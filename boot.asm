@@ -24,7 +24,7 @@ jmp start
 
 KERNEL_LOAD_SEG   equ 0x0000
 KERNEL_LOAD_OFF   equ 0x8000
-KERNEL_SECTORS    equ 40          ; how many 512B sectors to load (20KB, plenty of room)
+KERNEL_SECTORS    equ 64          ; how many 512B sectors to load (32KB, plenty of room)
 
 ; ---- on-screen checkpoint markers ----
 ; Each stage of the real->protected->long mode transition writes one

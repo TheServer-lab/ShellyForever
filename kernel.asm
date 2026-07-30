@@ -26,7 +26,7 @@ VAR_NAME_LEN    equ 32
 MAX_CALC_TOKENS equ 32
 
 ; disk region (LBA sectors) where the filesystem is persisted.
-; kernel occupies LBA 1..40 (see boot.asm KERNEL_SECTORS), so LBA 100
+; kernel occupies LBA 1..64 (see boot.asm KERNEL_SECTORS), so LBA 100
 ; leaves plenty of headroom for the kernel to grow.
 FS_LBA_START    equ 100
 
@@ -180,6 +180,42 @@ dispatch:
     call str_eq
     cmp al, 1
     je cmd_sync
+
+    mov rsi, cmd_buf
+    mov rdi, str_del
+    call str_eq
+    cmp al, 1
+    je cmd_del
+
+    mov rsi, cmd_buf
+    mov rdi, str_rmv
+    call str_eq
+    cmp al, 1
+    je cmd_rmv
+
+    mov rsi, cmd_buf
+    mov rdi, str_sdown
+    call str_eq
+    cmp al, 1
+    je cmd_sdown
+
+    mov rsi, cmd_buf
+    mov rdi, str_rname
+    call str_eq
+    cmp al, 1
+    je cmd_rname
+
+    mov rsi, cmd_buf
+    mov rdi, str_cpy
+    call str_eq
+    cmp al, 1
+    je cmd_cpy
+
+    mov rsi, cmd_buf
+    mov rdi, str_mov
+    call str_eq
+    cmp al, 1
+    je cmd_mov
 
     ; unknown command
     mov rsi, msg_unknown1
@@ -652,6 +688,236 @@ cmd_reboot:
     hlt
     jmp .hang
 
+; ------------------------------------------------------------
+; cmd_del: delete a file in the current folder (folders are untouched -
+; use 'rmv' for variables and there is no bulk folder-delete command).
+cmd_del:
+    cmp byte [arg1_buf], 0
+    jne .have_arg
+    mov rsi, msg_need_name
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+.have_arg:
+    mov rax, [cur_dir]
+    mov rsi, arg1_buf
+    mov r10, 2                  ; type = file
+    call fs_find_child
+    cmp rax, -1
+    je .not_found
+    call fs_delete_node
+    ret
+.not_found:
+    mov rsi, msg_no_entry
+    mov al, ATTR_ERROR
+    call print_string_attr
+    mov rsi, arg1_buf
+    call print_string
+    mov rsi, newline_str
+    call print_string
+    ret
+
+; ------------------------------------------------------------
+; cmd_rmv: remove a variable by name
+cmd_rmv:
+    cmp byte [arg1_buf], 0
+    jne .have_arg
+    mov rsi, msg_need_name
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+.have_arg:
+    mov rsi, arg1_buf
+    call var_find
+    cmp rax, -1
+    je .not_found
+    mov r9, rax
+    mov byte [var_used + r9], 0
+    mov qword [var_value + r9*8], 0
+    mov rdi, r9
+    imul rdi, VAR_NAME_LEN
+    lea rdi, [var_name + rdi]
+    mov rcx, VAR_NAME_LEN
+    xor al, al
+    rep stosb
+    ret
+.not_found:
+    mov rsi, msg_no_var
+    mov al, ATTR_ERROR
+    call print_string_attr
+    mov rsi, arg1_buf
+    call print_string
+    mov rsi, newline_str
+    call print_string
+    ret
+
+; ------------------------------------------------------------
+; cmd_sdown: save the filesystem, then try the legacy shutdown ports
+; used by QEMU/Bochs/VirtualBox. No ACPI tables are parsed by this
+; kernel, so on real hardware (or an emulator/port combo not listed
+; below) none of these will fire and the machine just halts safely.
+cmd_sdown:
+    call fs_save
+    mov rsi, msg_shutting_down
+    mov al, ATTR_NORMAL
+    call print_string_attr
+    mov dx, 0x604                ; QEMU (older versions) ACPI PM control
+    mov ax, 0x2000
+    out dx, ax
+    mov dx, 0xB004                ; Bochs / very old QEMU
+    mov ax, 0x2000
+    out dx, ax
+    mov dx, 0x4004                ; VirtualBox
+    mov ax, 0x3400
+    out dx, ax
+.hang:
+    cli
+    hlt
+    jmp .hang
+
+; ------------------------------------------------------------
+; cmd_rname: rename a file or folder in the current folder
+cmd_rname:
+    cmp byte [arg1_buf], 0
+    jne .check2
+    mov rsi, msg_need_name
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+.check2:
+    cmp byte [arg2_buf], 0
+    jne .have_args
+    mov rsi, msg_need_name
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+.have_args:
+    mov rax, [cur_dir]
+    mov rsi, arg1_buf
+    mov r10, -1                 ; any type
+    call fs_find_child
+    cmp rax, -1
+    je .not_found
+    mov r9, rax                 ; node to rename
+    mov rax, [cur_dir]
+    mov rsi, arg2_buf
+    mov r10, -1
+    call fs_find_child
+    cmp rax, -1
+    jne .exists
+    mov rdi, r9
+    imul rdi, NAME_LEN
+    lea rdi, [node_name + rdi]
+    mov rsi, arg2_buf
+    call str_copy
+    ret
+.exists:
+    mov rsi, msg_exists
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+.not_found:
+    mov rsi, msg_no_entry
+    mov al, ATTR_ERROR
+    call print_string_attr
+    mov rsi, arg1_buf
+    call print_string
+    mov rsi, newline_str
+    call print_string
+    ret
+
+; ------------------------------------------------------------
+; cmd_cpy: copy a file or folder (recursively) within the current folder
+; under a new name
+cmd_cpy:
+    cmp byte [arg1_buf], 0
+    jne .check2
+    mov rsi, msg_need_name
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+.check2:
+    cmp byte [arg2_buf], 0
+    jne .have_args
+    mov rsi, msg_need_name
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+.have_args:
+    mov rax, [cur_dir]
+    mov rsi, arg1_buf
+    mov r10, -1
+    call fs_find_child
+    cmp rax, -1
+    je .not_found
+    mov r10, [cur_dir]
+    mov rsi, arg2_buf
+    call fs_copy_node
+    cmp rax, -1
+    jne .ret_ok
+    mov rsi, msg_copy_failed
+    mov al, ATTR_ERROR
+    call print_string_attr
+.ret_ok:
+    ret
+.not_found:
+    mov rsi, msg_no_entry
+    mov al, ATTR_ERROR
+    call print_string_attr
+    mov rsi, arg1_buf
+    call print_string
+    mov rsi, newline_str
+    call print_string
+    ret
+
+; ------------------------------------------------------------
+; cmd_mov: move/rename a file or folder (recursively) within the current
+; folder - implemented as copy-then-delete-original.
+cmd_mov:
+    cmp byte [arg1_buf], 0
+    jne .check2
+    mov rsi, msg_need_name
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+.check2:
+    cmp byte [arg2_buf], 0
+    jne .have_args
+    mov rsi, msg_need_name
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+.have_args:
+    mov rax, [cur_dir]
+    mov rsi, arg1_buf
+    mov r10, -1
+    call fs_find_child
+    cmp rax, -1
+    je .not_found
+    mov r14, rax                 ; remember src idx to delete after copy
+    mov r10, [cur_dir]
+    mov rsi, arg2_buf
+    call fs_copy_node
+    cmp rax, -1
+    je .failed
+    mov rax, r14
+    call fs_delete_tree
+    ret
+.failed:
+    mov rsi, msg_copy_failed
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+.not_found:
+    mov rsi, msg_no_entry
+    mov al, ATTR_ERROR
+    call print_string_attr
+    mov rsi, arg1_buf
+    call print_string
+    mov rsi, newline_str
+    call print_string
+    ret
+
 ; ============================================================
 ;  FILESYSTEM
 ; ============================================================
@@ -755,6 +1021,148 @@ fs_create_node:
     pop rsi
     pop r9
     pop r8
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; fs_delete_node: rax = node index. Frees just that one node (does not
+; touch children - use fs_delete_tree if the node might be a folder with
+; contents).
+fs_delete_node:
+    push rax
+    push rdi
+    push rcx
+    push r9
+    mov r9, rax
+    mov byte [node_type + r9], 0
+    mov word [node_parent + r9*2], 0
+    mov rdi, r9
+    imul rdi, NAME_LEN
+    lea rdi, [node_name + rdi]
+    mov rcx, NAME_LEN
+    xor al, al
+    rep stosb
+    mov rdi, r9
+    imul rdi, CONTENT_LEN
+    lea rdi, [node_content + rdi]
+    mov rcx, CONTENT_LEN
+    xor al, al
+    rep stosb
+    pop r9
+    pop rcx
+    pop rdi
+    pop rax
+    ret
+
+; fs_delete_tree: rax = node index. Recursively frees the node and, if
+; it's a folder, everything inside it too.
+fs_delete_tree:
+    push rax
+    push r8
+    push r13
+    mov r8, rax
+    cmp byte [node_type + r8], 1
+    jne .leaf
+    xor r13, r13
+.loop:
+    cmp r13, MAX_NODES
+    jae .leaf
+    cmp byte [node_type + r13], 0
+    je .next
+    movzx rax, word [node_parent + r13*2]
+    cmp rax, r8
+    jne .next
+    mov rax, r13
+    call fs_delete_tree
+.next:
+    inc r13
+    jmp .loop
+.leaf:
+    mov rax, r8
+    call fs_delete_node
+    pop r13
+    pop r8
+    pop rax
+    ret
+
+; fs_copy_node: rax=src node idx, r10=dest parent idx, rsi=dest name.
+; Recursively copies a file, or a folder and everything inside it, to a
+; new parent under a new name. Returns rax = new node idx, or -1 if that
+; name is already taken at dest or the filesystem is full.
+fs_copy_node:
+    push rbx
+    push rcx
+    push rdx
+    push rdi
+    push rsi
+    push r8
+    push r9
+    push r11
+    push r12
+    push r13
+    mov r8, rax                  ; src idx
+    mov r9, r10                  ; dest parent idx
+
+    mov rax, r9
+    mov r10, -1
+    call fs_find_child            ; rsi (dest name) preserved by callee
+    cmp rax, -1
+    jne .taken
+
+    movzx r11, byte [node_type + r8]
+    mov rax, r9
+    mov r10, r11
+    call fs_create_node            ; rsi preserved
+    cmp rax, -1
+    je .full
+    mov r12, rax
+
+    cmp r11, 2
+    jne .isfolder
+    mov rdi, r12
+    imul rdi, CONTENT_LEN
+    lea rdi, [node_content + rdi]
+    mov rax, r8
+    imul rax, CONTENT_LEN
+    lea rsi, [node_content + rax]
+    call str_copy
+    jmp .done
+.isfolder:
+    xor r13, r13
+.childloop:
+    cmp r13, MAX_NODES
+    jae .done
+    cmp byte [node_type + r13], 0
+    je .childnext
+    movzx rax, word [node_parent + r13*2]
+    cmp rax, r8
+    jne .childnext
+    mov rax, r13
+    mov r10, r12
+    mov rdi, r13
+    imul rdi, NAME_LEN
+    lea rsi, [node_name + rdi]
+    call fs_copy_node
+.childnext:
+    inc r13
+    jmp .childloop
+.done:
+    mov rax, r12
+    jmp .out
+.taken:
+    mov rax, -1
+    jmp .out
+.full:
+    mov rax, -1
+.out:
+    pop r13
+    pop r12
+    pop r11
+    pop r9
+    pop r8
+    pop rsi
+    pop rdi
     pop rdx
     pop rcx
     pop rbx
@@ -1968,6 +2376,12 @@ str_reboot: db "rboot", 0
 str_sync:   db "sync", 0
 str_calc:   db "calc", 0
 str_edit:   db "edit", 0
+str_del:    db "del", 0
+str_rmv:    db "rmv", 0
+str_sdown:  db "sdown", 0
+str_rname:  db "rname", 0
+str_cpy:    db "cpy", 0
+str_mov:    db "mov", 0
 str_eq_sign: db "=", 0
 str_home_name: db "home", 0
 
@@ -1978,9 +2392,13 @@ msg_unknown1: db "rush: unknown command: ", 0
 msg_unknown2: db " (type 'help')", 10, 0
 msg_no_folder: db "cf: no such folder: ", 0
 msg_no_file:   db "view: no such file: ", 0
+msg_no_entry:  db "no such file or folder: ", 0
+msg_no_var:    db "rmv: no such variable: ", 0
 msg_need_name: db "error: a name is required", 10, 0
 msg_exists:    db "error: that name already exists here", 10, 0
 msg_full:      db "error: filesystem is full", 10, 0
+msg_copy_failed: db "error: name already exists at destination, or filesystem is full", 10, 0
+msg_shutting_down: db "Shutting down...", 10, 0
 msg_empty:     db "(empty)", 10, 0
 msg_synced:     db "Filesystem synced to disk.", 10, 0
 msg_loaded_fs:  db "Loaded filesystem from disk.", 10, 10, 0
@@ -2005,12 +2423,18 @@ help_text:
     db "  list               list contents of current folder", 10
     db "  view <name>        print a file's content", 10
     db "  edit <name>        open the built-in editor for a file", 10
+    db "  del <name>         delete a file", 10
+    db "  rname <old> <new>  rename a file or folder here", 10
+    db "  cpy <src> <dest>   copy a file or folder here", 10
+    db "  mov <src> <dest>   move/rename a file or folder here", 10
     db "  <name> = <value>   set a variable, e.g. a = 1", 10
+    db "  rmv <name>         remove a variable", 10
     db "  calc <expr>        evaluate math, e.g. calc 1 + 2 * 3", 10
     db "  current            print current path", 10
     db "  wipe               clear the screen", 10
     db "  sync               save the filesystem to disk", 10
-    db "  rboot              save to disk, then restart the machine", 10, 10, 0
+    db "  rboot              save to disk, then restart the machine", 10
+    db "  sdown              shut down the machine", 10, 10, 0
 
 ; --- scancode set 1 -> ascii tables (index = scancode, 0..0x39) ---
 ALIGN 8
