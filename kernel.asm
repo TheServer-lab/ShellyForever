@@ -233,43 +233,15 @@ cmd_cf:
     jne .have_arg
     ret
 .have_arg:
-    mov rsi, arg1_buf
-    mov rdi, str_slash
-    call str_eq
-    cmp al, 1
-    je .goto_root
-    mov rsi, arg1_buf
-    mov rdi, str_home
-    call str_eq
-    cmp al, 1
-    je .goto_root
-    mov rsi, arg1_buf
-    mov rdi, str_updir
-    call str_eq
-    cmp al, 1
-    je .goto_up
-
-    ; look for a child folder with this name
+    ; fs_resolve_path handles "/", "/home", "..", ".", multi-segment
+    ; paths, and plain single names all through one code path now.
     mov rax, [cur_dir]
     mov rsi, arg1_buf
-    mov r10, 1                 ; type = folder
-    call fs_find_child
+    xor rdi, rdi               ; whole-path mode: resolve every component
+    call fs_resolve_path
     cmp rax, -1
     je .not_found
     mov [cur_dir], rax
-    ret
-.goto_root:
-    mov qword [cur_dir], 0
-    ret
-.goto_up:
-    mov rax, [cur_dir]
-    cmp rax, 0
-    je .ret_ok
-    movzx rbx, word [node_parent + rax*2]
-    cmp bx, 0xFFFF
-    je .ret_ok
-    mov [cur_dir], rbx
-.ret_ok:
     ret
 .not_found:
     mov rsi, msg_no_folder
@@ -292,12 +264,19 @@ cmd_mkf:
 .have_arg:
     mov rax, [cur_dir]
     mov rsi, arg1_buf
+    mov rdi, leaf1_buf
+    call fs_resolve_path
+    cmp rax, -1
+    je .bad_path
+    mov r11, rax                ; parent dir the new folder goes in
+    mov rax, r11
+    mov rsi, leaf1_buf
     mov r10, -1                ; any type counts as "exists"
     call fs_find_child
     cmp rax, -1
     jne .exists
-    mov rax, [cur_dir]
-    mov rsi, arg1_buf
+    mov rax, r11
+    mov rsi, leaf1_buf
     mov r10, 1                 ; type folder
     call fs_create_node
     cmp rax, -1
@@ -309,9 +288,25 @@ cmd_mkf:
     call print_string_attr
     ret
 .full:
+    cmp byte [fs_name_too_long], 1
+    je .toolong
     mov rsi, msg_full
     mov al, ATTR_ERROR
     call print_string_attr
+    ret
+.toolong:
+    mov rsi, msg_name_too_long
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+.bad_path:
+    mov rsi, msg_bad_path
+    mov al, ATTR_ERROR
+    call print_string_attr
+    mov rsi, arg1_buf
+    call print_string
+    mov rsi, newline_str
+    call print_string
     ret
 
 ; ------------------------------------------------------------
@@ -325,12 +320,19 @@ cmd_mkfl:
 .have_arg:
     mov rax, [cur_dir]
     mov rsi, arg1_buf
+    mov rdi, leaf1_buf
+    call fs_resolve_path
+    cmp rax, -1
+    je .bad_path
+    mov r11, rax                 ; parent dir the new file goes in
+    mov rax, r11
+    mov rsi, leaf1_buf
     mov r10, -1
     call fs_find_child
     cmp rax, -1
     jne .exists
-    mov rax, [cur_dir]
-    mov rsi, arg1_buf
+    mov rax, r11
+    mov rsi, leaf1_buf
     mov r10, 2                  ; type file
     call fs_create_node
     cmp rax, -1
@@ -349,9 +351,25 @@ cmd_mkfl:
     call print_string_attr
     ret
 .full:
+    cmp byte [fs_name_too_long], 1
+    je .toolong
     mov rsi, msg_full
     mov al, ATTR_ERROR
     call print_string_attr
+    ret
+.toolong:
+    mov rsi, msg_name_too_long
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+.bad_path:
+    mov rsi, msg_bad_path
+    mov al, ATTR_ERROR
+    call print_string_attr
+    mov rsi, arg1_buf
+    call print_string
+    mov rsi, newline_str
+    call print_string
     ret
 
 ; ------------------------------------------------------------
@@ -627,6 +645,13 @@ cmd_cat:
 .have_arg:
     mov rax, [cur_dir]
     mov rsi, arg1_buf
+    mov rdi, leaf1_buf
+    call fs_resolve_path
+    cmp rax, -1
+    je .not_found
+    mov r11, rax
+    mov rax, r11
+    mov rsi, leaf1_buf
     mov r10, 2
     call fs_find_child
     cmp rax, -1
@@ -701,6 +726,13 @@ cmd_del:
 .have_arg:
     mov rax, [cur_dir]
     mov rsi, arg1_buf
+    mov rdi, leaf1_buf
+    call fs_resolve_path
+    cmp rax, -1
+    je .not_found
+    mov r11, rax
+    mov rax, r11
+    mov rsi, leaf1_buf
     mov r10, 2                  ; type = file
     call fs_find_child
     cmp rax, -1
@@ -792,14 +824,25 @@ cmd_rname:
     call print_string_attr
     ret
 .have_args:
+    mov rsi, arg2_buf
+    call str_len
+    cmp rax, NAME_LEN
+    jae .toolong
     mov rax, [cur_dir]
     mov rsi, arg1_buf
+    mov rdi, leaf1_buf
+    call fs_resolve_path
+    cmp rax, -1
+    je .not_found
+    mov r13, rax                ; folder the source lives in
+    mov rax, r13
+    mov rsi, leaf1_buf
     mov r10, -1                 ; any type
     call fs_find_child
     cmp rax, -1
     je .not_found
     mov r9, rax                 ; node to rename
-    mov rax, [cur_dir]
+    mov rax, r13                ; new name is checked/applied in the same folder
     mov rsi, arg2_buf
     mov r10, -1
     call fs_find_child
@@ -813,6 +856,11 @@ cmd_rname:
     ret
 .exists:
     mov rsi, msg_exists
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+.toolong:
+    mov rsi, msg_name_too_long
     mov al, ATTR_ERROR
     call print_string_attr
     ret
@@ -844,21 +892,53 @@ cmd_cpy:
     call print_string_attr
     ret
 .have_args:
+    ; resolve the source path -> (folder, leaf) and find the node
     mov rax, [cur_dir]
     mov rsi, arg1_buf
+    mov rdi, leaf1_buf
+    call fs_resolve_path
+    cmp rax, -1
+    je .not_found
+    mov rsi, leaf1_buf
     mov r10, -1
     call fs_find_child
     cmp rax, -1
     je .not_found
-    mov r10, [cur_dir]
+    mov r14, rax                ; src node index
+
+    ; resolve the destination path -> (folder, leaf name to copy as)
+    mov rax, [cur_dir]
     mov rsi, arg2_buf
+    mov rdi, leaf2_buf
+    call fs_resolve_path
+    cmp rax, -1
+    je .bad_dest
+    mov r10, rax                 ; dest parent folder
+    mov rax, r14
+    mov rsi, leaf2_buf
     call fs_copy_node
     cmp rax, -1
     jne .ret_ok
+    cmp byte [fs_name_too_long], 1
+    je .toolong
     mov rsi, msg_copy_failed
     mov al, ATTR_ERROR
     call print_string_attr
 .ret_ok:
+    ret
+.toolong:
+    mov rsi, msg_name_too_long
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+.bad_dest:
+    mov rsi, msg_bad_path
+    mov al, ATTR_ERROR
+    call print_string_attr
+    mov rsi, arg2_buf
+    call print_string
+    mov rsi, newline_str
+    call print_string
     ret
 .not_found:
     mov rsi, msg_no_entry
@@ -890,13 +970,26 @@ cmd_mov:
 .have_args:
     mov rax, [cur_dir]
     mov rsi, arg1_buf
+    mov rdi, leaf1_buf
+    call fs_resolve_path
+    cmp rax, -1
+    je .not_found
+    mov rsi, leaf1_buf
     mov r10, -1
     call fs_find_child
     cmp rax, -1
     je .not_found
     mov r14, rax                 ; remember src idx to delete after copy
-    mov r10, [cur_dir]
+
+    mov rax, [cur_dir]
     mov rsi, arg2_buf
+    mov rdi, leaf2_buf
+    call fs_resolve_path
+    cmp rax, -1
+    je .bad_dest
+    mov r10, rax                  ; dest parent folder
+    mov rax, r14
+    mov rsi, leaf2_buf
     call fs_copy_node
     cmp rax, -1
     je .failed
@@ -904,9 +997,25 @@ cmd_mov:
     call fs_delete_tree
     ret
 .failed:
+    cmp byte [fs_name_too_long], 1
+    je .toolong
     mov rsi, msg_copy_failed
     mov al, ATTR_ERROR
     call print_string_attr
+    ret
+.toolong:
+    mov rsi, msg_name_too_long
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+.bad_dest:
+    mov rsi, msg_bad_path
+    mov al, ATTR_ERROR
+    call print_string_attr
+    mov rsi, arg2_buf
+    call print_string
+    mov rsi, newline_str
+    call print_string
     ret
 .not_found:
     mov rsi, msg_no_entry
@@ -995,7 +1104,14 @@ fs_create_node:
     push r8
     push r9
     push rsi
-    mov r8, rax
+    mov byte [fs_name_too_long], 0
+    mov r8, rax                 ; save parent idx before str_len clobbers rax
+    ; reject names that won't fit in the fixed NAME_LEN slot (leaving room
+    ; for the null terminator) instead of silently overflowing into the
+    ; next node's name/type/parent fields
+    call str_len
+    cmp rax, NAME_LEN
+    jae .name_too_long
     xor r9, r9
 .loop:
     cmp r9, MAX_NODES
@@ -1014,6 +1130,10 @@ fs_create_node:
     push rsi
     call str_copy
     mov rax, r9
+    jmp .out
+.name_too_long:
+    mov byte [fs_name_too_long], 1
+    mov rax, -1
     jmp .out
 .full:
     mov rax, -1
@@ -1163,6 +1283,141 @@ fs_copy_node:
     pop r8
     pop rsi
     pop rdi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; ============================================================
+; fs_resolve_path: walks a '/'-separated path, one folder at a time,
+; using the same node_parent/fs_find_child machinery every other command
+; already relies on. Understands "/" (root), "." and ".." (like cf always
+; has), collapses repeated or trailing slashes, and treats a leading
+; "/home" as an alias for root (same alias cf used to special-case).
+;
+; in:  rax = starting dir index (normally [cur_dir])
+;      rsi = path string, e.g. "docs/notes.txt", "..", "/home/docs", "notes.txt"
+;      rdi = 0            -> whole-path mode: every component (including
+;                             the last) is resolved as a folder. Used by cf.
+;            leaf_buf ptr -> split mode: all components except the last
+;                             are resolved as folders; the last component
+;                             is copied verbatim into [leaf_buf] instead of
+;                             being looked up. Used by anything that names
+;                             a file/folder to act on (view, del, rname,
+;                             cpy, mov, mkf, mkfl).
+; out: rax = resolved dir index, or -1 if a folder component along the way
+;            doesn't exist (leaf_buf, if any, is left untouched on failure)
+; ============================================================
+fs_resolve_path:
+    push rbx
+    push rcx
+    push rdx
+    push r8
+    push r9
+    push r10
+    push r12
+    push r13
+    push r14
+    mov r12, rdi                ; leaf buf ptr, or 0 for whole-path mode
+    mov r13, rax                ; running "current dir" as we walk
+    mov r14, rsi                ; path cursor
+
+    cmp byte [r14], '/'
+    jne .parse_loop
+    mov r13, 0                  ; absolute path -> start from root
+
+.parse_loop:
+.skip_seps:
+    cmp byte [r14], '/'
+    jne .extract_check
+    inc r14
+    jmp .skip_seps
+.extract_check:
+    cmp byte [r14], 0
+    je .success                 ; nothing left to parse - done
+    mov rdi, path_comp_buf
+.copy_loop:
+    mov al, [r14]
+    cmp al, 0
+    je .comp_done
+    cmp al, '/'
+    je .comp_done
+    mov [rdi], al
+    inc rdi
+    inc r14
+    jmp .copy_loop
+.comp_done:
+    mov byte [rdi], 0
+    ; peek past any trailing slashes to see whether anything real remains
+.skip_seps2:
+    cmp byte [r14], '/'
+    jne .check_last
+    inc r14
+    jmp .skip_seps2
+.check_last:
+    cmp byte [r14], 0
+    jne .resolve_component      ; more path remains -> this is a folder step
+    cmp r12, 0
+    je .resolve_component        ; whole-path mode: resolve last comp too
+    ; split mode, and this was the last component -> it's the leaf name
+    push rsi
+    mov rsi, path_comp_buf
+    mov rdi, r12
+    call str_copy
+    pop rsi
+    jmp .success
+.resolve_component:
+    mov rsi, path_comp_buf
+    mov rdi, str_updir
+    call str_eq
+    cmp al, 1
+    je .do_updir
+    mov rsi, path_comp_buf
+    mov rdi, str_dot
+    call str_eq
+    cmp al, 1
+    je .after_resolve            ; "." is a no-op
+    ; "/home" alias: while sitting at root, a literal "home" component
+    ; is a no-op too (matches the old single-token "/home" special case)
+    cmp r13, 0
+    jne .lookup_child
+    mov rsi, path_comp_buf
+    mov rdi, str_home_name
+    call str_eq
+    cmp al, 1
+    je .after_resolve
+.lookup_child:
+    mov rax, r13
+    mov rsi, path_comp_buf
+    mov r10, 1                   ; must be a folder to descend into
+    call fs_find_child
+    cmp rax, -1
+    je .notfound
+    mov r13, rax
+    jmp .after_resolve
+.do_updir:
+    cmp r13, 0
+    je .after_resolve            ; already at root, no-op
+    movzx rbx, word [node_parent + r13*2]
+    cmp bx, 0xFFFF
+    je .after_resolve
+    mov r13, rbx
+.after_resolve:
+    cmp byte [r14], 0
+    je .success
+    jmp .parse_loop
+.notfound:
+    mov rax, -1
+    jmp .out
+.success:
+    mov rax, r13
+.out:
+    pop r14
+    pop r13
+    pop r12
+    pop r10
+    pop r9
+    pop r8
     pop rdx
     pop rcx
     pop rbx
@@ -2363,6 +2618,7 @@ newline_str: db 10, 0
 str_slash:  db "/", 0
 str_home:   db "/home", 0
 str_updir:  db "..", 0
+str_dot:    db ".", 0
 str_cf:     db "cf", 0
 str_mkf:    db "mkf", 0
 str_mkfl:   db "mkfl", 0
@@ -2391,12 +2647,14 @@ tag_file:   db "", 10, 0
 msg_unknown1: db "rush: unknown command: ", 0
 msg_unknown2: db " (type 'help')", 10, 0
 msg_no_folder: db "cf: no such folder: ", 0
+msg_bad_path:  db "error: no such folder in path: ", 0
 msg_no_file:   db "view: no such file: ", 0
 msg_no_entry:  db "no such file or folder: ", 0
 msg_no_var:    db "rmv: no such variable: ", 0
 msg_need_name: db "error: a name is required", 10, 0
 msg_exists:    db "error: that name already exists here", 10, 0
 msg_full:      db "error: filesystem is full", 10, 0
+msg_name_too_long: db "error: name too long (max 31 characters)", 10, 0
 msg_copy_failed: db "error: name already exists at destination, or filesystem is full", 10, 0
 msg_shutting_down: db "Shutting down...", 10, 0
 msg_empty:     db "(empty)", 10, 0
@@ -2415,18 +2673,18 @@ msg_saved:        db 10, "Saved.", 10, 0
 msg_discarded:    db 10, "Discarded.", 10, 0
 
 help_text:
-    db "Commands:", 10
-    db "  cf <name>          change folder ('cf ..' up, 'cf /home' root)", 10
-    db "  mkf <name>         make a folder here", 10
-    db '  mkfl <name> "txt"  make a file here with text content', 10
+    db "Commands (name args accept paths: docs/notes.txt, ../x, /home/x):", 10
+    db "  cf <path>          change folder ('cf ..' up, 'cf /home' root)", 10
+    db "  mkf <path>         make a folder", 10
+    db '  mkfl <path> "txt"  make a file with text content', 10
     db '  show "text"        print a message (or a variable to show its value)', 10
     db "  list               list contents of current folder", 10
-    db "  view <name>        print a file's content", 10
+    db "  view <path>        print a file's content", 10
     db "  edit <name>        open the built-in editor for a file", 10
-    db "  del <name>         delete a file", 10
-    db "  rname <old> <new>  rename a file or folder here", 10
-    db "  cpy <src> <dest>   copy a file or folder here", 10
-    db "  mov <src> <dest>   move/rename a file or folder here", 10
+    db "  del <path>         delete a file", 10
+    db "  rname <path> <new> rename a file or folder (new name stays in same folder)", 10
+    db "  cpy <src> <dest>   copy a file or folder (both can be paths)", 10
+    db "  mov <src> <dest>   move/rename a file or folder (both can be paths)", 10
     db "  <name> = <value>   set a variable, e.g. a = 1", 10
     db "  rmv <name>         remove a variable", 10
     db "  calc <expr>        evaluate math, e.g. calc 1 + 2 * 3", 10
@@ -2482,8 +2740,14 @@ FS_SECTORS    equ (fs_disk_block_end - fs_disk_header) / 512
 
 fs_loaded_from_disk: db 0
 fs_disk_available:   db 1     ; optimistic default; cleared on first ATA failure
+fs_name_too_long:    db 0     ; set by fs_create_node when a name won't fit
 
 path_stack:   times 16 dw 0
+
+; --- scratch for fs_resolve_path ---
+path_comp_buf: times 64 db 0     ; one path component at a time
+leaf1_buf:      times 64 db 0    ; resolved leaf name for arg1_buf paths
+leaf2_buf:      times 64 db 0    ; resolved leaf name for arg2_buf paths
 
 ; --- line editing buffers ---
 line_buf: times LINE_MAX db 0
