@@ -1,164 +1,375 @@
 # ShellyForever
 
-A 64-bit shell-based OS written entirely in x86-64 NASM assembly, from scratch —
-no C, no BIOS libraries beyond boot-time disk/keyboard calls, no existing kernel.
+ShellyForever is a tiny, from-scratch, bare-metal x86-64 operating system.
+It boots directly off a raw disk image via BIOS, walks itself up through
+16-bit real mode → 32-bit protected mode → 64-bit long mode, and lands in a
+single flat kernel binary that implements its own text-mode shell ("rush"),
+its own tiny in-memory/on-disk filesystem, its own PS/2 keyboard driver, and
+even its own USB (UHCI) mass-storage driver for moving projects between
+machines. There is no BIOS/UEFI runtime dependency once boot is complete, no
+interrupts (the keyboard is polled), and no third-party kernel code — it's
+one self-contained, hand-written system.
 
-## What's actually in here
+This document covers how to build it, how to run it, and how to use every
+command the shell understands.
 
-- **`boot.asm`** — the boot sector (512 bytes, fits in one disk sector).
-  Runs in 16-bit real mode, loads `kernel.bin` off disk, switches to 32-bit
-  protected mode, builds minimal page tables, switches to 64-bit long mode,
-  and jumps into the kernel.
-- **`kernel.asm`** — the OS itself. From scratch:
-  - A VGA text-mode driver (writes directly to `0xB8000`), with scrolling.
-  - A PS/2 keyboard driver (polls the `8042` controller, decodes scancode
-    set 1, handles shift for letters/symbols, backspace, enter).
-  - **`rush`**, the custom shell: prompt, line editor, a tokenizer that
-    understands `"quoted strings with spaces"`, and a command dispatcher.
-  - An in-memory filesystem tree rooted at `/home` (folders + files), with
-    recursive copy/move/delete of whole subtrees.
-  - A simple `name = value` variable table (int64), reused by `calc`.
-  - A built-in line editor for file content (`edit`).
+---
 
-## Commands implemented
+## Table of contents
 
-| Command | Example | Behavior |
-|---|---|---|
-| `cf` | `cf docs`, `cf ..`, `cf /home` | change folder |
-| `mkf` | `mkf docs` | make a folder in the current directory |
-| `mkfl` | `mkfl something.txt "some text"` | make a file with content |
-| `del` | `del something.txt` | delete a file in the current folder |
-| `rname` | `rname old.txt new.txt` | rename a file or folder here |
-| `cpy` | `cpy docs docs_backup` | copy a file or folder here (recursive for folders) |
-| `mov` | `mov docs archive` | move/rename a file or folder here (recursive for folders) |
-| `show` | `show "hello world"`, `show a` | print a message, or a variable's value |
-| `list` | `list` | list contents of current folder |
-| `view` | `view something.txt` | print a file's content |
-| `edit` | `edit something.txt` | open the built-in editor for a file (Esc, then y/n to save) |
-| `<name> = <value>` | `a = 5` | set a variable to a literal or another variable's value |
-| `rmv` | `rmv a` | remove a variable |
-| `calc` | `calc 1 + 2 * 3` | evaluate a math expression |
-| `current` | `current` | print current path |
-| `wipe` | `wipe` | clear the screen |
-| `help` | `help` | list commands |
-| `sync` | `sync` | save the filesystem to disk |
-| `rboot` | `rboot` | save to disk, then restart the machine |
-| `sdown` | `sdown` | save to disk, then shut down the machine |
+1. [How it boots](#how-it-boots)
+2. [Requirements](#requirements)
+3. [Building](#building)
+4. [Running](#running)
+5. [Using the shell](#using-the-shell)
+   - [The prompt](#the-prompt)
+   - [Line editing, history, and scrollback](#line-editing-history-and-scrollback)
+   - [Comments and chaining](#comments-and-chaining)
+   - [Paths](#paths)
+6. [Command reference](#command-reference)
+   - [Filesystem commands](#filesystem-commands)
+   - [Variables and math](#variables-and-math)
+   - [System commands](#system-commands)
+   - [Scripts and processes](#scripts-and-processes)
+   - [Privilege / auth](#privilege--auth)
+   - [USB commands](#usb-commands)
+7. [Persistence: how the filesystem is saved](#persistence-how-the-filesystem-is-saved)
+8. [Project file layout](#project-file-layout)
+9. [Troubleshooting](#troubleshooting)
 
-Prompt looks exactly like you asked:
+---
 
-```
-rush>/home: mkfl something.txt "some text"
-rush>/home: view something.txt
-some text
-rush>/home: mkf docs
-rush>/home: cf docs
-rush>/home/docs: show "hello world"
-hello world
-rush>/home/docs: cf ..
-rush>/home:
-```
+## How it boots
 
-## Building it yourself
+Booting a 400KB+ kernel from BIOS in one shot isn't reliable (real-mode
+`INT 13h` transfers are effectively bounded by 64KB segment windows), so
+ShellyForever boots in two stages:
+
+1. **`boot.asm`** — the classic 512-byte MBR boot sector. BIOS loads it at
+   `0x7C00`. Its only job is to load `stage2` (a fixed 32-sector/16KB
+   region starting at LBA 1) into memory and jump to it.
+2. **`stage2.asm`** — not size-constrained like the boot sector, so it does
+   everything else: loads the real kernel from disk in safe 32KB chunks,
+   enables the A20 line, sets up a GDT, enters 32-bit protected mode, builds
+   page tables, and finally enters 64-bit long mode before jumping into the
+   kernel at `0x8000`.
+3. **`kernel.asm`** — the OS itself. Runs flat in long mode with the first
+   64MB (later expanded to 4GB) identity-mapped. No IDT is installed —
+   the keyboard is polled directly via ports `0x60`/`0x64` rather than
+   using interrupts.
+
+If something goes wrong early in boot, you'll see single-character debug
+checkpoints (`1`, `2`, `K`, etc.) printed in the corner of the screen in
+white-on-red — these mark how far boot got before failing, and are useful
+for diagnosing a botched build rather than being part of the shell itself.
+
+## Requirements
+
+- **NASM** (`nasm -f bin`) to assemble all three stages.
+- **Python 3** — `build.sh` uses it to pad the binaries to fixed sizes.
+- **QEMU** (`qemu-system-x86_64`) — or any way to boot a raw disk image —
+  to actually run the OS.
+
+On Debian/Ubuntu:
 
 ```bash
-sudo apt install nasm
+sudo apt install nasm qemu-system-x86
+```
+
+## Building
+
+```bash
+chmod +x build.sh
 ./build.sh
 ```
 
-This produces `shellyforever.img`, a raw bootable disk image.
+This assembles `boot.asm`, `stage2.asm`, and `kernel.asm`, pads `stage2`
+out to its fixed 32-sector budget (so the kernel always starts at a known
+LBA), concatenates everything into `shellyforever.img`, and pads that image
+out to a standard 1.44MB floppy/USB size. Output looks like:
 
-## Running it
+```
+Built shellyforever.img (1474560 bytes)
+  boot.bin:   512 bytes (stage1, LBA 0)
+  stage2.bin: 16384 bytes padded, actual code 526 bytes (LBA 1)
+  kernel.bin: 115440 bytes (LBA 33)
+Run it with:  qemu-system-x86_64 -drive format=raw,file=shellyforever.img
+```
 
-**QEMU (easiest, works anywhere):**
+If `stage2.bin` or `kernel.bin` ever outgrow their sector budgets
+(`STAGE2_SECTORS` in `build.sh`/`boot.asm`, `KERNEL_SECTORS` in
+`stage2.asm`), the build stops with an error telling you which constant to
+bump — bump it in **both** places for that stage before rebuilding.
+
+## Running
+
 ```bash
 qemu-system-x86_64 -drive format=raw,file=shellyforever.img
 ```
 
-**Real 64-bit hardware (legacy/BIOS boot only, not UEFI):**
-```bash
-sudo dd if=shellyforever.img of=/dev/sdX bs=4M status=progress
+That's it — QEMU boots the image like a real BIOS machine would. You can
+also write the image to a real USB stick with `dd` (`dd if=shellyforever.img
+of=/dev/sdX bs=4M status=progress`) and boot real hardware with it, though
+QEMU is the easiest way to try it.
+
+## Using the shell
+
+Once booted, you land in **rush**, ShellyForever's shell.
+
+### The prompt
+
 ```
-Replace `/dev/sdX` with your USB drive (**not** a partition, not your hard
-disk — double check with `lsblk` first). Boot from it via your BIOS boot
-menu with legacy/CSM mode enabled.
+rush>/home: _
+```
 
-**VirtualBox/VMware:** create a new VM, "Other/Unknown 64-bit" OS, attach
-`shellyforever.img` as a raw/IDE disk, boot.
+The prompt is always `rush>` followed by your current path, then `: `. On a
+fresh boot you start in `/home`.
 
-## Disk persistence
+### Line editing, history, and scrollback
 
-The filesystem survives reboots. There's a hand-written ATA PIO driver
-(primary bus, LBA28, polling BSY/DRQ — no IRQs, matching the polled keyboard
-driver's style) that reads and writes raw sectors.
+While typing a command, the following work exactly like you'd expect from a
+normal terminal:
 
-- The whole node table (`node_type`, `node_parent`, `node_name`,
-  `node_content`) plus a small `SFFS`/version header is serialized as one
-  blob starting at disk sector (LBA) 100 — well clear of the boot sector and
-  the kernel's own sectors (1..64), leaving room for the kernel to grow.
-- **`sync`** writes the current filesystem to disk on demand.
-- **`rboot`** saves before it restarts, and **`sdown`** saves before it shuts
-  down, so neither will lose work.
-- On boot, the kernel tries to load that region; if the header's magic
-  bytes/version don't check out (blank disk, or an older on-disk format) it
-  falls back to `fs_init` and starts fresh, same as before.
-- Because `shellyforever.img` is a real disk image, this persists not just
-  across `reboot`/`sdown` inside one QEMU session, but across separate QEMU
-  invocations (and real hardware) as long as you keep using the same image
-  file.
+| Key             | Effect                                                        |
+|-----------------|----------------------------------------------------------------|
+| Backspace       | delete the previous character                                  |
+| Enter           | submit the line                                                 |
+| **Up / Down**   | recall previously entered commands (command history)            |
+| **Ctrl+Up / Ctrl+Down** | scroll the *screen* back/forward through past output   |
 
-This was tested end-to-end in QEMU: create files/folders → `sync` → quit
-QEMU entirely → relaunch QEMU on the same `.img` → `list`/`view` show the
-same data.
+**History (Up/Down).** ShellyForever remembers your last 16 typed lines.
+Press **Up** to walk backwards through them (most recent first), **Down**
+to walk forwards again. If you start typing something, then hit Up to
+browse history, then hit Down enough times to come back past the newest
+entry, you get back exactly what you had typed before you started
+browsing — nothing is lost. Empty lines and immediate repeats of the last
+command aren't added to history.
 
-## Shutdown (`sdown`)
+**Scrollback (Ctrl+Up/Ctrl+Down).** The screen is only 25 rows tall, so
+long output (like `help` or a big `list`) scrolls old lines off the top.
+Press **Ctrl+Up** to scroll the *view* back and see those lines again — up
+to about 10 screenfuls (256 rows) of history. **Ctrl+Down** scrolls back
+toward the bottom. This only changes what's displayed; it doesn't affect
+the command you're typing. As soon as you press any other key (type a
+character, Backspace, Enter, or use Up/Down for history), the view snaps
+straight back to the live bottom of the screen — just like a normal
+terminal emulator.
 
-There's no ACPI table parsing in this kernel, so `sdown` doesn't negotiate a
-real ACPI shutdown. Instead it saves the filesystem, then pokes the legacy
-"magic port" shutdown hooks that QEMU, Bochs, and VirtualBox each recognize
-(ports `0x604`, `0xB004`, and `0x4004` respectively). If none of those match
-whatever you're running it on (including real hardware), the CPU just halts
-safely instead of doing anything unsafe — you'd see the "Shutting down..."
-message and then nothing, which is your cue to power off manually.
+### Comments and chaining
 
-## Known limitations / what "from scratch" currently means
+- A line starting with `$` is a comment and is ignored:
+  ```
+  rush>/home: $ this line does nothing
+  ```
+- Multiple commands can be chained on one line with `;`:
+  ```
+  rush>/home: show hi ; show bye
+  hi
+  bye
+  ```
+  (Semicolons inside double quotes don't split the line.)
 
-- No interrupts/IDT — keyboard and disk I/O are both polled, which is simple
-  and reliable for a single-tasking shell but would need to change for
-  multitasking or overlapping disk I/O.
-- No memory manager beyond a flat identity-mapped first 2MB — fine for a
-  kernel this size, would need a real allocator to grow much further.
-- No ACPI — `sdown` relies on emulator-specific legacy ports rather than a
-  negotiated ACPI shutdown (see above).
-- 64 filesystem nodes max, file/folder names capped at 32 bytes, file
-  content capped at ~160 bytes, line input capped at ~220 chars — easy to
-  bump, just constants at the top of `kernel.asm` (the on-disk format size
-  adjusts automatically since it's computed from those same constants).
-  Worth knowing: `mkfl`/`rname`/`cpy`/`mov` don't currently check that a
-  destination name is short enough to fit in that 32-byte slot before
-  copying it in.
-- `cpy`/`mov` only operate within the current folder (no path arguments like
-  `../docs`), matching how `cf`/`mkf`/etc. already work one directory at a
-  time.
-- Persistence is whole-table snapshotting (like a save file), not an
-  incremental/journaled on-disk format — simple and robust for this scale,
-  but a `sync` rewrites the whole reserved region every time.
-- `kernel.bin` currently uses 47 of the 64 sectors (`KERNEL_SECTORS` in
-  `boot.asm`) the bootloader reserves for it. If you add enough new code to
-  cross that budget, bump `KERNEL_SECTORS` again — it's a one-line change,
-  but the bootloader will silently load a truncated kernel if you forget,
-  which looks like an unrelated crash.
+### Paths
 
-## Natural next steps, in order of payoff
+Anywhere a command takes a `<path>`, you can use:
 
-1. **Path arguments** for `cf`/`cpy`/`mov`/`rname` (e.g. `cpy docs/notes.txt ..`)
-   instead of current-folder-only operations.
-2. **Autosave on mutation** instead of requiring explicit `sync`/`rboot`/`sdown`,
-   if you'd rather not think about it (tradeoff: more disk writes).
-3. **A real memory allocator** once you want dynamic-sized files/folders
-   instead of fixed slot counts.
+- A plain name (`notes.txt`) — relative to the current folder.
+- A relative path with subfolders (`docs/notes.txt`).
+- `..` to go up a level, `.` for the current folder.
+- An absolute path starting with `/` (`/home/x`).
 
-I built and test-assembled this in a sandbox without a CPU emulator
-available, so it's been verified to assemble cleanly and I traced the logic
-carefully, but you should run it in QEMU yourself to catch anything a static
-read-through can't — happy to help debug from there if something misbehaves.
+Folder/file names are capped at 31 characters.
+
+---
+
+## Command reference
+
+Run `help` in the shell at any time to see a condensed version of this list.
+
+### Filesystem commands
+
+| Command | Description |
+|---|---|
+| `cf <path>` | Change folder. `cf ..` goes up one level, `cf /home` jumps to root. |
+| `mkf <path>` | Make a new folder. |
+| `mkfl <path> "text"` | Make a file at `<path>` containing `text` (the content must be in double quotes). |
+| `mkfl -force <path> "text"` | Overwrite the file if it already exists. |
+| `mkfl -silent <path> "text"` | Same as `-force`, but suppresses the overwrite warning. |
+| `mkfl -info <path> "text"` | Verbose mode — prints the filename and content length after creating it. |
+| `list` | List the contents of the current folder. |
+| `view <path>` | Print a file's contents. |
+| `edit <name>` | Open the built-in full-screen text editor on a file. Press **Esc** when done, then **y**/**n** to save or discard. |
+| `del <path>` | Delete a file. **Requires `auth`.** |
+| `rname <path> <new>` | Rename a file or folder in place (the new name stays in the same parent folder). |
+| `cpy <src> <dest>` | Copy a file or folder — both arguments can be full paths. |
+| `mov <src> <dest>` | Move/rename a file or folder — both arguments can be full paths. |
+| `current` | Print the current path. |
+
+**Examples:**
+
+```
+rush>/home: mkf docs
+rush>/home: cf docs
+rush>/home/docs: mkfl notes.txt "shopping list: eggs, milk"
+rush>/home/docs: view notes.txt
+shopping list: eggs, milk
+rush>/home/docs: cf ..
+rush>/home: cpy docs/notes.txt docs/notes_backup.txt
+rush>/home: mov docs/notes_backup.txt archive/notes_backup.txt
+rush>/home: rname docs backup_docs
+```
+
+### Variables and math
+
+| Command | Description |
+|---|---|
+| `<name> = <value>` | Set a variable to a number, or to the value of another variable. |
+| `show "text"` | Print a literal message. |
+| `show <name>` | If `<name>` matches a variable, print its value instead of the literal text. |
+| `rmv <name>` | Remove a variable. |
+| `vars` | List all variables and their values. |
+| `vars rmv all` | Clear every variable. **Requires `auth`.** |
+| `calc <expr>` | Evaluate a math expression (`+ - * /`, standard precedence, integer arithmetic, any number of terms). |
+
+**Examples:**
+
+```
+rush>/home: a = 10
+rush>/home: b = 5
+rush>/home: show a
+10
+rush>/home: calc a + b * 2
+20
+rush>/home: vars
+a = 10
+b = 5
+rush>/home: rmv b
+```
+
+### System commands
+
+| Command | Description |
+|---|---|
+| `wipe` | Clear the screen. |
+| `sync` | Save the current filesystem to disk. |
+| `rboot` | Save to disk, then restart the machine. **Requires `auth`.** |
+| `sdown` | Shut down the machine. **Requires `auth`.** |
+| `help` | Show the command list. |
+
+### Scripts and processes
+
+| Command | Description |
+|---|---|
+| `rr <script.rsh>` | Run a "rush script" file — a file full of shell commands (`$` still marks comment lines inside the script), executed line by line as a tracked background process named `runrush <filename>`. |
+| `prs` | List running processes (PID, name, state). |
+| `prs kill <pid>` | Kill a running process by its PID. |
+| `prs kill rushrun` | Kill the currently running `rr` script. |
+
+While a script is running, pressing **Esc** at the shell also sets a kill
+flag that script execution checks between lines, so a runaway script can be
+interrupted without waiting for `prs kill`.
+
+**Example:**
+
+```
+rush>/home: mkfl setup.rsh "$ demo script
+mkf project
+cf project
+show hello from a script"
+rush>/home: rr setup.rsh
+rush>/home: prs
+```
+
+### Privilege / auth
+
+A handful of commands are considered dangerous (`del`, `rboot`, `sdown`,
+`vars rmv all`) and are gated behind a one-shot authorization:
+
+```
+auth <command> [args...]
+```
+
+`auth` grants privilege for exactly **one** command, runs it immediately,
+and then revokes the privilege again — there's no persistent "logged in"
+state.
+
+**Examples:**
+
+```
+rush>/home: auth del docs/notes.txt
+rush>/home: auth vars rmv all
+rush>/home: auth sdown
+```
+
+### USB commands
+
+ShellyForever includes its own minimal UHCI USB driver and a small,
+purpose-built (not FAT/exFAT) archive format for moving whole project
+folders to and from a USB mass-storage drive. The typical flow is:
+
+```
+rush>/home: dscan          $ scan the PCI bus for a UHCI USB controller
+rush>/home: usbinfo        $ address the device found by dscan and probe it
+rush>/home: usbdisk        $ probe it as a mass-storage device
+rush>/home: usb list       $ list projects already stored on the drive
+```
+
+| Command | Description |
+|---|---|
+| `dscan` | Scan the PCI bus for a UHCI USB host controller. |
+| `usbinfo` | Assign a USB address to the controller found by `dscan` and probe its descriptors. |
+| `usbdisk` | Probe a USB mass-storage device found by `usbinfo` (vendor info, capacity, a raw sector read). |
+| `usb list` | List project archives already stored on the USB drive. |
+| `usb info` | Show USB device info. |
+| `usb export <name>` | Export a folder from the current filesystem to the USB drive as a project archive. (Needs `dscan` + `usbinfo` first.) |
+| `usb import <name>` | Import a project archive from the USB drive back into the filesystem. |
+| `usb delete <name>` | Delete a project archive from the USB drive. |
+| `usb rename <a> <b>` | Rename a project archive on the USB drive from `<a>` to `<b>`. |
+
+Each USB drive can hold up to 16 project archives, each capped at 16KB of
+serialized folder content — plenty for typical text-based projects, but
+worth knowing if an export unexpectedly fails.
+
+---
+
+## Persistence: how the filesystem is saved
+
+ShellyForever keeps its whole filesystem in memory while running. On boot,
+it tries to load a previously saved filesystem from disk; if none is found,
+it starts fresh and tells you so:
+
+```
+ShellyForever v0.1 -- 'help' for commands
+No saved filesystem found - starting fresh.
+```
+
+Nothing you create is written to disk automatically — run `sync` whenever
+you want to persist your current files/folders, or use `rboot`, which
+syncs and then restarts for you. If the disk itself isn't available (e.g.
+running from read-only media), the shell warns you at boot and `sync`
+simply won't have anywhere to write.
+
+## Project file layout
+
+| File | Purpose |
+|---|---|
+| `boot.asm` | Stage 1: 512-byte MBR boot sector. |
+| `stage2.asm` | Stage 2: real-mode kernel loader, A20/GDT/paging/long-mode setup. |
+| `kernel.asm` | The OS itself: shell, filesystem, keyboard driver, USB driver. |
+| `build.sh` | Assembles all three stages and links them into `shellyforever.img`. |
+| `shellyforever.img` | The bootable disk image produced by `build.sh`. |
+
+## Troubleshooting
+
+- **Stuck on a single debug character (`1`, `2`, etc.) after boot.** That's
+  one of `boot.asm`'s or `stage2.asm`'s checkpoint markers — it means boot
+  failed before reaching that stage. Rebuild with `./build.sh` and check
+  for assembly errors; a mismatched `STAGE2_SECTORS`/`KERNEL_SECTORS`
+  between `build.sh` and the `.asm` files is the most common cause.
+- **"disk not available" warning at boot.** The shell still works — you just
+  won't be able to `sync`/persist a filesystem or use `usb export`/`import`
+  writes to that same disk. This is normal when booting from certain
+  read-only or emulated media.
+- **A dangerous command refuses to run.** `del`, `rboot`, `sdown`, and
+  `vars rmv all` all require you to prefix them with `auth`, e.g.
+  `auth del somefile.txt`.
