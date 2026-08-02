@@ -24,6 +24,11 @@ NAME_LEN        equ 32
 CONTENT_LEN     equ 160
 LINE_MAX        equ 220
 
+SCROLLBACK_LINES equ 100         ; extra off-screen rows kept for Ctrl+Up/Down
+HISTORY_MAX      equ 20          ; command history entries kept for Up/Down
+KEY_UP           equ 0x11        ; sentinel byte get_char returns for the Up arrow
+KEY_DOWN         equ 0x12        ; sentinel byte get_char returns for the Down arrow
+
 MAX_VARS        equ 16
 VAR_NAME_LEN    equ 32
 MAX_CALC_TOKENS equ 32
@@ -1027,6 +1032,10 @@ cmd_edit:
     je .ce_newline
     cmp al, 8
     je .ce_bksp
+    cmp al, KEY_UP
+    je .ce_loop                  ; no history/scrollback editing here, ignore
+    cmp al, KEY_DOWN
+    je .ce_loop
     cmp r14, CONTENT_LEN-1
     jae .ce_loop
     lea rdi, [edit_buf]
@@ -4671,6 +4680,7 @@ scroll_screen:
     push rcx
     push rsi
     push rdi
+    call scrollback_capture_row      ; archive row 0 before it's shifted away
     mov rsi, VGA_BASE + (VGA_COLS*2)
     mov rdi, VGA_BASE
     mov rcx, (VGA_ROWS-1)*VGA_COLS
@@ -4692,7 +4702,15 @@ scroll_screen:
 ;  PS/2 KEYBOARD
 ; ============================================================
 
-; get_char: blocks until a key is pressed, returns ascii in al
+; get_char: blocks until a key is pressed, returns ascii in al.
+; Also handles: Ctrl tracking (make/break of 0x1D, plain or E0-prefixed),
+; E0-prefixed arrow keys (Up=0x48, Down=0x50), and Ctrl+Up/Ctrl+Down driving
+; the on-screen scrollback view. Plain Up/Down (no Ctrl) are returned to the
+; caller as the sentinel bytes KEY_UP/KEY_DOWN instead of an ascii char, so
+; read_line can use them for command history. Right before returning any
+; real key (ascii or arrow sentinel) to the caller, if the view is currently
+; scrolled back it snaps back to the live screen first - typing or
+; navigating history always means "I'm done reviewing, back to the prompt".
 get_char:
     push rbx
 .wait:
@@ -4701,12 +4719,59 @@ get_char:
     jz .wait
     in al, 0x60
     mov bl, al
+
+    cmp byte [kbd_ext_flag], 0
+    je .not_ext_cont
+    ; this byte follows an 0xE0 prefix byte
+    mov byte [kbd_ext_flag], 0
+    test bl, 0x80
+    jnz .ext_break
+    cmp bl, 0x48                 ; extended Up
+    je .ext_up
+    cmp bl, 0x50                 ; extended Down
+    je .ext_down
+    cmp bl, 0x1D                 ; right Ctrl make
+    je .ext_ctrl_make
+    jmp .wait                    ; ignore any other extended key
+.ext_break:
+    and bl, 0x7F
+    cmp bl, 0x1D
+    je .ext_ctrl_break
+    jmp .wait
+.ext_ctrl_make:
+    mov byte [ctrl_state], 1
+    jmp .wait
+.ext_ctrl_break:
+    mov byte [ctrl_state], 0
+    jmp .wait
+.ext_up:
+    cmp byte [ctrl_state], 0
+    je .return_up
+    call scrollback_view_up
+    jmp .wait
+.ext_down:
+    cmp byte [ctrl_state], 0
+    je .return_down
+    call scrollback_view_down
+    jmp .wait
+.return_up:
+    mov al, KEY_UP
+    jmp .snap_and_return
+.return_down:
+    mov al, KEY_DOWN
+    jmp .snap_and_return
+
+.not_ext_cont:
+    cmp bl, 0xE0
+    je .set_ext
     test bl, 0x80
     jnz .breakcode
     cmp bl, 0x2A
     je .setshift
     cmp bl, 0x36
     je .setshift
+    cmp bl, 0x1D                 ; left Ctrl make
+    je .ctrl_make
     movzx rbx, bl
     cmp byte [shift_state], 0
     jne .shifted
@@ -4717,10 +4782,15 @@ get_char:
 .have:
     cmp al, 0
     je .wait
-    pop rbx
-    ret
+    jmp .snap_and_return
+.set_ext:
+    mov byte [kbd_ext_flag], 1
+    jmp .wait
 .setshift:
     mov byte [shift_state], 1
+    jmp .wait
+.ctrl_make:
+    mov byte [ctrl_state], 1
     jmp .wait
 .breakcode:
     and bl, 0x7F
@@ -4728,13 +4798,216 @@ get_char:
     je .clrshift
     cmp bl, 0x36
     je .clrshift
+    cmp bl, 0x1D
+    je .ctrl_break
     jmp .wait
 .clrshift:
     mov byte [shift_state], 0
     jmp .wait
+.ctrl_break:
+    mov byte [ctrl_state], 0
+    jmp .wait
+
+.snap_and_return:
+    push rax
+    cmp byte [scroll_offset], 0
+    je .no_snap
+    xor al, al
+    call scrollback_render
+.no_snap:
+    pop rax
+    pop rbx
+    ret
+
+; ============================================================
+;  SCROLLBACK VIEW (Ctrl+Up / Ctrl+Down)
+; ============================================================
+; All of these routines save/restore every register they use, so they are
+; safe to call from anywhere inside get_char without disturbing a caller
+; like read_line that keeps its own state (buffer ptr/length/max) in
+; r8/r9/r10 across get_char calls.
+
+; scrollback_capture_row: archives the current row 0 (about to be shifted
+; off by scroll_screen) into the scrollback ring buffer.
+scrollback_capture_row:
+    push rax
+    push rcx
+    push rsi
+    push rdi
+
+    movzx rax, byte [sb_write_idx]
+    imul rax, VGA_COLS*2
+    lea rdi, [scrollback_buf + rax]
+    mov rsi, VGA_BASE
+    mov rcx, VGA_COLS*2
+    rep movsb
+
+    movzx rax, byte [sb_write_idx]
+    inc rax
+    cmp rax, SCROLLBACK_LINES
+    jne .no_wrap
+    xor rax, rax
+.no_wrap:
+    mov [sb_write_idx], al
+
+    cmp byte [sb_count], SCROLLBACK_LINES
+    je .out
+    inc byte [sb_count]
+.out:
+    pop rdi
+    pop rsi
+    pop rcx
+    pop rax
+    ret
+
+; scrollback_render: al = desired scroll offset (0 = live). Clamps to
+; [0, sb_count], stores the clamped value in scroll_offset, and redraws
+; VGA_BASE either as the pure live screen (from live_snapshot) or as a
+; composite of scrollback_buf + live_snapshot. Parks the hardware cursor
+; off-screen while scrolled back, since it belongs to the live line the
+; user is no longer looking at.
+scrollback_render:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+
+    movzx r9, byte [sb_count]
+    movzx r8, al
+    cmp r8, r9
+    jbe .clamped
+    mov r8, r9
+.clamped:
+    mov al, r8b
+    mov [scroll_offset], al
+
+    cmp r8, 0
+    jne .composite
+
+    lea rsi, [live_snapshot]
+    mov rdi, VGA_BASE
+    mov rcx, VGA_ROWS*VGA_COLS*2
+    rep movsb
+    call update_cursor
+    jmp .done
+
+.composite:
+    mov rax, r9
+    sub rax, r8                  ; rax = start virtual line index
+    xor r10, r10                 ; r10 = output row 0..VGA_ROWS-1
+.row_loop:
+    cmp r10, VGA_ROWS
+    jae .rows_done
+    mov rdx, rax
+    add rdx, r10                 ; rdx = virtual line index for this row
+
+    cmp rdx, r9
+    jb .from_sb
+
+    mov rcx, rdx
+    sub rcx, r9
+    imul rcx, VGA_COLS*2
+    lea rsi, [live_snapshot + rcx]
+    jmp .copy_row
+
+.from_sb:
+    movzx rcx, byte [sb_write_idx]
+    add rcx, SCROLLBACK_LINES
+    sub rcx, r9
+    add rcx, rdx
+    xor rdx, rdx
+    push rax
+    mov rax, rcx
+    mov rbx, SCROLLBACK_LINES
+    div rbx
+    mov rcx, rdx
+    pop rax
+    imul rcx, VGA_COLS*2
+    lea rsi, [scrollback_buf + rcx]
+
+.copy_row:
+    mov rdi, VGA_BASE
+    mov rcx, r10
+    imul rcx, VGA_COLS*2
+    add rdi, rcx
+    mov rcx, VGA_COLS*2
+    rep movsb
+    inc r10
+    jmp .row_loop
+
+.rows_done:
+    mov dx, 0x3D4
+    mov al, 0x0F
+    out dx, al
+    mov dx, 0x3D5
+    mov al, 0xFF
+    out dx, al
+    mov dx, 0x3D4
+    mov al, 0x0E
+    out dx, al
+    mov dx, 0x3D5
+    mov al, 0xFF
+    out dx, al
+
+.done:
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; scrollback_view_up: Ctrl+Up. On the first press (scroll_offset==0),
+; snapshots the current live screen so it can be exactly restored later,
+; then scrolls the view back one more line (capped at what's stored).
+scrollback_view_up:
+    push rax
+    push rcx
+    push rsi
+    push rdi
+
+    cmp byte [scroll_offset], 0
+    jne .already_scrolled
+    mov rsi, VGA_BASE
+    lea rdi, [live_snapshot]
+    mov rcx, VGA_ROWS*VGA_COLS*2
+    rep movsb
+.already_scrolled:
+    movzx rax, byte [scroll_offset]
+    inc rax
+    call scrollback_render
+
+    pop rdi
+    pop rsi
+    pop rcx
+    pop rax
+    ret
+
+; scrollback_view_down: Ctrl+Down. Scrolls the view one line back toward
+; the live screen (a no-op once already live).
+scrollback_view_down:
+    push rax
+    cmp byte [scroll_offset], 0
+    je .out
+    movzx rax, byte [scroll_offset]
+    dec rax
+    call scrollback_render
+.out:
+    pop rax
+    ret
 
 ; read_line: rdi=buffer, rcx=max chars. Echoes to screen, handles
-; backspace, terminates on Enter. Buffer is null terminated.
+; backspace, Up/Down command history, and terminates on Enter. Buffer is
+; null terminated.
 read_line:
     push rax
     push rbx
@@ -4743,12 +5016,17 @@ read_line:
     xor r8, r8
     mov r9, rdi
     mov r10, rcx
+    mov byte [history_nav], 0
 .loop:
     call get_char
     cmp al, 0x0D
     je .enter
     cmp al, 0x08
     je .bksp
+    cmp al, KEY_UP
+    je .hist_up
+    cmp al, KEY_DOWN
+    je .hist_down
     cmp r8, r10
     jae .loop
     mov [r9 + r8], al
@@ -4762,10 +5040,122 @@ read_line:
     dec r8
     call do_backspace
     jmp .loop
+
+.hist_up:
+    cmp byte [history_count], 0
+    je .loop
+    movzx rax, byte [history_nav]
+    movzx rbx, byte [history_count]
+    cmp rax, rbx
+    jae .loop                    ; already at the oldest entry
+    cmp rax, 0
+    jne .hu_have_saved
+    mov rsi, r9
+    lea rdi, [history_saved_line]
+    call str_copy
+.hu_have_saved:
+    inc byte [history_nav]
+    call .history_index          ; -> rax = ring index for history_nav
+    imul rax, LINE_MAX
+    lea rsi, [history_buf + rax]
+    call .load_entry
+    jmp .loop
+
+.hist_down:
+    cmp byte [history_nav], 0
+    je .loop
+    dec byte [history_nav]
+    cmp byte [history_nav], 0
+    jne .hd_older
+    lea rsi, [history_saved_line]
+    call .load_entry
+    jmp .loop
+.hd_older:
+    call .history_index
+    imul rax, LINE_MAX
+    lea rsi, [history_buf + rax]
+    call .load_entry
+    jmp .loop
+
+; .history_index: rax = (history_next + HISTORY_MAX - history_nav) mod HISTORY_MAX
+.history_index:
+    push rbx
+    push rdx
+    movzx rax, byte [history_next]
+    add rax, HISTORY_MAX
+    movzx rbx, byte [history_nav]
+    sub rax, rbx
+    xor rdx, rdx
+    mov rbx, HISTORY_MAX
+    div rbx
+    mov rax, rdx
+    pop rdx
+    pop rbx
+    ret
+
+; .load_entry: rsi = null-terminated source string. Erases the currently
+; displayed/buffered line and replaces it with the source string.
+.load_entry:
+    push rax
+    push rcx
+    mov rcx, r8
+.le_erase:
+    cmp rcx, 0
+    je .le_erase_done
+    call do_backspace
+    dec rcx
+    jmp .le_erase
+.le_erase_done:
+    xor r8, r8
+.le_copy:
+    mov al, [rsi + r8]
+    cmp al, 0
+    je .le_copy_done
+    cmp r8, r10
+    jae .le_copy_done
+    mov [r9 + r8], al
+    inc r8
+    jmp .le_copy
+.le_copy_done:
+    mov byte [r9 + r8], 0
+    xor rcx, rcx
+.le_echo:
+    cmp rcx, r8
+    jae .le_echo_done
+    mov al, [r9 + rcx]
+    push rbx
+    mov bl, ATTR_NORMAL
+    call putchar
+    pop rbx
+    inc rcx
+    jmp .le_echo
+.le_echo_done:
+    pop rcx
+    pop rax
+    ret
+
 .enter:
     mov byte [r9 + r8], 0
     mov al, 0x0A
     call putchar
+    cmp r8, 0
+    je .no_history_push
+    movzx rax, byte [history_next]
+    imul rax, LINE_MAX
+    lea rdi, [history_buf + rax]
+    mov rsi, r9
+    call str_copy
+    movzx rax, byte [history_next]
+    inc rax
+    cmp rax, HISTORY_MAX
+    jne .hn_no_wrap
+    xor rax, rax
+.hn_no_wrap:
+    mov [history_next], al
+    cmp byte [history_count], HISTORY_MAX
+    je .no_history_push
+    inc byte [history_count]
+.no_history_push:
     pop rcx
     pop rdi
     pop rbx
@@ -4816,6 +5206,22 @@ cursor_col:   db 0
 shift_state:  db 0
 cur_dir:      dq 0
 auth_valid:   db 0                   ; set by 'auth' command, checked by dangerous commands
+
+; --- keyboard/scrollback/history state ---
+ctrl_state:    db 0                  ; 1 while either Ctrl key is held
+kbd_ext_flag:  db 0                  ; 1 while waiting for the byte after an 0xE0 prefix
+scroll_offset: db 0                  ; 0 = live view, N = N lines scrolled back
+sb_write_idx:  db 0                  ; next slot to write in scrollback_buf (ring)
+sb_count:      db 0                  ; valid lines currently stored in scrollback_buf
+history_next:  db 0                  ; next slot to write in history_buf (ring)
+history_count: db 0                  ; valid entries currently stored in history_buf
+history_nav:   db 0                  ; 0 = not browsing history, else 1..history_count deep
+
+ALIGN 8
+scrollback_buf:     times SCROLLBACK_LINES*VGA_COLS*2 db 0
+live_snapshot:       times VGA_ROWS*VGA_COLS*2 db 0
+history_buf:         times HISTORY_MAX*LINE_MAX db 0
+history_saved_line:  times LINE_MAX db 0
 
 banner:
     db "ShellyForever v0.1 -- 'help' for commands", 10, 0

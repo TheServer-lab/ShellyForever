@@ -24,11 +24,12 @@ jmp start
 
 KERNEL_LOAD_SEG   equ 0x0000
 KERNEL_LOAD_OFF   equ 0x8000
-KERNEL_SECTORS    equ 160         ; how many 512B sectors to load (80KB). The kernel
-                                   ; grew when multi-volume SFFS support was added (the
-                                   ; node table now covers the OS volume plus mounted
-                                   ; drives), so 64 sectors is no longer enough. Must be
-                                   ; <= 255 (CHS fallback uses al) and <= 2880 (media).
+KERNEL_SECTORS    equ 190         ; how many 512B sectors to load (95KB). Bumped from 160
+                                   ; when the scrollback-view and command-history buffers
+                                   ; were added (kernel.bin now needs ~171 sectors, so this
+                                   ; leaves some headroom). Must be <= 255 (CHS fallback
+                                   ; uses al) and stay clear of the SFFS region at LBA 200
+                                   ; (see kernel.asm's SFFS notes) and <= 2880 (media).
 
 ; ---- on-screen checkpoint markers ----
 ; Each stage of the real->protected->long mode transition writes one
