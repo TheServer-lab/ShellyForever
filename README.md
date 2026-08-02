@@ -53,6 +53,18 @@ no C, no BIOS libraries beyond boot-time disk/keyboard calls, no existing kernel
 | `rboot` | `rboot` | save to disk, then restart (requires auth) |
 | `sdown` | `sdown` | save to disk, then shut down (requires auth) |
 
+### Line editing: history and scrollback
+
+- **Up / Down** — recall previous commands (like bash). Your in-progress
+  line is preserved if you arrow up through history and then back down past
+  the most recent entry. History holds the last 20 non-empty lines entered
+  this session (not persisted across reboot).
+- **Ctrl+Up / Ctrl+Down** — scroll the screen back to review output that's
+  scrolled off the top (up to 100 lines of scrollback), without disturbing
+  whatever you're mid-typing at the prompt. Typing a character, pressing
+  Enter, or recalling history all snap the view back to live automatically.
+  Works at the shell prompt and inside the `edit` command's editor.
+
 ### Command chaining with `;`
 
 You can chain multiple commands on a single line using `;`:
@@ -247,7 +259,7 @@ message and then nothing, which is your cue to power off manually.
 - Persistence is whole-table snapshotting (like a save file), not an
   incremental/journaled on-disk format — simple and robust for this scale,
   but a `sync` rewrites the whole reserved region every time.
-- `kernel.bin` currently uses ~117 of the 160 sectors (`KERNEL_SECTORS` in
+- `kernel.bin` currently uses ~171 of the 190 sectors (`KERNEL_SECTORS` in
   `boot.asm`) the bootloader reserves for it. If you add enough new code to
   cross that budget, bump `KERNEL_SECTORS` again — it's a one-line change,
   but the bootloader will silently load a truncated kernel if you forget,
@@ -267,6 +279,8 @@ message and then nothing, which is your cue to power off manually.
 
 ## What's new
 
+- **Command history (Up/Down)** and **scrollback (Ctrl+Up/Ctrl+Down)** — see
+  "Line editing: history and scrollback" above.
 - **`;` command chaining** — run multiple commands on one line:
   `show hello ; show world`. Semicolons inside double quotes are literal.
   Works in both the interactive shell and `rr` script files.
