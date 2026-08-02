@@ -16,7 +16,10 @@ ATTR_NORMAL     equ 0x0A          ; bright green on black
 ATTR_PROMPT     equ 0x0E          ; yellow
 ATTR_ERROR      equ 0x0C          ; red
 
-MAX_NODES       equ 64
+OS_NODES        equ 64              ; nodes per volume (each drive holds its own 64-node table)
+MAX_MOUNTS      equ 2               ; how many extra drives can be mounted at once
+VOL_NODES       equ OS_NODES        ; every volume, OS or mounted, is the same size
+MAX_NODES       equ OS_NODES * (1 + MAX_MOUNTS)   ; 192 = OS volume + 2 mounts
 NAME_LEN        equ 32
 CONTENT_LEN     equ 160
 LINE_MAX        equ 220
@@ -25,57 +28,34 @@ MAX_VARS        equ 16
 VAR_NAME_LEN    equ 32
 MAX_CALC_TOKENS equ 32
 
-; get_char returns these for arrow keys instead of an ASCII byte. Values
-; are chosen outside the 0x00-0x7E range that the scancode tables and
-; every other control code (8/13/27) ever produce, so they can never be
-; confused with a real typed character.
-KEY_UP          equ 0x91
-KEY_DOWN        equ 0x92
-KEY_CTRL_UP     equ 0x93
-KEY_CTRL_DOWN   equ 0x94
-
-; command history (Up/Down arrow recall). Ring buffer, must be a power
-; of two so "index mod HIST_MAX" can be done with a plain AND.
-HIST_MAX        equ 16
-
-; output scrollback (Ctrl+Up/Ctrl+Down). Ring buffer of whole VGA text
-; rows, also power-of-two sized for the same reason. 256 rows is ~10
-; screenfuls of history.
-SCROLLBACK_LINES equ 256
-
-; disk region (LBA sectors) where the filesystem is persisted.
-; kernel occupies LBA 1..64 (see boot.asm KERNEL_SECTORS), so LBA 100
-; leaves plenty of headroom for the kernel to grow.
-FS_LBA_START    equ 100
-
-; --- USB project transfer format (usb list/info/export/import/delete/rename) ---
-; This is intentionally NOT FAT/exFAT - it's a tiny purpose-built layout for
-; moving ShellyForever project folders between machines on a USB drive.
-;   LBA 0        : index header (magic/version/project count)
-;   LBA 1..2     : project table (USB_MAX_PROJECTS fixed-size entries)
-;   LBA 3..      : project archives, one fixed-size slot per table entry
-USB_MAX_PROJECTS       equ 16
-USB_ENTRY_SIZE         equ 64             ; bytes per project-table entry
-USB_TABLE_LBA          equ 1              ; table is 16*64=1024 bytes = 2 sectors
-USB_DATA_START_LBA     equ 3
-USB_PROJECT_SLOT_SECTORS equ 32           ; sectors reserved per project archive
-USB_PROJECT_SLOT_BYTES equ USB_PROJECT_SLOT_SECTORS*512   ; 16384 bytes/project
-
-; project-table entry field offsets (within USB_ENTRY_SIZE bytes)
-USB_ENT_NAME    equ 0      ; NAME_LEN bytes, null-padded
-USB_ENT_LBA     equ 32     ; dd - starting LBA of this project's archive
-USB_ENT_SIZE    equ 36     ; dd - archive size in bytes (used part of slot)
-USB_ENT_FLAGS   equ 40     ; db - bit0 = 1 if this entry is in use
-
-; project archive header (first 16 bytes of every archive)
-USB_ARC_HDR_SIZE equ 16
-; archive record layout (one per filesystem node, pre-order/parent-first)
-USB_REC_TYPE    equ 0      ; db  - 1=folder, 2=file
-USB_REC_PARENT  equ 1      ; dw  - local index of parent record, 0xFFFF = archive root
-USB_REC_NAME    equ 3      ; NAME_LEN bytes, null-padded
-USB_REC_CLEN    equ 3+NAME_LEN         ; dw - content length (files only)
-USB_REC_CONTENT equ 3+NAME_LEN+2       ; CONTENT_LEN bytes, null-padded
-USB_REC_SIZE    equ 3+NAME_LEN+2+CONTENT_LEN
+; ------------------------------------------------------------------
+;  SFFS v2 -- ShellyForever File Storage format (on-disk layout).
+;  Every drive (OS boot drive and any data drives) uses the same
+;  fixed layout so any drive can be scanned, formatted, and mounted:
+;
+;    LBA  FS_LBA_START     : superblock (512B) - magic 'SFFS', version
+;                             byte, reserved, 32-byte disk label
+;    LBA  FS_LBA_START+1   : node_type[VOL_NODES]  (1 sector, padded)
+;    LBA  FS_LBA_START+2   : node_parent[VOL_NODES] (1 sector, padded)
+;    LBA  FS_LBA_START+3.. : node_name[VOL_NODES*NAME_LEN] (4 sectors)
+;    LBA  FS_LBA_START+7.. : node_content[VOL_NODES*CONTENT_LEN] (20)
+;
+;  dscan probes all four ATA device slots for the magic, format writes
+;  a fresh empty volume + label, and mount loads a volume's node table
+;  into memory (remapping its parent indices) rooted at /<label>/.
+;  The kernel occupies LBA 1..160 (KERNEL_SECTORS in boot.asm), so the
+;  filesystem region at LBA 200 is well clear of it.
+; ------------------------------------------------------------------
+FS_LBA_START    equ 200
+SFFS_VERSION    equ 2
+SUPER_LABEL_OFF equ 8               ; label lives at superblock offset 8..39
+SUPER_LBA       equ FS_LBA_START
+TYPE_LBA        equ SUPER_LBA + 1
+PARENT_LBA      equ SUPER_LBA + 2
+NAME_LBA        equ SUPER_LBA + 3
+CONTENT_LBA     equ SUPER_LBA + 7
+NAME_SECTORS    equ (VOL_NODES * NAME_LEN) / 512          ; 4
+CONTENT_SECTORS equ (VOL_NODES * CONTENT_LEN) / 512       ; 20
 
 ; ============================================================
 kernel_entry:
@@ -129,7 +109,6 @@ kernel_entry:
         mov rdi, line_buf
         mov rcx, LINE_MAX-1
         call read_line
-        call hist_push
     
         ; skip $ comments (lines starting with $)
         cmp byte [line_buf], '$'
@@ -608,22 +587,16 @@ dispatch:
     je cmd_dscan
 
     mov rsi, cmd_buf
-    mov rdi, str_usbinfo
+    mov rdi, str_format
     call str_eq
     cmp al, 1
-    je cmd_usbinfo
+    je cmd_format
 
     mov rsi, cmd_buf
-    mov rdi, str_usbdisk
+    mov rdi, str_mount
     call str_eq
     cmp al, 1
-    je cmd_usbdisk
-
-    mov rsi, cmd_buf
-    mov rdi, str_usb
-    call str_eq
-    cmp al, 1
-    je cmd_usb
+    je cmd_mount
 
     ; unknown command
     mov rsi, msg_unknown1
@@ -1240,6 +1213,437 @@ cmd_sync:
     ret
 
 ; ------------------------------------------------------------
+; cmd_dscan: probe all four ATA device slots (primary/secondary x
+; master/slave) for SFFS volumes and report what's attached.
+cmd_dscan:
+    push r13
+    push r15
+    mov rsi, msg_dscan_header
+    mov al, ATTR_NORMAL
+    call print_string_attr
+    xor r15, r15                ; found-any flag
+    xor r13, r13                ; device id
+.scan:
+    cmp r13, 4
+    jae .done
+    mov al, r13b
+    call ata_select_device
+    mov rax, SUPER_LBA
+    lea rdi, [fs_super_buf]
+    call ata_read_sector
+    jc .next                    ; no response -> slot is empty
+    ; present; check for the SFFS magic + version
+    cmp byte [fs_super_buf+0], 'S'
+    jne .other
+    cmp byte [fs_super_buf+1], 'F'
+    jne .other
+    cmp byte [fs_super_buf+2], 'F'
+    jne .other
+    cmp byte [fs_super_buf+3], 'S'
+    jne .other
+    cmp byte [fs_super_buf+4], SFFS_VERSION
+    jne .other
+    ; valid SFFS volume
+    mov r15, 1
+    mov rsi, msg_dscan_found1   ; "  device "
+    mov al, ATTR_NORMAL
+    call print_string_attr
+    mov rax, r13
+    lea rdi, [show_num_buf]
+    call int_to_str
+    mov rsi, show_num_buf
+    call print_string
+    mov rsi, msg_dscan_found2   ; " ("
+    call print_string
+    mov al, r13b
+    call print_device_name
+    mov rsi, msg_dscan_found3   ; "): SFFS volume '"
+    call print_string
+    lea rsi, [fs_super_buf + SUPER_LABEL_OFF]
+    call print_string
+    mov rsi, msg_dscan_found4   ; "'"
+    call print_string
+    mov rsi, newline_str
+    call print_string
+    jmp .next
+.other:
+    ; a drive is there but it isn't ours
+    mov r15, 1
+    mov rsi, msg_dscan_found1   ; "  device "
+    mov al, ATTR_NORMAL
+    call print_string_attr
+    mov rax, r13
+    lea rdi, [show_num_buf]
+    call int_to_str
+    mov rsi, show_num_buf
+    call print_string
+    mov rsi, msg_dscan_found2   ; " ("
+    call print_string
+    mov al, r13b
+    call print_device_name
+    mov rsi, msg_dscan_other2   ; "): present, not SFFS"
+    call print_string
+    mov rsi, newline_str
+    call print_string
+.next:
+    inc r13
+    jmp .scan
+.done:
+    cmp r15, 0
+    jne .has
+    mov rsi, msg_dscan_none
+    mov al, ATTR_NORMAL
+    call print_string_attr
+.has:
+    pop r15
+    pop r13
+    ret
+
+; print_device_name: al = device id 0..3 -> prints "primary master" etc.
+print_device_name:
+    push rbx
+    push rsi
+    mov bl, al
+    and bl, 3
+    cmp bl, 2
+    jb .primary
+    mov rsi, msg_dev_secondary
+    jmp .which
+.primary:
+    mov rsi, msg_dev_primary
+.which:
+    call print_string
+    test bl, 1
+    jz .master
+    mov rsi, msg_dev_slave
+    call print_string
+    jmp .done
+.master:
+    mov rsi, msg_dev_master
+    call print_string
+.done:
+    pop rsi
+    pop rbx
+    ret
+
+; ------------------------------------------------------------
+; cmd_format: format a drive with the SFFS format and give it a label.
+;   fmt <label>             first present drive that isn't SFFS yet        
+;   fmt <label> -force      first present drive (even an existing volume)  
+; The boot drive (device 0) is never touched unless -force is given.
+cmd_format:
+    cmp byte [arg1_buf], 0
+    jne .have_arg
+    mov rsi, msg_fmt_usage
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+.have_arg:
+    mov rsi, arg1_buf
+    call str_len
+    cmp rax, 32
+    jae .too_long
+    ; find the target device
+    xor r13, r13                ; device being scanned
+    xor rbx, rbx                ; last valid SFFS device seen (for -force)
+    mov r14b, 0                 ; any valid SFFS device seen?
+.scan:
+    cmp r13, 4
+    jae .scan_done
+    mov al, r13b
+    call ata_select_device
+    mov rax, SUPER_LBA
+    lea rdi, [fs_super_buf]
+    call ata_read_sector
+    jc .next                    ; absent
+    cmp byte [fs_super_buf+0], 'S'
+    jne .unformatted
+    cmp byte [fs_super_buf+1], 'F'
+    jne .unformatted
+    cmp byte [fs_super_buf+2], 'F'
+    jne .unformatted
+    cmp byte [fs_super_buf+3], 'S'
+    jne .unformatted
+    cmp byte [fs_super_buf+4], SFFS_VERSION
+    jne .unformatted
+    ; already an SFFS volume - remember it for the -force path
+    mov rbx, r13
+    mov r14b, 1
+    jmp .next
+.unformatted:
+    ; skip the boot drive (device 0) unless -force; it holds the OS
+    cmp r13, 0
+    je .next
+    jmp .found
+.next:
+    inc r13
+    jmp .scan
+.scan_done:
+    mov rsi, arg2_buf
+    mov rdi, str_force
+    call str_eq
+    cmp al, 1
+    jne .none
+    cmp r14b, 1
+    jne .none
+    mov r13, rbx
+    jmp .format_target
+.none:
+    mov rsi, msg_fmt_none
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+.too_long:
+    mov rsi, msg_fmt_long
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+.found:
+    ; format the first unformatted drive we hit
+.format_target:
+    mov al, r13b
+    call ata_select_device
+    ; superblock: magic + version + label
+    mov rdi, fs_super_buf
+    mov rcx, 512 / 8
+    xor rax, rax
+    rep stosq
+    mov byte [fs_super_buf+0], 'S'
+    mov byte [fs_super_buf+1], 'F'
+    mov byte [fs_super_buf+2], 'F'
+    mov byte [fs_super_buf+3], 'S'
+    mov byte [fs_super_buf+4], SFFS_VERSION
+    mov rsi, arg1_buf
+    lea rdi, [fs_super_buf + SUPER_LABEL_OFF]
+    call str_copy
+    mov rax, SUPER_LBA
+    lea rsi, [fs_super_buf]
+    call ata_write_sector
+    jc .disk_err
+    ; node_type: a single root folder
+    mov rdi, fs_super_buf
+    mov rcx, 512 / 8
+    xor rax, rax
+    rep stosq
+    mov byte [fs_super_buf], 1
+    mov rax, TYPE_LBA
+    lea rsi, [fs_super_buf]
+    call ata_write_sector
+    jc .disk_err
+    ; node_parent: root parent = 0xFFFF
+    mov rdi, fs_super_buf
+    mov rcx, 512 / 8
+    xor rax, rax
+    rep stosq
+    mov word [fs_super_buf], 0xFFFF
+    mov rax, PARENT_LBA
+    lea rsi, [fs_super_buf]
+    call ata_write_sector
+    jc .disk_err
+    ; node_name: root named <label>, then zero sectors
+    mov rdi, fs_super_buf
+    mov rcx, 512 / 8
+    xor rax, rax
+    rep stosq
+    mov rsi, arg1_buf
+    lea rdi, [fs_super_buf]
+    call str_copy
+    mov rax, NAME_LBA
+    mov rcx, NAME_SECTORS
+.name_wr:
+    push rax
+    push rcx
+    lea rsi, [fs_super_buf]
+    call ata_write_sector
+    pop rcx
+    pop rax
+    jc .disk_err
+    inc rax
+    loop .name_wr
+    ; node_content: zero sectors
+    mov rdi, fs_super_buf
+    mov rcx, 512 / 8
+    xor rax, rax
+    rep stosq
+    mov rax, CONTENT_LBA
+    mov rcx, CONTENT_SECTORS
+.content_wr:
+    push rax
+    push rcx
+    lea rsi, [fs_super_buf]
+    call ata_write_sector
+    pop rcx
+    pop rax
+    jc .disk_err
+    inc rax
+    loop .content_wr
+    ; report
+    mov rsi, msg_fmt_ok1
+    mov al, ATTR_NORMAL
+    call print_string_attr
+    mov rsi, arg1_buf
+    call print_string
+    mov rsi, msg_fmt_ok2
+    call print_string
+    mov al, r13b
+    call print_device_name
+    mov rsi, msg_fmt_ok3
+    call print_string
+    mov rsi, newline_str
+    call print_string
+    ret
+.disk_err:
+    mov rsi, msg_fmt_err
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+
+; ------------------------------------------------------------
+; cmd_mount: attach a formatted drive to the filesystem tree.
+;   mount <label>
+; Loads the volume whose superblock label matches <label>, remaps its
+; node table into a free mount slice, and roots it as /<label>/ under
+; /home. Then 'cf <label>' (or 'cf /<label>') enters it.
+cmd_mount:
+    cmp byte [arg1_buf], 0
+    jne .have_arg
+    mov rsi, msg_mount_usage
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+.have_arg:
+    ; already mounted?
+    xor r12, r12
+.already_loop:
+    cmp r12, MAX_MOUNTS
+    jae .already_done
+    cmp byte [mount_used + r12], 0
+    je .already_next
+    mov rax, r12
+    imul rax, 32
+    lea rsi, [mount_label + rax]
+    mov rdi, arg1_buf
+    call str_eq
+    cmp al, 1
+    je .already_mounted
+.already_next:
+    inc r12
+    jmp .already_loop
+.already_done:
+    ; find a device whose label matches
+    xor r13, r13
+.scan:
+    cmp r13, 4
+    jae .not_found
+    mov al, r13b
+    call ata_select_device
+    mov rax, SUPER_LBA
+    lea rdi, [fs_super_buf]
+    call ata_read_sector
+    jc .scan_next
+    cmp byte [fs_super_buf+0], 'S'
+    jne .scan_next
+    cmp byte [fs_super_buf+1], 'F'
+    jne .scan_next
+    cmp byte [fs_super_buf+2], 'F'
+    jne .scan_next
+    cmp byte [fs_super_buf+3], 'S'
+    jne .scan_next
+    cmp byte [fs_super_buf+4], SFFS_VERSION
+    jne .scan_next
+    lea rsi, [fs_super_buf + SUPER_LABEL_OFF]
+    mov rdi, arg1_buf
+    call str_eq
+    cmp al, 1
+    je .found
+.scan_next:
+    inc r13
+    jmp .scan
+.found:
+    ; find a free mount slot
+    xor r12, r12
+.slot_loop:
+    cmp r12, MAX_MOUNTS
+    jae .too_many
+    cmp byte [mount_used + r12], 0
+    je .slot_ok
+    inc r12
+    jmp .slot_loop
+.slot_ok:
+    ; base node = VOL_NODES * (slot + 1)
+    mov rdi, r12
+    inc rdi
+    imul rdi, VOL_NODES
+    mov al, r13b
+    call vol_read
+    cmp rax, -1
+    je .load_fail
+    ; record the mount
+    mov byte [mount_used + r12], 1
+    mov byte [mount_device + r12], r13b
+    mov rax, r12
+    imul rax, 32
+    lea rdi, [mount_label + rax]
+    mov rsi, arg1_buf
+    call str_copy
+    ; root the volume as /<label>/ under the OS root
+    mov rdi, r12
+    inc rdi
+    imul rdi, VOL_NODES
+    mov byte [node_type + rdi], 1
+    imul rdi, NAME_LEN
+    lea rdi, [node_name + rdi]
+    mov rsi, arg1_buf
+    call str_copy
+    ; report
+    mov rsi, msg_mount_ok1      ; "Mounted "
+    mov al, ATTR_NORMAL
+    call print_string_attr
+    mov rsi, arg1_buf
+    call print_string
+    mov rsi, msg_mount_ok2      ; " at /"
+    call print_string
+    mov rsi, arg1_buf
+    call print_string
+    mov rsi, msg_mount_ok3      ; "/. Use 'cf "
+    call print_string
+    mov rsi, arg1_buf
+    call print_string
+    mov rsi, msg_mount_ok4      ; "' to enter it."
+    call print_string
+    mov rsi, newline_str
+    call print_string
+    ret
+.already_mounted:
+    mov rsi, msg_mount_already
+    mov al, ATTR_ERROR
+    call print_string_attr
+    mov rsi, arg1_buf
+    call print_string
+    mov rsi, newline_str
+    call print_string
+    ret
+.not_found:
+    mov rsi, msg_mount_none
+    mov al, ATTR_ERROR
+    call print_string_attr
+    mov rsi, arg1_buf
+    call print_string
+    mov rsi, msg_mount_none2
+    call print_string
+    ret
+.too_many:
+    mov rsi, msg_mount_full
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+.load_fail:
+    mov rsi, msg_mount_fail
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+
+; ------------------------------------------------------------
 cmd_reboot:
     cmp byte [auth_valid], 0
     jne .reboot_ok
@@ -1290,7 +1694,32 @@ cmd_del:
     call fs_find_child
     cmp rax, -1
     je .not_found
+    mov r14, rax
     call fs_delete_tree          ; recurses for folders, deletes a single node for files
+    ; if we just deleted a mounted volume's root, drop that mount slot too
+    xor r13, r13
+.clear_mount_loop:
+    cmp r13, MAX_MOUNTS
+    jae .clear_mount_done
+    cmp byte [mount_used + r13], 0
+    je .clear_mount_next
+    mov rdi, r13
+    inc rdi
+    imul rdi, VOL_NODES
+    cmp rdi, r14
+    jne .clear_mount_next
+    mov byte [mount_used + r13], 0
+    mov byte [mount_device + r13], 0
+    mov rdi, r13
+    imul rdi, 32
+    lea rdi, [mount_label + rdi]
+    mov rcx, 32
+    xor al, al
+    rep stosb
+.clear_mount_next:
+    inc r13
+    jmp .clear_mount_loop
+.clear_mount_done:
     ret
 .not_found:
     mov rsi, msg_no_entry
@@ -2498,2775 +2927,6 @@ vars_clear_all:
     pop rcx
     pop rax
     ret
-
-; ============================================================
-;  USB STACK - PHASE 1: PCI bus enumeration
-;  Finds a UHCI USB host controller so later phases can drive it.
-;  Only bus 0 is scanned for now (every USB controller QEMU exposes, and
-;  the vast majority on real desktop hardware, lives there); scanning PCI
-;  bridges down into other buses is a straightforward extension for later
-;  if a real machine needs it.
-; ============================================================
-
-; hex_to_str: rax=value, rcx=number of hex digits to print, rdi=buffer.
-; Writes rcx uppercase hex digits (zero-padded) + null terminator.
-hex_to_str:
-    push rax
-    push rbx
-    push rcx
-    push rsi
-    mov rsi, rdi
-    add rsi, rcx
-    mov byte [rsi], 0
-.htz_loop:
-    dec rsi
-    mov rbx, rax
-    and rbx, 0xF
-    cmp rbx, 10
-    jl .htz_digit
-    add rbx, 'A'-10
-    jmp .htz_store
-.htz_digit:
-    add rbx, '0'
-.htz_store:
-    mov [rsi], bl
-    shr rax, 4
-    dec rcx
-    jnz .htz_loop
-    pop rsi
-    pop rcx
-    pop rbx
-    pop rax
-    ret
-
-; pci_config_read_dword: rdi=bus, rsi=device, rdx=function, rcx=offset
-; (offset need not be pre-aligned; low 2 bits are masked off).
-; Returns: eax = the dword read from PCI config space.
-; Uses the standard CONFIG_ADDRESS/CONFIG_DATA I/O ports (0xCF8/0xCFC),
-; which work identically in real, protected, and long mode.
-pci_config_read_dword:
-    push rbx
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-
-    mov eax, 0x80000000
-    mov ebx, edi
-    and ebx, 0xFF
-    shl ebx, 16
-    or eax, ebx
-    mov ebx, esi
-    and ebx, 0x1F
-    shl ebx, 11
-    or eax, ebx
-    mov ebx, edx
-    and ebx, 0x07
-    shl ebx, 8
-    or eax, ebx
-    mov ebx, ecx
-    and ebx, 0xFC
-    or eax, ebx
-
-    mov dx, 0x0CF8
-    out dx, eax
-    mov dx, 0x0CFC
-    in eax, dx
-
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
-    ret
-
-; pci_report_device: r15=device index, r13=function index (bus fixed at 0).
-; Prints the device's vendor/device IDs; if it's a UHCI USB controller,
-; also records its I/O base (BAR4) into usb_uhci_* for later phases.
-pci_report_device:
-    push rax
-    push rbx
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-
-    mov rdi, 0
-    mov rsi, r15
-    mov rdx, r13
-    mov rcx, 0
-    call pci_config_read_dword
-    mov [pci_tmp_vendev], eax
-
-    mov rdi, 0
-    mov rsi, r15
-    mov rdx, r13
-    mov rcx, 0x08
-    call pci_config_read_dword
-    mov [pci_tmp_class], eax
-
-    mov rsi, msg_pci_dev
-    mov al, ATTR_NORMAL
-    call print_string_attr
-    mov rax, r15
-    mov rdi, hexbuf
-    mov rcx, 2
-    call hex_to_str
-    mov rsi, hexbuf
-    call print_string
-    mov rsi, msg_pci_func
-    call print_string
-    mov rax, r13
-    mov rdi, hexbuf
-    mov rcx, 1
-    call hex_to_str
-    mov rsi, hexbuf
-    call print_string
-    mov rsi, msg_pci_vendor
-    call print_string
-    mov eax, [pci_tmp_vendev]
-    and eax, 0xFFFF
-    mov rdi, hexbuf
-    mov rcx, 4
-    call hex_to_str
-    mov rsi, hexbuf
-    call print_string
-    mov rsi, msg_pci_device
-    call print_string
-    mov eax, [pci_tmp_vendev]
-    shr eax, 16
-    mov rdi, hexbuf
-    mov rcx, 4
-    call hex_to_str
-    mov rsi, hexbuf
-    call print_string
-    mov rsi, newline_str
-    call print_string
-
-    ; class code lives in byte 3, subclass in byte 2, prog-if in byte 1
-    ; of the dword read at config offset 0x08.
-    mov eax, [pci_tmp_class]
-    mov ebx, eax
-    shr ebx, 24
-    cmp ebx, 0x0C                  ; class 0x0C = serial bus controller
-    jne .prd_done
-    mov ebx, eax
-    shr ebx, 16
-    and ebx, 0xFF
-    cmp ebx, 0x03                  ; subclass 0x03 = USB controller
-    jne .prd_done
-
-    mov ebx, eax
-    shr ebx, 8
-    and ebx, 0xFF                  ; prog-if: 0x00=UHCI 0x10=OHCI 0x20=EHCI 0x30=XHCI
-    cmp ebx, 0x00
-    jne .prd_not_uhci
-
-    ; Only the first UHCI controller found gets used - real hardware can
-    ; have several, but everything from here on (frame list, port state)
-    ; assumes exactly one active controller.
-    cmp byte [usb_uhci_found], 1
-    je .prd_done
-
-    mov rdi, 0
-    mov rsi, r15
-    mov rdx, r13
-    mov rcx, 0x20                  ; BAR4 holds the UHCI I/O-space base
-    call pci_config_read_dword
-    and eax, 0xFFFC                ; clear the I/O-space/reserved low bits
-    mov [usb_uhci_io_base], ax
-    mov byte [usb_uhci_bus], 0
-    mov [usb_uhci_dev], r15b
-    mov [usb_uhci_func], r13b
-    mov byte [usb_uhci_found], 1
-
-    mov rsi, msg_uhci_found
-    mov al, ATTR_NORMAL
-    call print_string_attr
-    movzx eax, word [usb_uhci_io_base]
-    mov rdi, hexbuf
-    mov rcx, 4
-    call hex_to_str
-    mov rsi, hexbuf
-    call print_string
-    mov rsi, newline_str
-    call print_string
-
-    call uhci_init                 ; bring the controller up + report ports
-    jmp .prd_done
-
-.prd_not_uhci:
-    mov rsi, msg_usb_other
-    mov al, ATTR_NORMAL
-    call print_string_attr
-
-.prd_done:
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
-    pop rax
-    ret
-
-; cmd_dscan: scan PCI bus 0, device 0..31 (all functions on multi-function
-; devices), report every device found, and flag the first UHCI USB host
-; controller for the mount phase to use.
-cmd_dscan:
-    mov rsi, msg_dscan_header
-    mov al, ATTR_NORMAL
-    call print_string_attr
-    mov byte [usb_uhci_found], 0
-
-    xor r15, r15                   ; r15 = device index 0..31
-.dsc_dev_loop:
-    cmp r15, 32
-    jae .dsc_dev_done
-
-    mov rdi, 0
-    mov rsi, r15
-    mov rdx, 0
-    mov rcx, 0
-    call pci_config_read_dword
-    cmp eax, 0xFFFFFFFF
-    je .dsc_next_dev                ; nothing at function 0 -> device absent
-
-    ; header type byte (offset 0x0C dword, byte 2) tells us whether to
-    ; probe functions 1-7 too.
-    mov rdi, 0
-    mov rsi, r15
-    mov rdx, 0
-    mov rcx, 0x0C
-    call pci_config_read_dword
-    mov ebx, eax
-    shr ebx, 16
-    and ebx, 0xFF
-    test ebx, 0x80
-    jz .dsc_single_func
-
-    xor r13, r13                    ; r13 = function index
-.dsc_func_loop:
-    cmp r13, 8
-    jae .dsc_next_dev
-    mov rdi, 0
-    mov rsi, r15
-    mov rdx, r13
-    mov rcx, 0
-    call pci_config_read_dword
-    cmp eax, 0xFFFFFFFF
-    je .dsc_func_next
-    call pci_report_device
-.dsc_func_next:
-    inc r13
-    jmp .dsc_func_loop
-
-.dsc_single_func:
-    xor r13, r13
-    call pci_report_device
-
-.dsc_next_dev:
-    inc r15
-    jmp .dsc_dev_loop
-
-.dsc_dev_done:
-    cmp byte [usb_uhci_found], 1
-    je .dsc_ret
-    mov rsi, msg_dscan_none
-    mov al, ATTR_ERROR
-    call print_string_attr
-.dsc_ret:
-    ret
-
-; ============================================================
-;  USB STACK - PHASE 2: UHCI controller init + root hub port detection
-; ============================================================
-
-; UHCI I/O-space register offsets (relative to usb_uhci_io_base)
-UHCI_USBCMD     equ 0x00
-UHCI_USBSTS     equ 0x02
-UHCI_FRNUM      equ 0x06
-UHCI_FRBASEADD  equ 0x08
-UHCI_PORTSC1    equ 0x10
-UHCI_PORTSC2    equ 0x12
-
-; USBCMD bits
-UHCI_CMD_RS       equ 0x0001        ; run/stop
-UHCI_CMD_HCRESET  equ 0x0002        ; host controller reset
-UHCI_CMD_GRESET   equ 0x0004        ; global reset (resets attached devices)
-UHCI_CMD_CF       equ 0x0040        ; configure flag
-UHCI_CMD_MAXP     equ 0x0080        ; max packet (64 bytes for full-speed)
-
-; PORTSC bits
-UHCI_PORT_CCS     equ 0x0001        ; current connect status
-
-; uhci_delay: crude fixed busy-wait, calibrated generously since there's
-; no timer (PIT/HPET) driver yet - matches the bounded-poll style already
-; used by the ATA driver (see ata_wait_bsy) rather than a real millisecond
-; timer. UHCI's global-reset pulse needs to hold for a while (spec allows
-; up to 10-50ms); this errs long rather than risk cutting it short.
-UHCI_DELAY_SPINS equ 0x4000000
-uhci_delay:
-    push rcx
-    mov rcx, UHCI_DELAY_SPINS
-.spin:
-    loop .spin
-    pop rcx
-    ret
-
-; uhci_init: brings up the UHCI controller at usb_uhci_io_base and reports
-; root hub port status. No parameters/return value - state goes into
-; usb_uhci_ready and uhci_port1_status/uhci_port2_status for later phases.
-uhci_init:
-    push rax
-    push rdx
-    push r8
-
-    movzx r8, word [usb_uhci_io_base]
-
-    ; ---- global reset: pulses a reset signal out to attached devices ----
-    mov dx, r8w
-    add dx, UHCI_USBCMD
-    mov ax, UHCI_CMD_GRESET
-    out dx, ax
-    call uhci_delay
-    xor ax, ax
-    out dx, ax                      ; clear GRESET
-
-    ; ---- host controller reset: resets the HC's own internal state ----
-    mov ax, UHCI_CMD_HCRESET
-    out dx, ax
-.hcreset_wait:
-    in ax, dx
-    test ax, UHCI_CMD_HCRESET
-    jnz .hcreset_wait               ; hardware clears this bit when done
-
-    ; ---- point the controller at an empty frame list ----
-    ; Every entry has its Terminate bit (bit0) set, so the controller
-    ; won't try to process any queue/transfer descriptors yet - that
-    ; comes in a later phase once we're actually issuing transfers.
-    mov dx, r8w
-    add dx, UHCI_FRBASEADD
-    mov eax, uhci_frame_list        ; physical == linear here (identity map)
-    out dx, eax
-
-    mov dx, r8w
-    add dx, UHCI_FRNUM
-    xor ax, ax
-    out dx, ax
-
-    ; ---- clear stale status bits (write-1-to-clear register) ----
-    mov dx, r8w
-    add dx, UHCI_USBSTS
-    mov ax, 0xFFFF
-    out dx, ax
-
-    ; ---- start the controller running ----
-    mov dx, r8w
-    add dx, UHCI_USBCMD
-    mov ax, UHCI_CMD_RS | UHCI_CMD_CF | UHCI_CMD_MAXP
-    out dx, ax
-
-    mov byte [usb_uhci_ready], 1
-    mov rsi, msg_uhci_init_ok
-    mov al, ATTR_NORMAL
-    call print_string_attr
-
-    ; ---- root hub port detection ----
-    mov dx, r8w
-    add dx, UHCI_PORTSC1
-    in ax, dx
-    mov [uhci_port1_status], ax
-    test ax, UHCI_PORT_CCS
-    jz .port1_empty
-    mov rsi, msg_uhci_port1_device
-    jmp .port1_report
-.port1_empty:
-    mov rsi, msg_uhci_port1_empty
-.port1_report:
-    mov al, ATTR_NORMAL
-    call print_string_attr
-
-    mov dx, r8w
-    add dx, UHCI_PORTSC2
-    in ax, dx
-    mov [uhci_port2_status], ax
-    test ax, UHCI_PORT_CCS
-    jz .port2_empty
-    mov rsi, msg_uhci_port2_device
-    jmp .port2_report
-.port2_empty:
-    mov rsi, msg_uhci_port2_empty
-.port2_report:
-    mov al, ATTR_NORMAL
-    call print_string_attr
-
-    pop r8
-    pop rdx
-    pop rax
-    ret
-
-; ============================================================
-;  USB STACK - PHASE 3: control transfers
-;  Builds UHCI Transfer Descriptors (TDs) and a Queue Head (QH) to run a
-;  standard three-stage USB control transfer (SETUP + optional DATA +
-;  STATUS), then uses that primitive to move the device off the default
-;  address (0) and read its device and configuration descriptors. TD/QH
-;  pointers are physical addresses; this kernel is identity-mapped so
-;  linear == physical, the same assumption uhci_frame_list already relies
-;  on in Phase 2.
-; ============================================================
-
-; ---- UHCI TD token PIDs ----
-UHCI_PID_SETUP  equ 0x2D
-UHCI_PID_IN     equ 0x69
-UHCI_PID_OUT    equ 0xE1
-
-; ---- UHCI TD Control/Status dword bits ----
-UHCI_TD_SPD      equ (1 << 29)     ; short packet ends the queue, not an error
-UHCI_TD_CERR3    equ (3 << 27)     ; retry up to 3 times before giving up
-UHCI_TD_ACTIVE   equ (1 << 23)
-UHCI_TD_ERR_MASK equ 0x007E0000    ; bits 17-22: Bitstuff/CRC/NAK/Babble/Buffer/Stalled
-
-; conservative EP0 packet size: the spec-guaranteed minimum for every
-; full/low-speed control endpoint. A real driver would read the device's
-; actual bMaxPacketSize0 and switch to it; we always use the safe minimum,
-; which costs a few extra TDs on larger reads but works unconditionally.
-UHCI_CTRL_MAXPKT  equ 8
-UHCI_CTRL_TIMEOUT equ 0x200000     ; poll budget, ATA_TIMEOUT-style (see ata_wait_bsy)
-
-; uhci_ctrl_transfer: runs one control transfer over EP0 using the fixed
-; QH/TD pool. Caller fills in first:
-;   usb_xfer_addr  - target device address (0 = default address)
-;   usb_xfer_setup - 8-byte setup packet
-;   usb_xfer_buf   - data-stage buffer pointer; ignored if usb_xfer_len=0
-;   usb_xfer_len   - data-stage length in bytes (0 = no data stage)
-;   usb_xfer_dir   - 1 = IN (device->host), 0 = OUT; ignored if len=0
-; Returns al=1 on success, al=0 on failure (timeout or a TD error bit).
-; On a successful IN transfer, the received bytes are at usb_xfer_buf.
-uhci_ctrl_transfer:
-    push rbx
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    push r8
-    push r9
-    push r10
-    push r11
-    push r12
-    push r13
-    push r14
-
-    mov rsi, usb_xfer_setup
-    mov rdi, uhci_setup_pkt
-    mov rcx, 8
-    rep movsb                       ; SETUP TD's buffer points at this copy
-
-    ; ---- how many 8-byte data TDs does this transfer need? ----
-    movzx r13, word [usb_xfer_len]
-    xor r10, r10
-    test r13, r13
-    jz .uct_no_data_tds
-    mov rax, r13
-    add rax, UHCI_CTRL_MAXPKT - 1
-    xor rdx, rdx
-    mov rcx, UHCI_CTRL_MAXPKT
-    div rcx                         ; rax = ceil(len / MAXPKT)
-    mov r10, rax
-.uct_no_data_tds:
-    ; bail out rather than overrun the pool if a caller ever asks for more
-    ; than it can hold (SETUP + data TDs + STATUS)
-    mov rax, r10
-    add rax, 2
-    cmp rax, UHCI_MAX_TDS
-    jbe .uct_size_ok
-    xor al, al
-    jmp .uct_ret
-.uct_size_ok:
-
-    lea r12, [uhci_td_pool + 16]    ; r12 = cursor, starts at TD #1
-
-    ; ---- TD #0: SETUP stage (always present, always DATA0) ----
-    mov rdi, uhci_td_pool
-    mov eax, r12d
-    or eax, 0x04                    ; Vf=1 (depth-first), Q=0, T=0
-    mov [rdi], eax
-    mov eax, UHCI_TD_ACTIVE | UHCI_TD_CERR3
-    mov [rdi+4], eax
-    movzx eax, byte [usb_xfer_addr]
-    shl eax, 8
-    or eax, UHCI_PID_SETUP          ; endpoint=0, toggle=DATA0 (both bits 0)
-    mov ecx, 7                      ; MaxLen field = actual_len(8) - 1
-    shl ecx, 21
-    or eax, ecx
-    mov [rdi+8], eax
-    mov eax, uhci_setup_pkt
-    mov [rdi+12], eax
-
-    ; ---- data TDs (0 or more): alternate DATA1/DATA0, IN or OUT ----
-    xor r8, r8                      ; data TD index
-    mov r9, 1                       ; toggle, data stage starts at DATA1
-    mov r11, [usb_xfer_buf]         ; buffer cursor
-    movzx r13, word [usb_xfer_len]  ; bytes remaining
-    test r10, r10
-    jz .uct_data_tds_done
-.uct_data_td_loop:
-    cmp r8, r10
-    jae .uct_data_tds_done
-
-    mov r14, r13                    ; chunk length = min(remaining, MAXPKT)
-    cmp r14, UHCI_CTRL_MAXPKT
-    jbe .uct_chunk_ok
-    mov r14, UHCI_CTRL_MAXPKT
-.uct_chunk_ok:
-
-    mov rdi, r12
-    lea rax, [r12 + 16]              ; next TD - the next data TD, or the
-    or eax, 0x04                     ; STATUS TD once the loop ends
-    mov [rdi], eax
-
-    mov eax, UHCI_TD_ACTIVE | UHCI_TD_CERR3 | UHCI_TD_SPD
-    mov [rdi+4], eax
-
-    movzx eax, byte [usb_xfer_addr]
-    shl eax, 8
-    cmp byte [usb_xfer_dir], 1
-    je .uct_data_pid_in
-    or eax, UHCI_PID_OUT
-    jmp .uct_data_pid_set
-.uct_data_pid_in:
-    or eax, UHCI_PID_IN
-.uct_data_pid_set:
-    mov ecx, r9d
-    shl ecx, 19
-    or eax, ecx                      ; data toggle bit
-    mov edx, r14d
-    dec edx
-    and edx, 0x7FF
-    shl edx, 21
-    or eax, edx                      ; MaxLen = chunk_len - 1
-    mov [rdi+8], eax
-
-    mov eax, r11d
-    mov [rdi+12], eax
-
-    add r11, r14
-    sub r13, r14
-    xor r9, 1                        ; flip toggle
-    add r12, 16
-    inc r8
-    jmp .uct_data_td_loop
-.uct_data_tds_done:
-
-    ; ---- STATUS stage: zero-length, always DATA1, opposite direction of
-    ; the data stage (or IN if there was no data stage at all) ----
-    mov rdi, r12
-    mov dword [rdi], 0x00000001      ; Terminate: nothing follows STATUS
-    mov eax, UHCI_TD_ACTIVE | UHCI_TD_CERR3
-    mov [rdi+4], eax
-    movzx eax, byte [usb_xfer_addr]
-    shl eax, 8
-    test r10, r10
-    jz .uct_status_in
-    cmp byte [usb_xfer_dir], 1
-    je .uct_status_out
-.uct_status_in:
-    or eax, UHCI_PID_IN
-    jmp .uct_status_pid_set
-.uct_status_out:
-    or eax, UHCI_PID_OUT
-.uct_status_pid_set:
-    or eax, (1 << 19)                ; data toggle = DATA1
-    mov ecx, 0x7FF                   ; MaxLen encoding for a 0-byte packet
-    shl ecx, 21
-    or eax, ecx
-    mov [rdi+8], eax
-    mov dword [rdi+12], 0            ; zero-length: buffer pointer unused
-
-    ; ---- hand the chain to the controller ----
-    mov dword [uhci_qh], 0x00000001  ; Head Link: unused, Terminate
-    mov eax, uhci_td_pool            ; Element -> first TD (Q=0, T=0)
-    mov [uhci_qh+4], eax
-
-    ; splice the QH into every frame-list slot so it starts on the very
-    ; next SOF regardless of the controller's current frame number; it
-    ; gets unlinked again below once the transfer finishes (or times out).
-    mov eax, uhci_qh
-    or eax, 0x02                     ; Q=1: this pointer targets a QH
-    mov rdi, uhci_frame_list
-    mov rcx, 1024
-.uct_link_loop:
-    mov [rdi], eax
-    add rdi, 4
-    loop .uct_link_loop
-
-    ; ---- poll for completion ----
-    ; Hardware advances the QH's Element pointer past each TD as it
-    ; completes successfully, leaving it at Terminate once the whole chain
-    ; has run. An error (stall/timeout) clears a TD's Active bit without
-    ; advancing the pointer, so we also watch every TD's error bits.
-    mov rcx, UHCI_CTRL_TIMEOUT
-.uct_poll:
-    mov eax, [uhci_qh+4]
-    test eax, 0x01
-    jnz .uct_poll_done
-
-    push rcx
-    mov rdi, uhci_td_pool
-    mov rcx, r10
-    add rcx, 2                       ; SETUP + data TDs + STATUS
-.uct_err_scan:
-    mov eax, [rdi+4]
-    test eax, UHCI_TD_ERR_MASK
-    jnz .uct_err_found
-    add rdi, 16
-    loop .uct_err_scan
-    pop rcx
-    loop .uct_poll
-    jmp .uct_timeout
-.uct_err_found:
-    pop rcx
-    jmp .uct_fail
-
-.uct_poll_done:
-    ; one last sweep - covers the STATUS TD erroring right as the element
-    ; pointer advanced past it
-    mov rdi, uhci_td_pool
-    mov rcx, r10
-    add rcx, 2
-.uct_final_scan:
-    mov eax, [rdi+4]
-    test eax, UHCI_TD_ERR_MASK
-    jnz .uct_fail
-    add rdi, 16
-    loop .uct_final_scan
-    jmp .uct_success
-
-.uct_timeout:
-.uct_fail:
-    mov rdi, uhci_frame_list
-    mov rcx, 1024
-    mov eax, 1
-.uct_unlink_fail:
-    mov [rdi], eax
-    add rdi, 4
-    loop .uct_unlink_fail
-    xor al, al
-    jmp .uct_ret
-
-.uct_success:
-    mov rdi, uhci_frame_list
-    mov rcx, 1024
-    mov eax, 1
-.uct_unlink_ok:
-    mov [rdi], eax
-    add rdi, 4
-    loop .uct_unlink_ok
-    mov al, 1
-
-.uct_ret:
-    pop r14
-    pop r13
-    pop r12
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
-    ret
-
-; usb_set_address: SET_ADDRESS(1), issued to the current default address
-; (0). Per spec the device needs a short recovery window after the status
-; stage before it responds at the new address; uhci_delay is generous
-; enough to cover the required >=2ms. Returns al=1/0.
-usb_set_address:
-    push rdi
-
-    mov byte [usb_xfer_addr], 0
-    mov word [usb_xfer_len], 0
-
-    mov rdi, usb_xfer_setup
-    mov byte [rdi+0], 0x00           ; host->device, standard, device
-    mov byte [rdi+1], 0x05           ; SET_ADDRESS
-    mov byte [rdi+2], 1              ; wValue low = new address
-    mov byte [rdi+3], 0
-    mov byte [rdi+4], 0              ; wIndex = 0
-    mov byte [rdi+5], 0
-    mov byte [rdi+6], 0              ; wLength = 0
-    mov byte [rdi+7], 0
-
-    call uhci_ctrl_transfer
-    cmp al, 1
-    jne .usa_fail
-
-    call uhci_delay
-    mov byte [usb_dev_address], 1
-    mov al, 1
-    jmp .usa_ret
-.usa_fail:
-    xor al, al
-.usa_ret:
-    pop rdi
-    ret
-
-; usb_get_descriptor: standard GET_DESCRIPTOR request.
-;   rdi = descriptor type (1=DEVICE, 2=CONFIGURATION, ...)
-;   rsi = descriptor index
-;   rdx = requested length in bytes
-;   rcx = destination buffer
-;   r8b = device address to target
-; Returns al=1/0. On success, up to rdx bytes land in the buffer (fewer if
-; the device replies with a short packet).
-usb_get_descriptor:
-    push rbx
-    push rsi
-    push rdi
-    push rdx
-    push rcx
-    push r8
-
-    mov [usb_xfer_addr], r8b
-    mov [usb_xfer_buf], rcx
-    mov [usb_xfer_len], dx
-    mov byte [usb_xfer_dir], 1       ; IN
-
-    mov rbx, usb_xfer_setup
-    mov byte [rbx+0], 0x80           ; device->host, standard, device
-    mov byte [rbx+1], 0x06           ; GET_DESCRIPTOR
-    mov al, sil
-    mov [rbx+2], al                  ; wValue low = index
-    mov al, dil
-    mov [rbx+3], al                  ; wValue high = type
-    mov byte [rbx+4], 0              ; wIndex = 0
-    mov byte [rbx+5], 0
-    mov [rbx+6], dl                  ; wLength low
-    mov [rbx+7], dh                  ; wLength high
-
-    call uhci_ctrl_transfer
-
-    pop r8
-    pop rcx
-    pop rdx
-    pop rdi
-    pop rsi
-    pop rbx
-    ret
-
-; usb_parse_config_descriptor: walks usb_cfg_desc for the first interface
-; whose bInterfaceClass is Mass Storage (0x08) and records its bulk IN/OUT
-; endpoint numbers into usb_bulk_in_ep/usb_bulk_out_ep for Phase 4.
-; Assumes usb_cfg_desc/usb_cfg_total_len were already filled in by a
-; successful GET_DESCRIPTOR(CONFIGURATION, ...).
-usb_parse_config_descriptor:
-    push rax
-    push rbx
-    push rcx
-    push rdx
-    push rsi
-    push r9
-
-    mov byte [usb_msc_iface_num], 0xFF
-    mov byte [usb_bulk_in_ep], 0xFF
-    mov byte [usb_bulk_out_ep], 0xFF
-
-    movzx rcx, word [usb_cfg_total_len]
-    cmp rcx, UHCI_CFG_BUFSZ
-    jbe .upc_len_ok
-    mov rcx, UHCI_CFG_BUFSZ           ; clamp to what we actually have
-.upc_len_ok:
-    cmp rcx, 9
-    jbe .upc_ret                      ; nothing beyond the config header
-    sub rcx, 9
-    lea rsi, [usb_cfg_desc + 9]       ; first sub-descriptor
-    xor bl, bl                        ; "currently inside our MSC interface?"
-
-.upc_loop:
-    cmp rcx, 2
-    jb .upc_ret
-    movzx r9, byte [rsi]               ; bLength
-    test r9b, r9b
-    jz .upc_ret                        ; malformed (0-length) - stop
-    cmp r9, rcx
-    ja .upc_ret                        ; descriptor claims to run past what we have
-
-    movzx rdx, byte [rsi+1]            ; bDescriptorType
-    cmp dl, 4                          ; INTERFACE
-    je .upc_iface
-    cmp dl, 5                          ; ENDPOINT
-    je .upc_endpoint
-    jmp .upc_next
-
-.upc_iface:
-    cmp byte [usb_msc_iface_num], 0xFF
-    jne .upc_iface_other               ; already found our interface - ignore rest
-    cmp byte [rsi+5], 0x08             ; bInterfaceClass == Mass Storage
-    jne .upc_iface_other
-    mov al, [rsi+2]
-    mov [usb_msc_iface_num], al
-    mov al, [rsi+5]
-    mov [usb_msc_iface_class], al
-    mov al, [rsi+6]
-    mov [usb_msc_iface_subclass], al
-    mov al, [rsi+7]
-    mov [usb_msc_iface_protocol], al
-    mov bl, 1
-    jmp .upc_next
-.upc_iface_other:
-    xor bl, bl
-    jmp .upc_next
-
-.upc_endpoint:
-    test bl, bl
-    jz .upc_next
-    mov al, [rsi+3]
-    and al, 0x03
-    cmp al, 0x02                       ; Bulk transfer type
-    jne .upc_next
-    mov al, [rsi+2]                    ; bEndpointAddress
-    test al, 0x80
-    jz .upc_ep_out
-    and al, 0x0F
-    mov [usb_bulk_in_ep], al
-    jmp .upc_next
-.upc_ep_out:
-    and al, 0x0F
-    mov [usb_bulk_out_ep], al
-
-.upc_next:
-    add rsi, r9
-    sub rcx, r9
-    jmp .upc_loop
-
-.upc_ret:
-    pop r9
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
-    pop rax
-    ret
-
-; usb_init_device: full Phase 3 sequence - address the device, read its
-; device and configuration descriptors, and locate its mass-storage bulk
-; endpoints. Requires uhci_init to have already run.
-usb_init_device:
-    call usb_set_address
-    cmp al, 1
-    jne .uid_addr_fail
-
-    mov rsi, msg_usb_addr_ok
-    mov al, ATTR_NORMAL
-    call print_string_attr
-
-    mov rdi, 1                         ; DEVICE descriptor
-    mov rsi, 0
-    mov rdx, 18
-    mov rcx, usb_dev_desc
-    movzx r8, byte [usb_dev_address]
-    call usb_get_descriptor
-    cmp al, 1
-    jne .uid_desc_fail
-
-    mov rsi, msg_usb_vendor
-    mov al, ATTR_NORMAL
-    call print_string_attr
-    movzx eax, word [usb_dev_desc+8]   ; idVendor
-    mov rdi, hexbuf
-    mov rcx, 4
-    call hex_to_str
-    mov rsi, hexbuf
-    call print_string
-    mov rsi, msg_usb_product
-    call print_string
-    movzx eax, word [usb_dev_desc+10]  ; idProduct
-    mov rdi, hexbuf
-    mov rcx, 4
-    call hex_to_str
-    mov rsi, hexbuf
-    call print_string
-    mov rsi, newline_str
-    call print_string
-
-    ; a short packet (SPD) ends this early once the device's actual,
-    ; usually-smaller, descriptor set has been delivered
-    mov rdi, 2                         ; CONFIGURATION descriptor
-    mov rsi, 0
-    mov rdx, UHCI_CFG_BUFSZ
-    mov rcx, usb_cfg_desc
-    movzx r8, byte [usb_dev_address]
-    call usb_get_descriptor
-    cmp al, 1
-    jne .uid_desc_fail
-
-    movzx eax, word [usb_cfg_desc+2]   ; wTotalLength
-    mov [usb_cfg_total_len], ax
-
-    call usb_parse_config_descriptor
-
-    ; the device stays in the Addressed state (EP0 only) until this is
-    ; issued - required before either bulk endpoint will respond to
-    ; anything Phase 4 sends it
-    call usb_set_configuration
-    cmp al, 1
-    jne .uid_cfg_fail
-
-    mov rsi, msg_usb_cfg_ok
-    mov al, ATTR_NORMAL
-    call print_string_attr
-
-    cmp byte [usb_msc_iface_num], 0xFF
-    je .uid_no_msc
-
-    mov rsi, msg_usb_msc_found
-    mov al, ATTR_NORMAL
-    call print_string_attr
-
-    mov rsi, msg_usb_bulk_in
-    call print_string
-    movzx eax, byte [usb_bulk_in_ep]
-    mov rdi, hexbuf
-    mov rcx, 2
-    call hex_to_str
-    mov rsi, hexbuf
-    call print_string
-    mov rsi, msg_usb_bulk_out
-    call print_string
-    movzx eax, byte [usb_bulk_out_ep]
-    mov rdi, hexbuf
-    mov rcx, 2
-    call hex_to_str
-    mov rsi, hexbuf
-    call print_string
-    mov rsi, newline_str
-    call print_string
-    ret
-
-.uid_no_msc:
-    mov rsi, msg_usb_no_msc
-    mov al, ATTR_ERROR
-    call print_string_attr
-    ret
-
-.uid_addr_fail:
-    mov rsi, msg_usb_addr_fail
-    mov al, ATTR_ERROR
-    call print_string_attr
-    ret
-
-.uid_desc_fail:
-    mov rsi, msg_usb_desc_fail
-    mov al, ATTR_ERROR
-    call print_string_attr
-    ret
-
-.uid_cfg_fail:
-    mov rsi, msg_usb_cfg_fail
-    mov al, ATTR_ERROR
-    call print_string_attr
-    ret
-
-; cmd_usbinfo: shell entry point for Phase 3 - requires a prior 'dscan' to
-; have found a UHCI controller with a device physically connected before
-; attempting to address/enumerate it.
-cmd_usbinfo:
-    cmp byte [usb_uhci_found], 1
-    je .ui_have_ctrl
-    mov rsi, msg_usbinfo_no_ctrl
-    mov al, ATTR_ERROR
-    call print_string_attr
-    ret
-.ui_have_ctrl:
-    test word [uhci_port1_status], UHCI_PORT_CCS
-    jnz .ui_go
-    test word [uhci_port2_status], UHCI_PORT_CCS
-    jnz .ui_go
-    mov rsi, msg_usbinfo_no_dev
-    mov al, ATTR_ERROR
-    call print_string_attr
-    ret
-.ui_go:
-    call usb_init_device
-    ret
-
-; ============================================================
-;  USB STACK - PHASE 4: bulk transfers + mass storage (BOT/SCSI)
-;  Adds uhci_bulk_transfer, a bulk IN/OUT primitive with no SETUP/STATUS
-;  stage that persists each endpoint's DATA0/DATA1 toggle across calls
-;  the way real bulk endpoints require. On top of that, the USB Mass
-;  Storage Bulk-Only Transport (Command Block Wrapper out, optional data
-;  stage, Command Status Wrapper in) drives a handful of SCSI commands -
-;  TEST UNIT READY, INQUIRY, READ CAPACITY(10), READ(10) - and the
-;  'usbdisk' shell command strings them together as a smoke test of the
-;  whole path.
-;
-;  Known simplification: on a data-stage transport failure inside
-;  usb_msc_command, a real driver would run a Bulk-Only Mass Storage
-;  Reset + Clear Halt on both endpoints before trusting anything else;
-;  that recovery path isn't implemented here, so a wedged endpoint after
-;  an error may need a fresh 'dscan'/'usbinfo' (which re-addresses and
-;  re-configures the device) to recover. Same spirit as the fixed EP0
-;  packet size flagged in Phase 3.
-; ============================================================
-
-UHCI_BULK_MAXPKT  equ 64            ; full-speed bulk endpoint max packet
-UHCI_BULK_TIMEOUT equ 0x200000      ; same generous poll budget as control
-
-; uhci_bulk_transfer: runs one bulk transfer (no SETUP/STATUS stage) over
-; the shared TD pool/QH. Caller fills in first:
-;   usb_bulk_ep   - target endpoint number (0-15)
-;   usb_bulk_buf  - buffer pointer (linear==physical); ignored if len=0
-;   usb_bulk_len  - length in bytes (0 = nothing to send/receive)
-;   usb_bulk_dir  - 1 = IN (device->host), 0 = OUT
-;   rdi           - pointer to the persisted toggle byte for this
-;                    endpoint (usb_bulk_in_toggle / usb_bulk_out_toggle);
-;                    read as the starting DATA0/DATA1 state and updated
-;                    in place once the transfer completes successfully.
-; Targets usb_dev_address. Returns al=1 on success, al=0 on failure
-; (timeout or a TD error bit) - the toggle byte is left unchanged on
-; failure, since the device's own toggle state after an error is
-; unknown.
-uhci_bulk_transfer:
-    push rbx
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    push r8
-    push r9
-    push r10
-    push r11
-    push r12
-    push r13
-    push r14
-    push r15
-
-    mov r15, rdi                    ; toggle-byte pointer, kept for later
-
-    ; ---- how many MAXPKT-sized TDs does this transfer need? ----
-    movzx r13, word [usb_bulk_len]
-    xor r10, r10
-    test r13, r13
-    jz .ubt_no_tds
-    mov rax, r13
-    add rax, UHCI_BULK_MAXPKT - 1
-    xor rdx, rdx
-    mov rcx, UHCI_BULK_MAXPKT
-    div rcx
-    mov r10, rax
-.ubt_no_tds:
-    test r10, r10
-    jnz .ubt_have_tds
-    mov al, 1                       ; zero-length transfer: nothing to do
-    jmp .ubt_ret
-.ubt_have_tds:
-    cmp r10, UHCI_MAX_TDS
-    jbe .ubt_size_ok
-    xor al, al
-    jmp .ubt_ret
-.ubt_size_ok:
-
-    lea r12, [uhci_td_pool]         ; cursor - no SETUP TD ahead of it here
-    xor r8, r8                      ; TD index
-    movzx r9, byte [r15]            ; starting toggle
-    mov r11, [usb_bulk_buf]         ; buffer cursor
-    ; r13 already holds total remaining bytes
-
-.ubt_td_loop:
-    cmp r8, r10
-    jae .ubt_tds_done
-
-    mov r14, r13                    ; chunk length = min(remaining, MAXPKT)
-    cmp r14, UHCI_BULK_MAXPKT
-    jbe .ubt_chunk_ok
-    mov r14, UHCI_BULK_MAXPKT
-.ubt_chunk_ok:
-
-    mov rdi, r12
-    mov rax, r8
-    inc rax
-    cmp rax, r10
-    jae .ubt_last_td
-    lea rax, [r12 + 16]
-    or eax, 0x04                    ; Vf=1 (depth-first), more TDs follow
-    mov [rdi], eax
-    jmp .ubt_link_set
-.ubt_last_td:
-    mov dword [rdi], 0x00000001     ; Terminate: this is the last TD
-.ubt_link_set:
-
-    mov eax, UHCI_TD_ACTIVE | UHCI_TD_CERR3 | UHCI_TD_SPD
-    mov [rdi+4], eax
-
-    movzx eax, byte [usb_dev_address]
-    shl eax, 8
-    movzx ecx, byte [usb_bulk_ep]
-    and ecx, 0x0F
-    shl ecx, 15
-    or eax, ecx
-    cmp byte [usb_bulk_dir], 1
-    je .ubt_pid_in
-    or eax, UHCI_PID_OUT
-    jmp .ubt_pid_set
-.ubt_pid_in:
-    or eax, UHCI_PID_IN
-.ubt_pid_set:
-    mov ecx, r9d
-    shl ecx, 19
-    or eax, ecx                     ; data toggle bit
-    mov edx, r14d
-    dec edx
-    and edx, 0x7FF
-    shl edx, 21
-    or eax, edx                     ; MaxLen = chunk_len - 1
-    mov [rdi+8], eax
-
-    mov eax, r11d
-    mov [rdi+12], eax
-
-    add r11, r14
-    sub r13, r14
-    xor r9, 1                       ; flip toggle
-    add r12, 16
-    inc r8
-    jmp .ubt_td_loop
-.ubt_tds_done:
-
-    ; ---- hand the chain to the controller ----
-    mov dword [uhci_qh], 0x00000001 ; Head Link: unused, Terminate
-    mov eax, uhci_td_pool           ; Element -> first TD (Q=0, T=0)
-    mov [uhci_qh+4], eax
-
-    mov eax, uhci_qh
-    or eax, 0x02                    ; Q=1: this pointer targets a QH
-    mov rdi, uhci_frame_list
-    mov rcx, 1024
-.ubt_link_loop:
-    mov [rdi], eax
-    add rdi, 4
-    loop .ubt_link_loop
-
-    ; ---- poll for completion (see uhci_ctrl_transfer for the rationale) ----
-    mov rcx, UHCI_BULK_TIMEOUT
-.ubt_poll:
-    mov eax, [uhci_qh+4]
-    test eax, 0x01
-    jnz .ubt_poll_done
-
-    push rcx
-    mov rdi, uhci_td_pool
-    mov rcx, r10
-.ubt_err_scan:
-    mov eax, [rdi+4]
-    test eax, UHCI_TD_ERR_MASK
-    jnz .ubt_err_found
-    add rdi, 16
-    loop .ubt_err_scan
-    pop rcx
-    loop .ubt_poll
-    jmp .ubt_timeout
-.ubt_err_found:
-    pop rcx
-    jmp .ubt_fail
-
-.ubt_poll_done:
-    mov rdi, uhci_td_pool
-    mov rcx, r10
-.ubt_final_scan:
-    mov eax, [rdi+4]
-    test eax, UHCI_TD_ERR_MASK
-    jnz .ubt_fail
-    add rdi, 16
-    loop .ubt_final_scan
-    jmp .ubt_success
-
-.ubt_timeout:
-.ubt_fail:
-    mov rdi, uhci_frame_list
-    mov rcx, 1024
-    mov eax, 1
-.ubt_unlink_fail:
-    mov [rdi], eax
-    add rdi, 4
-    loop .ubt_unlink_fail
-    xor al, al
-    jmp .ubt_ret
-
-.ubt_success:
-    mov rdi, uhci_frame_list
-    mov rcx, 1024
-    mov eax, 1
-.ubt_unlink_ok:
-    mov [rdi], eax
-    add rdi, 4
-    loop .ubt_unlink_ok
-    mov [r15], r9b                  ; persist toggle for the next call
-    mov al, 1
-
-.ubt_ret:
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
-    ret
-
-; usb_set_configuration: SET_CONFIGURATION(bConfigurationValue) - moves
-; the device from Addressed into Configured state, which every real USB
-; device requires before any endpoint other than EP0 (i.e. the bulk
-; endpoints this phase needs) will respond. Assumes usb_cfg_desc already
-; holds a successfully-read configuration descriptor. Resets both bulk
-; toggle-tracking bytes to DATA0 on success, matching what SetConfiguration
-; does to the device's own endpoint state. Returns al=1/0.
-usb_set_configuration:
-    push rdi
-
-    movzx eax, byte [usb_dev_address]
-    mov [usb_xfer_addr], al
-    mov word [usb_xfer_len], 0
-
-    mov rdi, usb_xfer_setup
-    mov byte [rdi+0], 0x00          ; host->device, standard, device
-    mov byte [rdi+1], 0x09          ; SET_CONFIGURATION
-    mov al, [usb_cfg_desc+5]        ; bConfigurationValue
-    mov [rdi+2], al
-    mov byte [rdi+3], 0
-    mov byte [rdi+4], 0
-    mov byte [rdi+5], 0
-    mov byte [rdi+6], 0
-    mov byte [rdi+7], 0
-
-    call uhci_ctrl_transfer
-    cmp al, 1
-    jne .usc_ret
-
-    mov byte [usb_bulk_in_toggle], 0
-    mov byte [usb_bulk_out_toggle], 0
-
-.usc_ret:
-    pop rdi
-    ret
-
-; usb_msc_command: runs one SCSI command over the USB Mass Storage
-; Bulk-Only Transport (CBW -> optional data stage -> CSW). Caller
-; supplies:
-;   rsi - pointer to the CDB bytes (copied into the CBW, up to 16)
-;   rcx - CDB length in bytes (6 or 10 for everything used here)
-;   rdx - data-stage length in bytes (0 = no data stage)
-;   rdi - data-stage buffer (linear==physical)
-;   r8b - 1 = IN (device->host), 0 = OUT; ignored if rdx=0
-; Targets usb_dev_address/usb_bulk_in_ep/usb_bulk_out_ep. Returns al=1 on
-; a matching, successful (bCSWStatus==0) CSW; al=0 on any transport
-; failure, a signature/tag mismatch, or a non-zero CSW status.
-usb_msc_command:
-    push rbx
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    push r8
-    push r9
-
-    mov [usb_msc_data_dir], r8b     ; save direction (r8b) before r8 reused
-    mov r9, rdi                     ; stash data-stage buffer pointer
-    mov r8, rcx                     ; stash CDB length
-    mov [usb_msc_data_len], dx      ; stash data-stage length
-
-    ; ---- zero and build the CBW ----
-    mov rdi, usb_msc_cbw
-    xor eax, eax
-    mov rcx, 31
-    rep stosb
-
-    mov byte [usb_msc_cbw+0], 0x55
-    mov byte [usb_msc_cbw+1], 0x53
-    mov byte [usb_msc_cbw+2], 0x42
-    mov byte [usb_msc_cbw+3], 0x43  ; dCBWSignature = "USBC"
-
-    mov eax, [usb_msc_cur_tag]
-    mov [usb_msc_cbw+4], eax
-    mov [usb_msc_last_tag], eax
-    inc dword [usb_msc_cur_tag]
-
-    movzx eax, word [usb_msc_data_len]
-    mov [usb_msc_cbw+8], eax        ; dCBWDataTransferLength
-
-    mov al, 0x80
-    cmp byte [usb_msc_data_dir], 1
-    je .umc_flags_set
-    xor al, al
-.umc_flags_set:
-    mov [usb_msc_cbw+12], al        ; bmCBWFlags
-    mov byte [usb_msc_cbw+13], 0    ; bCBWLUN
-    mov [usb_msc_cbw+14], r8b       ; bCBWCBLength
-
-    lea rdi, [usb_msc_cbw+15]
-    mov rcx, r8
-    cmp rcx, 16
-    jbe .umc_cdblen_ok
-    mov rcx, 16
-.umc_cdblen_ok:
-    rep movsb                       ; rsi still points at caller's CDB
-
-    ; ---- send the CBW (bulk OUT) ----
-    movzx eax, byte [usb_bulk_out_ep]
-    mov [usb_bulk_ep], al
-    mov rax, usb_msc_cbw
-    mov [usb_bulk_buf], rax
-    mov word [usb_bulk_len], 31
-    mov byte [usb_bulk_dir], 0
-    mov rdi, usb_bulk_out_toggle
-    call uhci_bulk_transfer
-    cmp al, 1
-    je .umc_cbw_ok
-    xor al, al
-    jmp .umc_ret
-.umc_cbw_ok:
-
-    ; ---- optional data stage ----
-    movzx rax, word [usb_msc_data_len]
-    test rax, rax
-    jz .umc_data_done
-    cmp byte [usb_msc_data_dir], 1
-    jne .umc_data_out
-    movzx eax, byte [usb_bulk_in_ep]
-    mov [usb_bulk_ep], al
-    mov byte [usb_bulk_dir], 1
-    mov rdi, usb_bulk_in_toggle
-    jmp .umc_data_go
-.umc_data_out:
-    movzx eax, byte [usb_bulk_out_ep]
-    mov [usb_bulk_ep], al
-    mov byte [usb_bulk_dir], 0
-    mov rdi, usb_bulk_out_toggle
-.umc_data_go:
-    mov [usb_bulk_buf], r9
-    mov ax, [usb_msc_data_len]
-    mov [usb_bulk_len], ax
-    call uhci_bulk_transfer
-    ; on failure here a real driver would run Bulk-Only Mass Storage Reset
-    ; + Clear Halt before trusting the CSW - see the Phase 4 header comment
-.umc_data_done:
-
-    ; ---- read the CSW (bulk IN) ----
-    movzx eax, byte [usb_bulk_in_ep]
-    mov [usb_bulk_ep], al
-    mov rax, usb_msc_csw
-    mov [usb_bulk_buf], rax
-    mov word [usb_bulk_len], 13
-    mov byte [usb_bulk_dir], 1
-    mov rdi, usb_bulk_in_toggle
-    call uhci_bulk_transfer
-    cmp al, 1
-    je .umc_csw_ok
-    xor al, al
-    jmp .umc_ret
-.umc_csw_ok:
-
-    cmp byte [usb_msc_csw+0], 0x55
-    jne .umc_bad
-    cmp byte [usb_msc_csw+1], 0x53
-    jne .umc_bad
-    cmp byte [usb_msc_csw+2], 0x42
-    jne .umc_bad
-    cmp byte [usb_msc_csw+3], 0x53
-    jne .umc_bad                    ; dCSWSignature != "USBS"
-    mov eax, [usb_msc_csw+4]
-    cmp eax, [usb_msc_last_tag]
-    jne .umc_bad                    ; tag mismatch - stale/mismatched CSW
-    cmp byte [usb_msc_csw+12], 0
-    jne .umc_bad                    ; bCSWStatus != 0
-    mov al, 1
-    jmp .umc_ret
-.umc_bad:
-    xor al, al
-
-.umc_ret:
-    pop r9
-    pop r8
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
-    ret
-
-; usb_msc_test_unit_ready: SCSI TEST UNIT READY (6-byte CDB, no data
-; stage). Returns al=1 if the device reports ready, al=0 otherwise
-; (including any transport failure).
-usb_msc_test_unit_ready:
-    push rsi
-    push rcx
-    push rdx
-    push rdi
-    push r8
-
-    mov rdi, usb_msc_cdb
-    xor eax, eax
-    mov rcx, 16
-    rep stosb                       ; opcode 0x00 = TEST UNIT READY
-
-    mov rsi, usb_msc_cdb
-    mov rcx, 6
-    xor rdx, rdx                    ; no data stage
-    xor rdi, rdi
-    xor r8, r8
-    call usb_msc_command
-
-    pop r8
-    pop rdi
-    pop rdx
-    pop rcx
-    pop rsi
-    ret
-
-; usb_msc_inquiry: SCSI INQUIRY, 36-byte data stage into
-; usb_msc_inquiry_buf. Returns al=1/0.
-usb_msc_inquiry:
-    push rsi
-    push rcx
-    push rdx
-    push rdi
-    push r8
-
-    mov rdi, usb_msc_cdb
-    xor eax, eax
-    mov rcx, 16
-    rep stosb
-    mov byte [usb_msc_cdb+0], 0x12  ; INQUIRY
-    mov byte [usb_msc_cdb+4], 36    ; allocation length
-
-    mov rsi, usb_msc_cdb
-    mov rcx, 6
-    mov rdx, 36
-    mov rdi, usb_msc_inquiry_buf
-    mov r8, 1                       ; IN
-    call usb_msc_command
-
-    pop r8
-    pop rdi
-    pop rdx
-    pop rcx
-    pop rsi
-    ret
-
-; usb_msc_read_capacity: SCSI READ CAPACITY(10), 8-byte data stage into
-; usb_msc_cap_buf (dLastLBA, dBlockSize - both big-endian on the wire).
-; On success also fills usb_msc_block_count (=dLastLBA+1) and
-; usb_msc_block_size, both converted to host byte order. Returns al=1/0.
-usb_msc_read_capacity:
-    push rsi
-    push rcx
-    push rdx
-    push rdi
-    push r8
-
-    mov rdi, usb_msc_cdb
-    xor eax, eax
-    mov rcx, 16
-    rep stosb
-    mov byte [usb_msc_cdb+0], 0x25  ; READ CAPACITY (10)
-
-    mov rsi, usb_msc_cdb
-    mov rcx, 10
-    mov rdx, 8
-    mov rdi, usb_msc_cap_buf
-    mov r8, 1                       ; IN
-    call usb_msc_command
-    cmp al, 1
-    jne .urc_ret
-
-    mov eax, [usb_msc_cap_buf]
-    bswap eax
-    inc eax                         ; dLastLBA -> total block count
-    mov [usb_msc_block_count], eax
-
-    mov eax, [usb_msc_cap_buf+4]
-    bswap eax
-    mov [usb_msc_block_size], eax
-
-    mov al, 1
-.urc_ret:
-    pop r8
-    pop rdi
-    pop rdx
-    pop rcx
-    pop rsi
-    ret
-
-; usb_msc_read10: SCSI READ(10). rax = starting LBA, rdi = destination
-; buffer, rdx = number of blocks to read. Block size is
-; usb_msc_block_size if READ CAPACITY has already run and found one,
-; else the 512-byte default nearly every USB flash drive uses. Callers
-; here only ever ask for one block at a time, which keeps the data
-; stage's TD count well under UHCI_MAX_TDS (see uhci_bulk_transfer).
-; Returns al=1/0.
-usb_msc_read10:
-    push rbx
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    push r8
-    push r9
-
-    mov r9, rdi                     ; destination buffer
-    mov ebx, eax                    ; LBA
-    mov r8, rdx                     ; block count
-
-    mov rdi, usb_msc_cdb
-    xor eax, eax
-    mov rcx, 16
-    rep stosb
-    mov byte [usb_msc_cdb+0], 0x28  ; READ(10)
-    mov eax, ebx
-    bswap eax
-    mov [usb_msc_cdb+2], eax        ; LBA, big-endian
-
-    mov ax, r8w
-    xchg al, ah                     ; transfer length, big-endian
-    mov [usb_msc_cdb+7], ax
-
-    mov eax, [usb_msc_block_size]
-    test eax, eax
-    jnz .ur10_have_bs
-    mov eax, 512
-.ur10_have_bs:
-    imul eax, r8d
-    mov edx, eax                    ; total data-stage length in bytes
-
-    mov rsi, usb_msc_cdb
-    mov rcx, 10
-    mov rdi, r9
-    mov r8, 1                       ; IN
-    call usb_msc_command
-
-    pop r9
-    pop r8
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
-    ret
-
-; usb_msc_write10: SCSI WRITE(10). rax = starting LBA, rsi = source buffer,
-; rdx = number of blocks to write. Mirrors usb_msc_read10 but with the
-; data stage in the OUT direction and CDB opcode 0x2A. Returns al=1/0.
-usb_msc_write10:
-    push rbx
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    push r8
-    push r9
-
-    mov r9, rsi                     ; source buffer
-    mov ebx, eax                    ; LBA
-    mov r8, rdx                     ; block count
-
-    mov rdi, usb_msc_cdb
-    xor eax, eax
-    mov rcx, 16
-    rep stosb
-    mov byte [usb_msc_cdb+0], 0x2A  ; WRITE(10)
-    mov eax, ebx
-    bswap eax
-    mov [usb_msc_cdb+2], eax        ; LBA, big-endian
-
-    mov ax, r8w
-    xchg al, ah                     ; transfer length, big-endian
-    mov [usb_msc_cdb+7], ax
-
-    mov eax, [usb_msc_block_size]
-    test eax, eax
-    jnz .uw10_have_bs
-    mov eax, 512
-.uw10_have_bs:
-    imul eax, r8d
-    mov edx, eax                    ; total data-stage length in bytes
-
-    mov rsi, usb_msc_cdb
-    mov rcx, 10
-    mov rdi, r9                     ; usb_msc_command's OUT data comes from rdi
-    mov r8, 0                       ; OUT
-    call usb_msc_command
-
-    pop r9
-    pop r8
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
-    ret
-
-; usb_read_sector: rax=LBA, rdi=512-byte destination buffer. al=1/0.
-usb_read_sector:
-    push rdx
-    mov rdx, 1
-    call usb_msc_read10
-    pop rdx
-    ret
-
-; usb_write_sector: rax=LBA, rsi=512-byte source buffer. al=1/0.
-usb_write_sector:
-    push rdx
-    mov rdx, 1
-    call usb_msc_write10
-    pop rdx
-    ret
-
-; print_raw_bytes: rsi=buffer, rcx=count, al=attribute. Prints raw bytes
-; as characters with no null terminator required - used for fixed-width
-; ASCII fields like SCSI INQUIRY's vendor/product strings.
-print_raw_bytes:
-    push rax
-    push rbx
-    push rcx
-    push rsi
-    mov bl, al
-    test rcx, rcx
-    jz .prb_done
-.prb_loop:
-    mov al, [rsi]
-    push rbx
-    call putchar
-    pop rbx
-    inc rsi
-    loop .prb_loop
-.prb_done:
-    pop rsi
-    pop rcx
-    pop rbx
-    pop rax
-    ret
-
-; cmd_usbdisk: shell entry point for Phase 4 - runs TEST UNIT READY,
-; INQUIRY, READ CAPACITY(10) and a one-block READ(10) against the
-; mass-storage device usbinfo already enumerated and configured, as a
-; smoke test for the bulk transfer engine and the BOT/SCSI layer above.
-cmd_usbdisk:
-    push r12
-
-    cmp byte [usb_bulk_in_ep], 0xFF
-    je .ud_no_msc
-    cmp byte [usb_bulk_out_ep], 0xFF
-    je .ud_no_msc
-    jmp .ud_go
-.ud_no_msc:
-    mov rsi, msg_usbdisk_no_msc
-    mov al, ATTR_ERROR
-    call print_string_attr
-    pop r12
-    ret
-
-.ud_go:
-    call usb_msc_test_unit_ready
-    cmp al, 1
-    jne .ud_not_ready
-    mov rsi, msg_usbdisk_ready
-    mov al, ATTR_NORMAL
-    call print_string_attr
-    jmp .ud_inquiry
-.ud_not_ready:
-    mov rsi, msg_usbdisk_not_ready
-    mov al, ATTR_ERROR
-    call print_string_attr
-
-.ud_inquiry:
-    call usb_msc_inquiry
-    cmp al, 1
-    je .ud_inquiry_ok
-    mov rsi, msg_usbdisk_inquiry_fail
-    mov al, ATTR_ERROR
-    call print_string_attr
-    pop r12
-    ret
-.ud_inquiry_ok:
-    mov rsi, msg_usbdisk_vendor
-    mov al, ATTR_NORMAL
-    call print_string_attr
-    lea rsi, [usb_msc_inquiry_buf+8]
-    mov rcx, 8
-    mov al, ATTR_NORMAL
-    call print_raw_bytes
-    mov rsi, msg_usbdisk_product
-    call print_string
-    lea rsi, [usb_msc_inquiry_buf+16]
-    mov rcx, 16
-    mov al, ATTR_NORMAL
-    call print_raw_bytes
-    mov rsi, newline_str
-    call print_string
-
-    call usb_msc_read_capacity
-    cmp al, 1
-    je .ud_cap_ok
-    mov rsi, msg_usbdisk_cap_fail
-    mov al, ATTR_ERROR
-    call print_string_attr
-    pop r12
-    ret
-.ud_cap_ok:
-    mov rsi, msg_usbdisk_blocks
-    mov al, ATTR_NORMAL
-    call print_string_attr
-    mov eax, [usb_msc_block_count]
-    mov rdi, hexbuf
-    mov rcx, 8
-    call hex_to_str
-    mov rsi, hexbuf
-    call print_string
-    mov rsi, msg_usbdisk_blocksize
-    call print_string
-    mov eax, [usb_msc_block_size]
-    mov rdi, hexbuf
-    mov rcx, 8
-    call hex_to_str
-    mov rsi, hexbuf
-    call print_string
-    mov rsi, msg_usbdisk_bytes_each
-    call print_string
-
-    xor rax, rax                    ; LBA 0
-    mov rdi, usb_msc_sector_buf
-    mov rdx, 1                      ; one block
-    call usb_msc_read10
-    cmp al, 1
-    je .ud_read_ok
-    mov rsi, msg_usbdisk_read_fail
-    mov al, ATTR_ERROR
-    call print_string_attr
-    pop r12
-    ret
-.ud_read_ok:
-    mov rsi, msg_usbdisk_sector0
-    mov al, ATTR_NORMAL
-    call print_string_attr
-    xor r12, r12
-.ud_dump_loop:
-    cmp r12, 16
-    jae .ud_dump_done
-    movzx eax, byte [usb_msc_sector_buf + r12]
-    mov rdi, hexbuf
-    mov rcx, 2
-    call hex_to_str
-    mov rsi, hexbuf
-    call print_string
-    mov al, ' '
-    mov bl, ATTR_NORMAL
-    call putchar
-    inc r12
-    jmp .ud_dump_loop
-.ud_dump_done:
-    mov rsi, newline_str
-    call print_string
-    pop r12
-    ret
-
-; ============================================================
-;  USB STACK - PHASE 5: project transfer (the 'usb' command)
-;  Not a general-purpose filesystem (no FAT/exFAT) - just a small fixed
-;  layout (header + project table + fixed-size per-project archive slots)
-;  for moving whole ShellyForever project folders between machines. Only
-;  usb_read_sector/usb_write_sector below know about USB/SCSI; everything
-;  above that works purely in terms of sectors, the same way fs_save/
-;  fs_load only know about ata_read_sector/ata_write_sector.
-; ============================================================
-
-; usb_count_projects: scans the in-memory table -> al = number of entries
-; with USB_ENT_FLAGS bit0 set.
-usb_count_projects:
-    push rbx
-    push rcx
-    push rdx
-    xor rdx, rdx
-    xor rcx, rcx
-.ucp_loop:
-    cmp rcx, USB_MAX_PROJECTS
-    jae .ucp_done
-    mov rbx, rcx
-    imul rbx, USB_ENTRY_SIZE
-    add rbx, usb_idx_table
-    test byte [rbx + USB_ENT_FLAGS], 1
-    jz .ucp_next
-    inc rdx
-.ucp_next:
-    inc rcx
-    jmp .ucp_loop
-.ucp_done:
-    mov rax, rdx
-    pop rdx
-    pop rcx
-    pop rbx
-    ret
-
-; usb_find_project: rsi=name -> rax=table index or -1. Only matches
-; entries with USB_ENT_FLAGS bit0 set.
-usb_find_project:
-    push rbx
-    push rcx
-    push rdi
-    push rsi
-    xor rcx, rcx
-.ufp_loop:
-    cmp rcx, USB_MAX_PROJECTS
-    jae .ufp_notfound
-    mov rbx, rcx
-    imul rbx, USB_ENTRY_SIZE
-    add rbx, usb_idx_table
-    test byte [rbx + USB_ENT_FLAGS], 1
-    jz .ufp_next
-    pop rsi
-    push rsi
-    lea rdi, [rbx + USB_ENT_NAME]
-    push rcx
-    call str_eq
-    pop rcx
-    cmp al, 1
-    je .ufp_found
-.ufp_next:
-    inc rcx
-    jmp .ufp_loop
-.ufp_found:
-    mov rax, rcx
-    jmp .ufp_out
-.ufp_notfound:
-    mov rax, -1
-.ufp_out:
-    pop rsi
-    pop rdi
-    pop rcx
-    pop rbx
-    ret
-
-; usb_find_free_slot: rax = first table index with USB_ENT_FLAGS==0, or -1
-; if all USB_MAX_PROJECTS slots are in use.
-usb_find_free_slot:
-    push rbx
-    push rcx
-    xor rcx, rcx
-.uffs_loop:
-    cmp rcx, USB_MAX_PROJECTS
-    jae .uffs_full
-    mov rbx, rcx
-    imul rbx, USB_ENTRY_SIZE
-    add rbx, usb_idx_table
-    test byte [rbx + USB_ENT_FLAGS], 1
-    jz .uffs_found
-    inc rcx
-    jmp .uffs_loop
-.uffs_found:
-    mov rax, rcx
-    jmp .uffs_out
-.uffs_full:
-    mov rax, -1
-.uffs_out:
-    pop rcx
-    pop rbx
-    ret
-
-; usb_load_index: reads the header sector (LBA 0) and, if its magic/
-; version check out, the project table (LBA 1..2) too. If the magic is
-; wrong (blank/foreign drive) this starts a fresh empty in-memory table
-; instead of failing - the drive just hasn't been formatted for
-; ShellyForever project storage yet, which 'usb export' will do on first
-; write. Returns al=1 on success (including "fresh"), al=0 only on an
-; actual sector-read failure.
-usb_load_index:
-    push rdi
-    push rax
-    push rcx
-    mov rax, 0
-    mov rdi, usb_idx_header
-    call usb_read_sector
-    cmp al, 1
-    jne .uli_fail
-    cmp byte [usb_idx_header+0], 'S'
-    jne .uli_fresh
-    cmp byte [usb_idx_header+1], 'F'
-    jne .uli_fresh
-    cmp byte [usb_idx_header+2], 'U'
-    jne .uli_fresh
-    cmp byte [usb_idx_header+3], 'S'
-    jne .uli_fresh
-    cmp byte [usb_idx_header+4], 1
-    jne .uli_fresh
-
-    mov rax, USB_TABLE_LBA
-    mov rdi, usb_idx_table
-    call usb_read_sector
-    cmp al, 1
-    jne .uli_fail
-    mov rax, USB_TABLE_LBA+1
-    lea rdi, [usb_idx_table+512]
-    call usb_read_sector
-    cmp al, 1
-    jne .uli_fail
-    mov al, 1
-    jmp .uli_done
-.uli_fresh:
-    mov rdi, usb_idx_header
-    xor eax, eax
-    mov rcx, 512
-    rep stosb
-    mov rdi, usb_idx_table
-    xor eax, eax
-    mov rcx, USB_MAX_PROJECTS*USB_ENTRY_SIZE
-    rep stosb
-    mov al, 1
-    jmp .uli_done
-.uli_fail:
-    xor al, al
-.uli_done:
-    pop rcx
-    pop rax
-    pop rdi
-    ret
-
-; usb_save_index: writes the in-memory header+table back to LBA 0..2.
-; Returns al=1/0.
-usb_save_index:
-    push rdi
-    push rsi
-    push rax
-    mov byte [usb_idx_header+0], 'S'
-    mov byte [usb_idx_header+1], 'F'
-    mov byte [usb_idx_header+2], 'U'
-    mov byte [usb_idx_header+3], 'S'
-    mov byte [usb_idx_header+4], 1
-    call usb_count_projects
-    mov [usb_idx_header+5], al
-
-    mov rax, 0
-    mov rsi, usb_idx_header
-    call usb_write_sector
-    cmp al, 1
-    jne .usi_fail
-    mov rax, USB_TABLE_LBA
-    mov rsi, usb_idx_table
-    call usb_write_sector
-    cmp al, 1
-    jne .usi_fail
-    mov rax, USB_TABLE_LBA+1
-    lea rsi, [usb_idx_table+512]
-    call usb_write_sector
-    cmp al, 1
-    jne .usi_fail
-    mov al, 1
-    jmp .usi_done
-.usi_fail:
-    xor al, al
-.usi_done:
-    pop rax
-    pop rsi
-    pop rdi
-    ret
-
-; usb_archive_emit: recursively serializes a filesystem subtree into
-; usb_archive_buf as it's walked (pre-order, parent always emitted before
-; its children - see USB_REC_PARENT above).
-; in: rax = node index (real fs node), rbx = this node's parent's LOCAL
-;     archive index (0xFFFF for the project root itself)
-usb_archive_emit:
-    push rax
-    push rbx
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    push r8
-    push r9
-    push r12
-    push r13
-    push r14
-
-    mov r12, rax                    ; node idx
-    mov r13, rbx                    ; parent local index
-
-    cmp byte [usb_archive_overflow], 1
-    je .uae_out
-
-    mov rax, [usb_archive_ptr]
-    lea rdx, [rax + USB_REC_SIZE]
-    mov rcx, usb_archive_buf + USB_PROJECT_SLOT_BYTES
-    cmp rdx, rcx
-    jbe .uae_cap_ok
-    mov byte [usb_archive_overflow], 1
-    jmp .uae_out
-.uae_cap_ok:
-    mov [usb_rec_base], rax
-    movzx r14, word [usb_archive_count]
-    inc word [usb_archive_count]
-
-    mov rdi, [usb_rec_base]
-    movzx eax, byte [node_type + r12]
-    mov [rdi + USB_REC_TYPE], al
-    mov [rdi + USB_REC_PARENT], r13w
-
-    lea rdi, [rdi + USB_REC_NAME]
-    push rdi
-    mov rcx, NAME_LEN
-    xor al, al
-    rep stosb
-    pop rdi
-    mov rax, r12
-    imul rax, NAME_LEN
-    lea rsi, [node_name + rax]
-    call str_copy
-
-    movzx eax, byte [node_type + r12]
-    cmp eax, 2
-    jne .uae_no_content
-    mov rax, r12
-    imul rax, CONTENT_LEN
-    lea rsi, [node_content + rax]
-    call str_len                    ; rax=len, preserves rsi
-    mov rdi, [usb_rec_base]
-    mov [rdi + USB_REC_CLEN], ax
-    lea rdi, [rdi + USB_REC_CONTENT]
-    push rsi
-    mov rcx, CONTENT_LEN
-    xor al, al
-    push rdi
-    rep stosb
-    pop rdi
-    pop rsi
-    call str_copy
-    jmp .uae_content_done
-.uae_no_content:
-    mov rdi, [usb_rec_base]
-    mov word [rdi + USB_REC_CLEN], 0
-.uae_content_done:
-
-    mov rax, [usb_rec_base]
-    add rax, USB_REC_SIZE
-    mov [usb_archive_ptr], rax
-
-    cmp byte [node_type + r12], 1   ; only folders have children
-    jne .uae_out
-    xor r8, r8
-.uae_childloop:
-    cmp r8, MAX_NODES
-    jae .uae_out
-    cmp byte [node_type + r8], 0
-    je .uae_childnext
-    movzx r9, word [node_parent + r8*2]
-    cmp r9, r12
-    jne .uae_childnext
-    cmp byte [usb_archive_overflow], 1
-    je .uae_out
-    mov rax, r8
-    mov rbx, r14
-    push r8
-    call usb_archive_emit
-    pop r8
-.uae_childnext:
-    inc r8
-    jmp .uae_childloop
-.uae_out:
-    pop r14
-    pop r13
-    pop r12
-    pop r9
-    pop r8
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
-    pop rax
-    ret
-
-; cmd_usb: shell entry point. arg1_buf = subcommand, arg2_buf/arg3_buf =
-; its arguments. Every subcommand needs an addressed, configured
-; mass-storage device (i.e. 'dscan' then 'usbinfo' already run), same
-; precondition as 'usbdisk'.
-cmd_usb:
-    cmp byte [usb_bulk_in_ep], 0xFF
-    je .cu_no_device
-    cmp byte [usb_bulk_out_ep], 0xFF
-    jne .cu_have_device
-.cu_no_device:
-    mov rsi, msg_usb_no_device
-    mov al, ATTR_ERROR
-    call print_string_attr
-    ret
-.cu_have_device:
-    mov rsi, arg1_buf
-    mov rdi, str_usb_list
-    call str_eq
-    cmp al, 1
-    je cmd_usb_list
-
-    mov rsi, arg1_buf
-    mov rdi, str_usb_info
-    call str_eq
-    cmp al, 1
-    je cmd_usb_info
-
-    mov rsi, arg1_buf
-    mov rdi, str_usb_export
-    call str_eq
-    cmp al, 1
-    je cmd_usb_export
-
-    mov rsi, arg1_buf
-    mov rdi, str_usb_import
-    call str_eq
-    cmp al, 1
-    je cmd_usb_import
-
-    mov rsi, arg1_buf
-    mov rdi, str_usb_delete
-    call str_eq
-    cmp al, 1
-    je cmd_usb_delete
-
-    mov rsi, arg1_buf
-    mov rdi, str_usb_rename
-    call str_eq
-    cmp al, 1
-    je cmd_usb_rename
-
-    mov rsi, msg_usb_usage
-    mov al, ATTR_ERROR
-    call print_string_attr
-    ret
-
-cmd_usb_list:
-    push r12
-    push r13
-    push r14
-    push r15
-    call usb_load_index
-    cmp al, 1
-    je .cul_ok
-    mov rsi, msg_usb_read_fail
-    mov al, ATTR_ERROR
-    call print_string_attr
-    jmp .cmd_usb_list_exit
-.cul_ok:
-    mov rsi, newline_str
-    call print_string
-    xor r12, r12
-    xor r13, r13                    ; r13 = how many printed
-.cul_loop:
-    cmp r12, USB_MAX_PROJECTS
-    jae .cul_done
-    mov rbx, r12
-    imul rbx, USB_ENTRY_SIZE
-    add rbx, usb_idx_table
-    test byte [rbx + USB_ENT_FLAGS], 1
-    jz .cul_next
-    inc r13
-    lea rsi, [rbx + USB_ENT_NAME]
-    call print_string
-    mov rsi, newline_str
-    call print_string
-.cul_next:
-    inc r12
-    jmp .cul_loop
-.cul_done:
-    cmp r13, 0
-    jne .cul_ret
-    mov rsi, msg_usb_none_found
-    call print_string
-.cul_ret:
-    jmp .cmd_usb_list_exit
-
-.cmd_usb_list_exit:
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    ret
-cmd_usb_info:
-    call usb_load_index
-    cmp al, 1
-    je .cui_ok
-    mov rsi, msg_usb_read_fail
-    mov al, ATTR_ERROR
-    call print_string_attr
-    ret
-.cui_ok:
-    call usb_msc_inquiry
-    cmp al, 1
-    je .cui_inquiry_ok
-    mov rsi, msg_usbdisk_inquiry_fail
-    mov al, ATTR_ERROR
-    call print_string_attr
-    ret
-.cui_inquiry_ok:
-    mov rsi, msg_usb_info_vendor
-    call print_string
-    lea rsi, [usb_msc_inquiry_buf+8]
-    mov rcx, 8
-    mov al, ATTR_NORMAL
-    call print_raw_bytes
-    mov rsi, newline_str
-    call print_string
-    mov rsi, msg_usb_info_product
-    call print_string
-    lea rsi, [usb_msc_inquiry_buf+16]
-    mov rcx, 16
-    mov al, ATTR_NORMAL
-    call print_raw_bytes
-    mov rsi, newline_str
-    call print_string
-
-    call usb_msc_read_capacity
-    cmp al, 1
-    je .cui_cap_ok
-    mov rsi, msg_usbdisk_cap_fail
-    mov al, ATTR_ERROR
-    call print_string_attr
-    ret
-.cui_cap_ok:
-    mov rsi, msg_usb_info_capacity
-    call print_string
-    mov eax, [usb_msc_block_count]
-    mov ebx, [usb_msc_block_size]
-    mul ebx                         ; rax = total bytes (edx:eax, fits rax)
-    shr rax, 20                     ; -> MB
-    lea rdi, [show_num_buf]
-    call int_to_str
-    mov rsi, show_num_buf
-    call print_string
-    mov rsi, msg_usb_info_mb
-    call print_string
-
-    mov rsi, msg_usb_info_projects
-    call print_string
-    call usb_count_projects
-    lea rdi, [show_num_buf]
-    call int_to_str
-    mov rsi, show_num_buf
-    call print_string
-    mov rsi, newline_str
-    call print_string
-    ret
-
-cmd_usb_export:
-    push r12
-    push r13
-    push r14
-    push r15
-    cmp byte [arg2_buf], 0
-    jne .cue_have_name
-    mov rsi, msg_need_name
-    mov al, ATTR_ERROR
-    call print_string_attr
-    jmp .cmd_usb_export_exit
-.cue_have_name:
-    call usb_load_index
-    cmp al, 1
-    je .cue_idx_ok
-    mov rsi, msg_usb_read_fail
-    mov al, ATTR_ERROR
-    call print_string_attr
-    jmp .cmd_usb_export_exit
-.cue_idx_ok:
-    ; find the project folder locally (current-folder-only, like cpy/mov)
-    mov rax, [cur_dir]
-    mov rsi, arg2_buf
-    mov r10, 1                      ; must be a folder
-    call fs_find_child
-    cmp rax, -1
-    jne .cue_local_found
-    mov rsi, msg_usb_no_project1
-    mov al, ATTR_ERROR
-    call print_string_attr
-    mov rsi, arg2_buf
-    call print_string
-    mov rsi, msg_usb_no_project2
-    call print_string
-    jmp .cmd_usb_export_exit
-.cue_local_found:
-    mov r15, rax                    ; project's fs node index
-
-    mov rsi, arg2_buf
-    call usb_find_project
-    cmp rax, -1
-    je .cue_not_taken
-    mov rsi, msg_usb_exists
-    mov al, ATTR_ERROR
-    call print_string_attr
-    jmp .cmd_usb_export_exit
-.cue_not_taken:
-    call usb_find_free_slot
-    cmp rax, -1
-    jne .cue_have_slot
-    mov rsi, msg_usb_full
-    mov al, ATTR_ERROR
-    call print_string_attr
-    jmp .cmd_usb_export_exit
-.cue_have_slot:
-    mov r14, rax                    ; table slot index
-
-    mov rsi, msg_usb_exporting
-    call print_string
-
-    mov rax, usb_archive_buf + USB_ARC_HDR_SIZE
-    mov [usb_archive_ptr], rax
-    mov word [usb_archive_count], 0
-    mov byte [usb_archive_overflow], 0
-
-    mov rax, r15
-    mov rbx, 0xFFFF
-    call usb_archive_emit
-
-    cmp byte [usb_archive_overflow], 1
-    jne .cue_fits
-    mov rsi, msg_usb_full
-    mov al, ATTR_ERROR
-    call print_string_attr
-    jmp .cmd_usb_export_exit
-.cue_fits:
-    mov byte [usb_archive_buf+0], 'S'
-    mov byte [usb_archive_buf+1], 'F'
-    mov byte [usb_archive_buf+2], 'P'
-    mov byte [usb_archive_buf+3], 'A'
-    mov byte [usb_archive_buf+4], 1
-    mov byte [usb_archive_buf+5], 0
-    mov ax, [usb_archive_count]
-    mov [usb_archive_buf+6], ax
-    mov qword [usb_archive_buf+8], 0
-
-    mov rsi, msg_usb_creating_archive
-    call print_string
-
-    mov rax, [usb_archive_ptr]
-    sub rax, usb_archive_buf
-    mov r12, rax                    ; total archive bytes
-    add rax, 511
-    shr rax, 9
-    mov r13, rax                    ; sector count
-
-    mov rax, r14
-    imul rax, USB_PROJECT_SLOT_SECTORS
-    add rax, USB_DATA_START_LBA
-    mov r15, rax                    ; starting LBA for this project's archive
-
-    mov rsi, msg_usb_writing
-    call print_string
-
-    xor rbx, rbx                    ; sector index
-.cue_write_loop:
-    cmp rbx, r13
-    jae .cue_write_done
-    mov rax, r15
-    add rax, rbx
-    mov rsi, usb_archive_buf
-    mov rcx, rbx
-    shl rcx, 9
-    add rsi, rcx
-    call usb_write_sector
-    cmp al, 1
-    je .cue_write_next
-    mov rsi, msg_usb_write_fail
-    mov al, ATTR_ERROR
-    call print_string_attr
-    jmp .cmd_usb_export_exit
-.cue_write_next:
-    inc rbx
-    jmp .cue_write_loop
-.cue_write_done:
-
-    mov rbx, r14
-    imul rbx, USB_ENTRY_SIZE
-    add rbx, usb_idx_table
-    push rdi
-    lea rdi, [rbx + USB_ENT_NAME]
-    push rcx
-    mov rcx, NAME_LEN
-    xor al, al
-    rep stosb
-    pop rcx
-    pop rdi
-    lea rdi, [rbx + USB_ENT_NAME]
-    mov rsi, arg2_buf
-    call str_copy
-    mov eax, r15d
-    mov [rbx + USB_ENT_LBA], eax
-    mov eax, r12d
-    mov [rbx + USB_ENT_SIZE], eax
-    mov byte [rbx + USB_ENT_FLAGS], 1
-
-    call usb_save_index
-    cmp al, 1
-    je .cue_saved
-    mov rsi, msg_usb_write_fail
-    mov al, ATTR_ERROR
-    call print_string_attr
-    jmp .cmd_usb_export_exit
-.cue_saved:
-    mov rsi, msg_usb_done
-    call print_string
-    jmp .cmd_usb_export_exit
-
-.cmd_usb_export_exit:
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    ret
-cmd_usb_import:
-    push r12
-    push r13
-    push r14
-    push r15
-    cmp byte [arg2_buf], 0
-    jne .cui2_have_name
-    mov rsi, msg_need_name
-    mov al, ATTR_ERROR
-    call print_string_attr
-    jmp .cmd_usb_import_exit
-.cui2_have_name:
-    call usb_load_index
-    cmp al, 1
-    je .cui2_idx_ok
-    mov rsi, msg_usb_read_fail
-    mov al, ATTR_ERROR
-    call print_string_attr
-    jmp .cmd_usb_import_exit
-.cui2_idx_ok:
-    mov rsi, arg2_buf
-    call usb_find_project
-    cmp rax, -1
-    jne .cui2_found
-    mov rsi, msg_usb_no_project1
-    mov al, ATTR_ERROR
-    call print_string_attr
-    mov rsi, arg2_buf
-    call print_string
-    mov rsi, msg_usb_no_project2
-    call print_string
-    jmp .cmd_usb_import_exit
-.cui2_found:
-    mov r14, rax                    ; table slot index
-
-    mov rax, [cur_dir]
-    mov rsi, arg2_buf
-    mov r10, -1
-    call fs_find_child
-    cmp rax, -1
-    je .cui2_dest_ok
-    mov rsi, msg_usb_exists
-    mov al, ATTR_ERROR
-    call print_string_attr
-    jmp .cmd_usb_import_exit
-.cui2_dest_ok:
-    mov rbx, r14
-    imul rbx, USB_ENTRY_SIZE
-    add rbx, usb_idx_table
-    mov eax, [rbx + USB_ENT_LBA]
-    mov r15, rax                    ; start LBA
-    mov eax, [rbx + USB_ENT_SIZE]
-    mov r12, rax                    ; archive size in bytes
-
-    add rax, 511
-    shr rax, 9
-    mov r13, rax                    ; sector count
-
-    mov rsi, msg_usb_creating_project
-    call print_string
-
-    xor rbx, rbx
-.cui2_read_loop:
-    cmp rbx, r13
-    jae .cui2_read_done
-    mov rax, r15
-    add rax, rbx
-    mov rdi, usb_archive_buf
-    mov rcx, rbx
-    shl rcx, 9
-    add rdi, rcx
-    call usb_read_sector
-    cmp al, 1
-    je .cui2_read_next
-    mov rsi, msg_usb_read_fail
-    mov al, ATTR_ERROR
-    call print_string_attr
-    jmp .cmd_usb_import_exit
-.cui2_read_next:
-    inc rbx
-    jmp .cui2_read_loop
-.cui2_read_done:
-
-    cmp byte [usb_archive_buf+0], 'S'
-    jne .cui2_corrupt
-    cmp byte [usb_archive_buf+1], 'F'
-    jne .cui2_corrupt
-    cmp byte [usb_archive_buf+2], 'P'
-    jne .cui2_corrupt
-    cmp byte [usb_archive_buf+3], 'A'
-    jne .cui2_corrupt
-    cmp byte [usb_archive_buf+4], 1
-    jne .cui2_corrupt
-    movzx r13, word [usb_archive_buf+6]     ; node count
-    test r13, r13
-    jz .cui2_corrupt
-    cmp r13, MAX_NODES
-    ja .cui2_corrupt
-    jmp .cui2_ok
-.cui2_corrupt:
-    mov rsi, msg_usb_corrupt
-    mov al, ATTR_ERROR
-    call print_string_attr
-    jmp .cmd_usb_import_exit
-.cui2_ok:
-    mov rsi, msg_usb_copying
-    call print_string
-
-    mov qword [usb_import_root_real], -1
-    xor r12, r12                    ; record index 0..node_count-1
-    mov rax, usb_archive_buf + USB_ARC_HDR_SIZE
-    mov [usb_rec_base], rax
-.cui2_node_loop:
-    cmp r12, r13
-    jae .cui2_import_done
-
-    mov rdi, [usb_rec_base]
-    movzx r9, byte [rdi + USB_REC_TYPE]     ; node type
-    movzx r8, word [rdi + USB_REC_PARENT]   ; parent local idx
-
-    cmp r8, 0xFFFF
-    jne .cui2_lookup_parent
-    mov rax, [cur_dir]
-    jmp .cui2_have_parent
-.cui2_lookup_parent:
-    movzx rax, word [usb_local_map + r8*2]
-.cui2_have_parent:
-    mov r11, rax                    ; real parent idx
-
-    lea rsi, [rdi + USB_REC_NAME]
-    mov rax, r11
-    mov r10, r9
-    call fs_create_node
-    cmp rax, -1
-    jne .cui2_created
-    jmp .cui2_import_fail
-.cui2_created:
-    mov [usb_local_map + r12*2], ax
-    cmp r12, 0
-    jne .cui2_not_root
-    mov [usb_import_root_real], rax
-.cui2_not_root:
-    cmp r9, 2                       ; file? copy content
-    jne .cui2_next_node
-    mov rbx, rax
-    imul rbx, CONTENT_LEN
-    lea rdi, [node_content + rbx]
-    mov [usb_tmp_dest], rdi
-    mov rdi, [usb_rec_base]
-    lea rsi, [rdi + USB_REC_CONTENT]
-    mov rdi, [usb_tmp_dest]
-    call str_copy
-.cui2_next_node:
-    mov rax, [usb_rec_base]
-    add rax, USB_REC_SIZE
-    mov [usb_rec_base], rax
-    inc r12
-    jmp .cui2_node_loop
-
-.cui2_import_fail:
-    cmp qword [usb_import_root_real], -1
-    je .cui2_fail_msg
-    mov rax, [usb_import_root_real]
-    call fs_delete_tree
-.cui2_fail_msg:
-    mov rsi, msg_full
-    mov al, ATTR_ERROR
-    call print_string_attr
-    jmp .cmd_usb_import_exit
-
-.cui2_import_done:
-    mov rsi, msg_usb_done
-    call print_string
-    jmp .cmd_usb_import_exit
-
-.cmd_usb_import_exit:
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    ret
-cmd_usb_delete:
-    push r12
-    push r13
-    push r14
-    push r15
-    cmp byte [arg2_buf], 0
-    jne .cud_have_name
-    mov rsi, msg_need_name
-    mov al, ATTR_ERROR
-    call print_string_attr
-    jmp .cmd_usb_delete_exit
-.cud_have_name:
-    call usb_load_index
-    cmp al, 1
-    je .cud_idx_ok
-    mov rsi, msg_usb_read_fail
-    mov al, ATTR_ERROR
-    call print_string_attr
-    jmp .cmd_usb_delete_exit
-.cud_idx_ok:
-    mov rsi, arg2_buf
-    call usb_find_project
-    cmp rax, -1
-    jne .cud_found
-    mov rsi, msg_usb_no_project1
-    mov al, ATTR_ERROR
-    call print_string_attr
-    mov rsi, arg2_buf
-    call print_string
-    mov rsi, msg_usb_no_project2
-    call print_string
-    jmp .cmd_usb_delete_exit
-.cud_found:
-    mov rbx, rax
-    imul rbx, USB_ENTRY_SIZE
-    add rbx, usb_idx_table
-    mov rdi, rbx
-    push rcx
-    mov rcx, USB_ENTRY_SIZE
-    xor al, al
-    rep stosb
-    pop rcx
-    call usb_save_index
-    cmp al, 1
-    je .cud_saved
-    mov rsi, msg_usb_write_fail
-    mov al, ATTR_ERROR
-    call print_string_attr
-    jmp .cmd_usb_delete_exit
-.cud_saved:
-    mov rsi, msg_usb_deleted1
-    call print_string
-    mov rsi, arg2_buf
-    call print_string
-    mov rsi, msg_usb_deleted2
-    call print_string
-    jmp .cmd_usb_delete_exit
-
-.cmd_usb_delete_exit:
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    ret
-cmd_usb_rename:
-    push r12
-    push r13
-    push r14
-    push r15
-    cmp byte [arg2_buf], 0
-    jne .cur_check2
-    mov rsi, msg_need_name
-    mov al, ATTR_ERROR
-    call print_string_attr
-    jmp .cmd_usb_rename_exit
-.cur_check2:
-    cmp byte [arg3_buf], 0
-    jne .cur_have_args
-    mov rsi, msg_need_name
-    mov al, ATTR_ERROR
-    call print_string_attr
-    jmp .cmd_usb_rename_exit
-.cur_have_args:
-    mov rsi, arg3_buf
-    call str_len
-    cmp rax, NAME_LEN
-    jae .cur_toolong
-    call usb_load_index
-    cmp al, 1
-    je .cur_idx_ok
-    mov rsi, msg_usb_read_fail
-    mov al, ATTR_ERROR
-    call print_string_attr
-    jmp .cmd_usb_rename_exit
-.cur_idx_ok:
-    mov rsi, arg2_buf
-    call usb_find_project
-    cmp rax, -1
-    jne .cur_found
-    mov rsi, msg_usb_no_project1
-    mov al, ATTR_ERROR
-    call print_string_attr
-    mov rsi, arg2_buf
-    call print_string
-    mov rsi, msg_usb_no_project2
-    call print_string
-    jmp .cmd_usb_rename_exit
-.cur_found:
-    mov r14, rax
-    mov rsi, arg3_buf
-    call usb_find_project
-    cmp rax, -1
-    je .cur_new_free
-    mov rsi, msg_usb_exists
-    mov al, ATTR_ERROR
-    call print_string_attr
-    jmp .cmd_usb_rename_exit
-.cur_new_free:
-    mov rbx, r14
-    imul rbx, USB_ENTRY_SIZE
-    add rbx, usb_idx_table
-    lea rdi, [rbx + USB_ENT_NAME]
-    push rcx
-    mov rcx, NAME_LEN
-    xor al, al
-    rep stosb
-    pop rcx
-    lea rdi, [rbx + USB_ENT_NAME]
-    mov rsi, arg3_buf
-    call str_copy
-    call usb_save_index
-    cmp al, 1
-    je .cur_saved
-    mov rsi, msg_usb_write_fail
-    mov al, ATTR_ERROR
-    call print_string_attr
-    jmp .cmd_usb_rename_exit
-.cur_saved:
-    mov rsi, msg_usb_renamed1
-    call print_string
-    mov rsi, arg2_buf
-    call print_string
-    mov rsi, msg_usb_renamed2
-    call print_string
-    mov rsi, arg3_buf
-    call print_string
-    mov rsi, msg_usb_renamed3
-    call print_string
-    jmp .cmd_usb_rename_exit
-.cur_toolong:
-    mov rsi, msg_name_too_long
-    mov al, ATTR_ERROR
-    call print_string_attr
-    jmp .cmd_usb_rename_exit
-
-.cmd_usb_rename_exit:
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    ret
-
 ; ============================================================
 fs_init:
     mov rdi, node_type
@@ -5279,6 +2939,19 @@ fs_init:
     mov rsi, str_home_name
     call str_copy
     mov qword [cur_dir], 0
+    ; a fresh filesystem has nothing mounted
+    mov rdi, mount_used
+    mov rcx, MAX_MOUNTS
+    xor al, al
+    rep stosb
+    mov rdi, mount_device
+    mov rcx, MAX_MOUNTS
+    xor al, al
+    rep stosb
+    mov rdi, mount_label
+    mov rcx, MAX_MOUNTS*32
+    xor al, al
+    rep stosb
     ret
 
 ; fs_find_child: rax=parent_idx, rsi=name, r10=type filter (-1 = any)
@@ -5675,12 +3348,17 @@ fs_resolve_path:
 ; returns CF=0 on success, CF=1 on timeout (no device responding at all,
 ; e.g. real hardware with no legacy IDE controller / booting off USB).
 ATA_TIMEOUT equ 0x400000
+; ata_wait_bsy: block until BSY (bit 7) clears, or give up after a timeout.
+; returns CF=0 on success, CF=1 on timeout (no device responding at all,
+; e.g. real hardware with no legacy IDE controller / booting off USB).
+ATA_TIMEOUT equ 0x400000
 ata_wait_bsy:
     push rax
     push rdx
     push rcx
     mov rcx, ATA_TIMEOUT
-    mov dx, 0x1F7
+    movzx edx, word [ata_port_base]
+    add dx, 7
 .wait:
     in al, dx
     test al, 0x80
@@ -5704,7 +3382,8 @@ ata_wait_drq:
     push rdx
     push rcx
     mov rcx, ATA_TIMEOUT
-    mov dx, 0x1F7
+    movzx edx, word [ata_port_base]
+    add dx, 7
 .wait:
     in al, dx
     test al, 0x08
@@ -5722,6 +3401,30 @@ ata_wait_drq:
     clc
     ret
 
+; ata_select_device: al = device id (0=primary master, 1=primary slave,
+; 2=secondary master, 3=secondary slave). Picks the I/O port base and the
+; drive-select bit so every ATA routine below talks to the right drive.
+ata_select_device:
+    push rax
+    and al, 3
+    cmp al, 2
+    jb .primary
+    mov word [ata_port_base], 0x170
+    sub al, 2
+    jmp .drive
+.primary:
+    mov word [ata_port_base], 0x1F0
+.drive:
+    test al, 1
+    jnz .slave
+    mov byte [ata_drive_sel], 0xE0
+    jmp .done
+.slave:
+    mov byte [ata_drive_sel], 0xF0
+.done:
+    pop rax
+    ret
+
 ; ata_read_sector: rax = LBA (28-bit), rdi = 512-byte destination buffer
 ; returns CF=0 on success, CF=1 on failure/timeout (buffer left untouched
 ; or partially written - caller should not trust it on failure).
@@ -5734,34 +3437,40 @@ ata_read_sector:
     mov rbx, rax                 ; keep LBA
     call ata_wait_bsy
     jc .fail
-    mov dx, 0x1F6
+    movzx edx, word [ata_port_base]
+    add dx, 6
     mov rax, rbx
     shr rax, 24
     and al, 0x0F
-    or al, 0xE0                  ; LBA mode, master drive
+    or al, [ata_drive_sel]       ; LBA mode + master/slave bit
     out dx, al
-    mov dx, 0x1F2
+    movzx edx, word [ata_port_base]
+    add dx, 2
     mov al, 1                    ; sector count = 1
     out dx, al
-    mov dx, 0x1F3
+    movzx edx, word [ata_port_base]
+    add dx, 3
     mov al, bl
     out dx, al                   ; LBA[0:7]
-    mov dx, 0x1F4
+    movzx edx, word [ata_port_base]
+    add dx, 4
     mov rax, rbx
     shr rax, 8
     out dx, al                   ; LBA[8:15]
-    mov dx, 0x1F5
+    movzx edx, word [ata_port_base]
+    add dx, 5
     mov rax, rbx
     shr rax, 16
     out dx, al                   ; LBA[16:23]
-    mov dx, 0x1F7
+    movzx edx, word [ata_port_base]
+    add dx, 7
     mov al, 0x20                 ; READ SECTORS (with retry)
     out dx, al
     call ata_wait_bsy
     jc .fail
     call ata_wait_drq
     jc .fail
-    mov dx, 0x1F0
+    movzx edx, word [ata_port_base]
     mov rcx, 256                 ; 256 words = 512 bytes
 .readloop:
     in ax, dx
@@ -5791,34 +3500,40 @@ ata_write_sector:
     mov rbx, rax
     call ata_wait_bsy
     jc .fail
-    mov dx, 0x1F6
+    movzx edx, word [ata_port_base]
+    add dx, 6
     mov rax, rbx
     shr rax, 24
     and al, 0x0F
-    or al, 0xE0
+    or al, [ata_drive_sel]
     out dx, al
-    mov dx, 0x1F2
+    movzx edx, word [ata_port_base]
+    add dx, 2
     mov al, 1
     out dx, al
-    mov dx, 0x1F3
+    movzx edx, word [ata_port_base]
+    add dx, 3
     mov al, bl
     out dx, al
-    mov dx, 0x1F4
+    movzx edx, word [ata_port_base]
+    add dx, 4
     mov rax, rbx
     shr rax, 8
     out dx, al
-    mov dx, 0x1F5
+    movzx edx, word [ata_port_base]
+    add dx, 5
     mov rax, rbx
     shr rax, 16
     out dx, al
-    mov dx, 0x1F7
+    movzx edx, word [ata_port_base]
+    add dx, 7
     mov al, 0x30                 ; WRITE SECTORS (with retry)
     out dx, al
     call ata_wait_bsy
     jc .fail
     call ata_wait_drq
     jc .fail
-    mov dx, 0x1F0
+    movzx edx, word [ata_port_base]
     mov rcx, 256
 .writeloop:
     mov ax, [rsi]
@@ -5827,7 +3542,8 @@ ata_write_sector:
     loop .writeloop
     call ata_wait_bsy
     jc .fail
-    mov dx, 0x1F7
+    movzx edx, word [ata_port_base]
+    add dx, 7
     mov al, 0xE7                 ; CACHE FLUSH so it actually hits the image
     out dx, al
     call ata_wait_bsy
@@ -5844,98 +3560,352 @@ ata_write_sector:
     pop rax
     ret
 
-; fs_save: serialize node_type/node_parent/node_name/node_content (plus a
-; small magic/version header) out to FS_LBA_START.. on disk.
-; returns CF=0 on success, CF=1 if the disk isn't there/isn't responding.
-fs_save:
-    push rax
+; ------------------------------------------------------------------
+;  SFFS v2 volume I/O
+; ------------------------------------------------------------------
+
+; vol_read: al = device id (0..3), rdi = base node index.
+; Loads an SFFS volume from that device into the node table at
+; [base .. base+VOL_NODES). For the OS volume (base 0) parents are
+; copied verbatim; for mounted volumes, on-disk relative parent indices
+; are remapped to the mount's global slice and the volume root becomes a
+; child of the OS root (parent 0).
+; returns rax = 0 on success, -1 on failure (absent device, bad magic,
+; or an I/O error). Sets fs_disk_available=0 when the device never
+; responded (i.e. there's no drive at that slot).
+vol_read:
+    push rbx
+    push rcx
+    push rdx
     push rsi
-    push rcx
-    cmp byte [fs_disk_available], 0
-    je .fail                     ; already known-absent this session, don't retry
-    mov byte [fs_disk_header+0], 'S'
-    mov byte [fs_disk_header+1], 'F'
-    mov byte [fs_disk_header+2], 'F'
-    mov byte [fs_disk_header+3], 'S'
-    mov byte [fs_disk_header+4], 1     ; format version
-    mov byte [fs_disk_header+5], 0
-    mov byte [fs_disk_header+6], 0
-    mov byte [fs_disk_header+7], 0
-    mov rax, FS_LBA_START
-    lea rsi, [fs_disk_header]
-    mov rcx, FS_SECTORS
-.loop:
+    push rdi
+    push r8
+    push r9
+    mov r8, rdi                 ; r8 = base node index
+    call ata_select_device
+    mov rax, SUPER_LBA
+    lea rdi, [fs_super_buf]
+    call ata_read_sector
+    jc .nodisk
+    cmp byte [fs_super_buf+0], 'S'
+    jne .fail
+    cmp byte [fs_super_buf+1], 'F'
+    jne .fail
+    cmp byte [fs_super_buf+2], 'F'
+    jne .fail
+    cmp byte [fs_super_buf+3], 'S'
+    jne .fail
+    cmp byte [fs_super_buf+4], SFFS_VERSION
+    jne .fail
+    ; node_type
+    mov rax, TYPE_LBA
+    lea rdi, [node_type]
+    add rdi, r8
+    call ata_read_sector
+    jc .fail
+    ; node_parent -> scratch, then remap into place
+    mov rax, PARENT_LBA
+    lea rdi, [fs_parent_scratch]
+    call ata_read_sector
+    jc .fail
+    mov r9, r8                   ; r9 = base + i (live table index)
+    xor rcx, rcx                 ; rcx = i
+.remap:
+    cmp rcx, VOL_NODES
+    jae .remap_done
+    movzx rax, word [fs_parent_scratch + rcx*2]
+    cmp r8, 0
+    jne .remap_mount
+    ; OS volume: parents are already global, copy verbatim
+    mov [node_parent + r9*2], ax
+    jmp .remap_next
+.remap_mount:
+    cmp rcx, 0
+    je .remap_root
+    cmp rax, 0xFFFF
+    je .remap_root
+    add rax, r8
+    mov [node_parent + r9*2], ax
+    jmp .remap_next
+.remap_root:
+    mov word [node_parent + r9*2], 0
+.remap_next:
+    inc rcx
+    inc r9
+    jmp .remap
+.remap_done:
+    ; node_name
+    mov rax, NAME_LBA
+    mov rcx, NAME_SECTORS
+    lea rdi, [node_name]
+    mov r9, r8
+    imul r9, NAME_LEN
+    add rdi, r9
+.name_loop:
     push rax
     push rcx
-    call ata_write_sector
+    push rdi
+    call ata_read_sector
+    pop rdi
     pop rcx
     pop rax
-    jc .disk_gone
+    jc .fail
+    add rdi, 512
+    inc rax
+    loop .name_loop
+    ; node_content
+    mov rax, CONTENT_LBA
+    mov rcx, CONTENT_SECTORS
+    lea rdi, [node_content]
+    mov r9, r8
+    imul r9, CONTENT_LEN
+    add rdi, r9
+.content_loop:
+    push rax
+    push rcx
+    push rdi
+    call ata_read_sector
+    pop rdi
+    pop rcx
+    pop rax
+    jc .fail
+    add rdi, 512
+    inc rax
+    loop .content_loop
+    xor rax, rax
+    jmp .done
+.nodisk:
+    mov byte [fs_disk_available], 0
+.fail:
+    mov rax, -1
+.done:
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; vol_write: al = device id, rdi = base node index, rsi = label ptr.
+; Writes the volume at [base .. base+VOL_NODES) plus a fresh superblock
+; (magic + version + label) to that device. Parents are remapped back to
+; on-disk relative indices (the volume root is stored as 0xFFFF).
+; returns CF=0 on success, CF=1 on failure.
+vol_write:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    mov r8, rdi                 ; r8 = base node index
+    mov r9, rsi                 ; r9 = label ptr
+    call ata_select_device
+    ; --- build and write the superblock ---
+    mov byte [fs_super_buf+0], 'S'
+    mov byte [fs_super_buf+1], 'F'
+    mov byte [fs_super_buf+2], 'F'
+    mov byte [fs_super_buf+3], 'S'
+    mov byte [fs_super_buf+4], SFFS_VERSION
+    mov byte [fs_super_buf+5], 0
+    mov byte [fs_super_buf+6], 0
+    mov byte [fs_super_buf+7], 0
+    mov rdi, fs_super_buf
+    add rdi, SUPER_LABEL_OFF
+    mov rcx, 32
+    xor al, al
+    rep stosb
+    mov rsi, r9
+    mov rdi, fs_super_buf
+    add rdi, SUPER_LABEL_OFF
+    xor rcx, rcx
+.label_copy:
+    cmp rcx, 31
+    jae .label_done
+    mov al, [rsi]
+    test al, al
+    jz .label_done
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    inc rcx
+    jmp .label_copy
+.label_done:
+    mov rax, SUPER_LBA
+    lea rsi, [fs_super_buf]
+    call ata_write_sector
+    jc .fail
+    ; --- node_type ---
+    mov rax, TYPE_LBA
+    lea rsi, [node_type]
+    add rsi, r8
+    call ata_write_sector
+    jc .fail
+    ; --- node_parent (remap to on-disk relative indices) ---
+    xor rcx, rcx
+.parent_loop:
+    cmp rcx, VOL_NODES
+    jae .parent_done
+    cmp rcx, 0
+    je .parent_root
+    movzx rax, word [node_parent + r8 + rcx*2]
+    sub rax, r8
+    mov [fs_parent_scratch + rcx*2], ax
+    jmp .parent_next
+.parent_root:
+    mov word [fs_parent_scratch + rcx*2], 0xFFFF
+.parent_next:
+    inc rcx
+    jmp .parent_loop
+.parent_done:
+    mov rax, PARENT_LBA
+    lea rsi, [fs_parent_scratch]
+    call ata_write_sector
+    jc .fail
+    ; --- node_name ---
+    mov rax, NAME_LBA
+    mov rcx, NAME_SECTORS
+    lea rsi, [node_name]
+    mov rdi, r8
+    imul rdi, NAME_LEN
+    add rsi, rdi
+.name_loop:
+    push rax
+    push rcx
+    push rsi
+    call ata_write_sector
+    pop rsi
+    pop rcx
+    pop rax
+    jc .fail
     add rsi, 512
     inc rax
-    loop .loop
-    pop rcx
+    loop .name_loop
+    ; --- node_content ---
+    mov rax, CONTENT_LBA
+    mov rcx, CONTENT_SECTORS
+    lea rsi, [node_content]
+    mov rdi, r8
+    imul rdi, CONTENT_LEN
+    add rsi, rdi
+.content_loop:
+    push rax
+    push rcx
+    push rsi
+    call ata_write_sector
     pop rsi
+    pop rcx
+    pop rax
+    jc .fail
+    add rsi, 512
+    inc rax
+    loop .content_loop
+    clc
+    jmp .done
+.fail:
+    stc
+.done:
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; fs_save: writes the OS volume (device 0, nodes 0..OS_NODES) then every
+; mounted volume back to its own device. Returns CF=0 on success, CF=1 if
+; the OS volume's disk isn't there/isn't responding. A mounted volume that
+; fails to write is left mounted (best effort; sync still reports success).
+fs_save:
+    push rax
+    push rbx
+    push rsi
+    push rdi
+    push r13
+    cmp byte [fs_disk_available], 0
+    je .fail                     ; already known-absent this session, don't retry
+    ; OS volume: device 0, base 0, label = root node's name
+    lea rsi, [node_name]
+    xor rdi, rdi
+    xor al, al
+    call vol_write
+    jc .disk_gone
+    ; mounted volumes
+    xor r13, r13
+.mount_loop:
+    cmp r13, MAX_MOUNTS
+    jae .done
+    cmp byte [mount_used + r13], 0
+    je .mount_next
+    movzx rax, byte [mount_device + r13]
+    mov rdi, r13
+    inc rdi
+    imul rdi, VOL_NODES
+    mov rbx, r13
+    imul rbx, 32
+    lea rsi, [mount_label + rbx]
+    call vol_write
+    ; a mounted volume failing to save is not fatal; keep it mounted
+.mount_next:
+    inc r13
+    jmp .mount_loop
+.done:
+    pop r13
+    pop rdi
+    pop rsi
+    pop rbx
     pop rax
     clc
     ret
 .disk_gone:
     mov byte [fs_disk_available], 0
 .fail:
-    pop rcx
+    pop r13
+    pop rdi
     pop rsi
+    pop rbx
     pop rax
     stc
     ret
 
-; fs_load: read the persisted region straight into the live fs structures;
-; if the magic/version don't check out (blank disk, older format, etc.) or
-; there's simply no disk responding at the legacy ATA ports (common on
-; real hardware without a PATA/IDE controller, or booting off USB), fall
-; back to fs_init for a fresh in-memory-only filesystem instead.
+; fs_load: reads the OS volume (device 0) into nodes 0..OS_NODES. If the
+; magic/version don't check out (blank disk, older format, etc.) or there's
+; simply no disk responding at the legacy ATA ports (common on real hardware
+; without a PATA/IDE controller, or booting off USB), falls back to fs_init
+; for a fresh in-memory-only filesystem. Mounted volumes are never loaded
+; here - you re-attach them after boot with 'dscan' + 'mount'.
 ; sets fs_loaded_from_disk and fs_disk_available accordingly.
 fs_load:
     push rax
     push rdi
-    push rcx
-    mov rax, FS_LBA_START
-    lea rdi, [fs_disk_header]
-    mov rcx, FS_SECTORS
-.loop:
-    push rax
-    push rcx
-    call ata_read_sector
-    pop rcx
-    pop rax
-    jc .no_disk
-    add rdi, 512
-    inc rax
-    loop .loop
-
-    cmp byte [fs_disk_header+0], 'S'
-    jne .invalid
-    cmp byte [fs_disk_header+1], 'F'
-    jne .invalid
-    cmp byte [fs_disk_header+2], 'F'
-    jne .invalid
-    cmp byte [fs_disk_header+3], 'S'
-    jne .invalid
-    cmp byte [fs_disk_header+4], 1
-    jne .invalid
-
-    mov qword [cur_dir], 0
-    mov byte [fs_loaded_from_disk], 1
-    jmp .done
-.invalid:
+    push rsi
+    xor al, al                  ; device 0 (boot drive)
+    xor rdi, rdi                ; base 0 = OS volume
+    call vol_read
+    cmp rax, -1
+    jne .loaded
+    ; failed: either no disk, or a disk that isn't SFFS yet
+    cmp byte [fs_disk_available], 0
+    je .no_disk
     call fs_init
     mov byte [fs_loaded_from_disk], 0
     jmp .done
 .no_disk:
-    mov byte [fs_disk_available], 0
     call fs_init
     mov byte [fs_loaded_from_disk], 0
+    jmp .done
+.loaded:
+    mov qword [cur_dir], 0
+    mov byte [fs_loaded_from_disk], 1
 .done:
-    pop rcx
+    pop rsi
     pop rdi
     pop rax
     ret
@@ -6701,27 +4671,6 @@ scroll_screen:
     push rcx
     push rsi
     push rdi
-
-    ; stash the top row (about to be scrolled off) into the scrollback
-    ; ring so Ctrl+Up can bring it back later
-    movzx rax, word [scrollback_write]
-    imul rax, VGA_COLS*2
-    mov rdi, scrollback_buf
-    add rdi, rax
-    mov rsi, VGA_BASE
-    mov rcx, VGA_COLS
-    rep movsw
-
-    mov ax, [scrollback_write]
-    inc ax
-    and ax, SCROLLBACK_LINES-1
-    mov [scrollback_write], ax
-
-    cmp word [scrollback_count], SCROLLBACK_LINES
-    jae .sb_capped
-    inc word [scrollback_count]
-.sb_capped:
-
     mov rsi, VGA_BASE + (VGA_COLS*2)
     mov rdi, VGA_BASE
     mov rcx, (VGA_ROWS-1)*VGA_COLS
@@ -6743,11 +4692,7 @@ scroll_screen:
 ;  PS/2 KEYBOARD
 ; ============================================================
 
-; get_char: blocks until a key is pressed, returns ascii in al. Also
-; recognizes the arrow keys (which arrive as an 0xE0-prefixed 2-byte
-; "extended" scancode sequence) and Ctrl, returning them as one of the
-; KEY_* virtual codes above rather than an ASCII byte - Up/Down are for
-; command history recall, Ctrl+Up/Ctrl+Down are for output scrollback.
+; get_char: blocks until a key is pressed, returns ascii in al
 get_char:
     push rbx
 .wait:
@@ -6756,18 +4701,12 @@ get_char:
     jz .wait
     in al, 0x60
     mov bl, al
-
-    cmp bl, 0xE0
-    je .extended
-
     test bl, 0x80
     jnz .breakcode
     cmp bl, 0x2A
     je .setshift
     cmp bl, 0x36
     je .setshift
-    cmp bl, 0x1D
-    je .ctrl_make
     movzx rbx, bl
     cmp byte [shift_state], 0
     jne .shifted
@@ -6783,77 +4722,19 @@ get_char:
 .setshift:
     mov byte [shift_state], 1
     jmp .wait
-.ctrl_make:
-    mov byte [ctrl_state], 1
-    jmp .wait
 .breakcode:
     and bl, 0x7F
     cmp bl, 0x2A
     je .clrshift
     cmp bl, 0x36
     je .clrshift
-    cmp bl, 0x1D
-    je .ctrl_break
     jmp .wait
 .clrshift:
     mov byte [shift_state], 0
     jmp .wait
-.ctrl_break:
-    mov byte [ctrl_state], 0
-    jmp .wait
-
-.extended:
-    ; 0xE0 prefix seen - the byte that follows is the real code
-.ext_wait:
-    in al, 0x64
-    test al, 1
-    jz .ext_wait
-    in al, 0x60
-    mov bl, al
-
-    test bl, 0x80
-    jnz .ext_break
-
-    cmp bl, 0x48                  ; up arrow, make code
-    je .ext_up
-    cmp bl, 0x50                  ; down arrow, make code
-    je .ext_down
-    cmp bl, 0x1D                  ; right ctrl, make code
-    je .ctrl_make
-    jmp .wait                     ; ignore any other extended key
-
-.ext_break:
-    and bl, 0x7F
-    cmp bl, 0x1D                  ; right ctrl, break code
-    je .ctrl_break
-    jmp .wait
-
-.ext_up:
-    cmp byte [ctrl_state], 0
-    je .plain_up
-    mov al, KEY_CTRL_UP
-    jmp .ext_have
-.plain_up:
-    mov al, KEY_UP
-    jmp .ext_have
-.ext_down:
-    cmp byte [ctrl_state], 0
-    je .plain_down
-    mov al, KEY_CTRL_DOWN
-    jmp .ext_have
-.plain_down:
-    mov al, KEY_DOWN
-.ext_have:
-    pop rbx
-    ret
 
 ; read_line: rdi=buffer, rcx=max chars. Echoes to screen, handles
 ; backspace, terminates on Enter. Buffer is null terminated.
-; Also handles Up/Down (recall previously entered lines from the
-; history ring - see hist_push/hist_apply_line) and Ctrl+Up/Ctrl+Down
-; (scroll the visible output back/forward through scrollback_buf).
-; r11 = history nav depth for this call (0 = live editing, 1 = most
-; recent entry, 2 = the one before that, etc).
 read_line:
     push rax
     push rbx
@@ -6862,26 +4743,8 @@ read_line:
     xor r8, r8
     mov r9, rdi
     mov r10, rcx
-    xor r11, r11
 .loop:
     call get_char
-
-    cmp al, KEY_CTRL_UP
-    je .ctrlup
-    cmp al, KEY_CTRL_DOWN
-    je .ctrldown
-
-    ; any key other than Ctrl+Up/Ctrl+Down snaps back to the live view
-    ; first, if we were showing a scrolled-back screen
-    cmp word [scroll_offset], 0
-    je .not_scrolled
-    call scrollback_snap_live
-.not_scrolled:
-
-    cmp al, KEY_UP
-    je .histup
-    cmp al, KEY_DOWN
-    je .histdown
     cmp al, 0x0D
     je .enter
     cmp al, 0x08
@@ -6907,252 +4770,6 @@ read_line:
     pop rdi
     pop rbx
     pop rax
-    ret
-
-.histup:
-    cmp word [hist_count], 0
-    je .loop                          ; no history yet
-    cmp r11, 0
-    jne .histup_cont
-    ; first Up this line - stash whatever's currently typed so Down
-    ; can bring it back later
-    mov byte [r9 + r8], 0
-    mov rsi, r9
-    mov rdi, hist_saved_line
-    call str_copy
-.histup_cont:
-    movzx rax, word [hist_count]
-    cmp r11, rax
-    jae .loop                          ; already at the oldest entry
-    inc r11
-    mov ax, [hist_head]
-    sub ax, r11w
-    and ax, HIST_MAX-1
-    movzx rcx, ax
-    imul rcx, LINE_MAX
-    mov rsi, hist_buf
-    add rsi, rcx
-    call hist_apply_line
-    jmp .loop
-
-.histdown:
-    cmp r11, 0
-    je .loop                           ; not browsing history
-    dec r11
-    cmp r11, 0
-    jne .histdown_pick
-    mov rsi, hist_saved_line
-    call hist_apply_line
-    jmp .loop
-.histdown_pick:
-    mov ax, [hist_head]
-    sub ax, r11w
-    and ax, HIST_MAX-1
-    movzx rcx, ax
-    imul rcx, LINE_MAX
-    mov rsi, hist_buf
-    add rsi, rcx
-    call hist_apply_line
-    jmp .loop
-
-.ctrlup:
-    cmp word [scroll_offset], 0
-    jne .ctrlup_cont
-    call scrollback_capture_live
-.ctrlup_cont:
-    mov ax, [scroll_offset]
-    cmp ax, [scrollback_count]
-    jae .loop                          ; already at the oldest scrollback line
-    inc word [scroll_offset]
-    call scrollback_render
-    jmp .loop
-
-.ctrldown:
-    cmp word [scroll_offset], 0
-    je .loop                           ; already live
-    dec word [scroll_offset]
-    call scrollback_render
-    cmp word [scroll_offset], 0
-    jne .loop
-    mov al, [saved_cursor_row]
-    mov [cursor_row], al
-    mov al, [saved_cursor_col]
-    mov [cursor_col], al
-    call update_cursor
-    jmp .loop
-
-; hist_apply_line: replaces the line currently being edited with a new
-; string - erases what's on screen, copies the new content into the
-; line buffer, and re-prints it.
-; in:  rsi = new content (null terminated), r8 = currently displayed
-;      length, r9 = line buffer to write into.
-; out: r8 = new length, r9's buffer updated, screen redrawn.
-hist_apply_line:
-    push rax
-    push rbx
-    push rcx
-    push rdx
-    push rdi
-    push rsi
-.hal_erase:
-    cmp r8, 0
-    je .hal_erase_done
-    call do_backspace
-    dec r8
-    jmp .hal_erase
-.hal_erase_done:
-    mov rdi, r9
-    call str_copy
-    mov rsi, r9
-    call str_len
-    mov r8, rax
-    mov rsi, r9
-.hal_print:
-    mov al, [rsi]
-    cmp al, 0
-    je .hal_done
-    mov bl, ATTR_NORMAL
-    call putchar
-    inc rsi
-    jmp .hal_print
-.hal_done:
-    pop rsi
-    pop rdi
-    pop rdx
-    pop rcx
-    pop rbx
-    pop rax
-    ret
-
-; hist_push: appends line_buf to the history ring, unless it's empty or
-; identical to the most recently stored entry (avoids duplicate spam
-; when a user just hits Enter on the same command repeatedly).
-hist_push:
-    push rax
-    push rsi
-    push rdi
-    push rcx
-    cmp byte [line_buf], 0
-    je .hp_done
-    cmp word [hist_count], 0
-    je .hp_store
-    mov ax, [hist_head]
-    sub ax, 1
-    and ax, HIST_MAX-1
-    movzx rcx, ax
-    imul rcx, LINE_MAX
-    mov rsi, line_buf
-    mov rdi, hist_buf
-    add rdi, rcx
-    call str_eq
-    cmp al, 1
-    je .hp_done
-.hp_store:
-    movzx rcx, word [hist_head]
-    imul rcx, LINE_MAX
-    mov rdi, hist_buf
-    add rdi, rcx
-    mov rsi, line_buf
-    call str_copy
-    mov ax, [hist_head]
-    add ax, 1
-    and ax, HIST_MAX-1
-    mov [hist_head], ax
-    cmp word [hist_count], HIST_MAX
-    jae .hp_done
-    inc word [hist_count]
-.hp_done:
-    pop rcx
-    pop rdi
-    pop rsi
-    pop rax
-    ret
-
-; scrollback_capture_live: snapshots the current 25 on-screen rows and
-; cursor position into live_snapshot/saved_cursor_*, so the real live
-; view can be restored exactly once the user scrolls back down.
-scrollback_capture_live:
-    push rax
-    push rcx
-    push rsi
-    push rdi
-    mov rsi, VGA_BASE
-    mov rdi, live_snapshot
-    mov rcx, VGA_COLS*VGA_ROWS
-    rep movsw
-    mov al, [cursor_row]
-    mov [saved_cursor_row], al
-    mov al, [cursor_col]
-    mov [saved_cursor_col], al
-    pop rdi
-    pop rsi
-    pop rcx
-    pop rax
-    ret
-
-; scrollback_render: redraws all 25 VGA rows for the current
-; [scroll_offset] (0 = live bottom), pulling each row from either
-; scrollback_buf (older content) or live_snapshot (the screen as it
-; looked when the scrollback session began).
-scrollback_render:
-    push rax
-    push rbx
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    xor rbx, rbx                       ; rbx = screen_row (0..24)
-.sr_row:
-    cmp rbx, VGA_ROWS
-    jae .sr_done
-    movzx rax, word [scrollback_count]
-    mov rcx, rax                       ; rcx = scrollback_count
-    movzx rdx, word [scroll_offset]
-    sub rax, rdx
-    add rax, rbx                       ; rax = base = count - offset + screen_row
-    cmp rax, rcx
-    jb .sr_from_scrollback
-.sr_from_live:
-    sub rax, rcx                       ; rax = live row index (0..24)
-    imul rax, VGA_COLS*2
-    mov rsi, live_snapshot
-    add rsi, rax
-    jmp .sr_copy
-.sr_from_scrollback:
-    movzx rdx, word [scrollback_write]
-    sub rdx, rcx
-    add rdx, rax
-    and rdx, SCROLLBACK_LINES-1
-    imul rdx, VGA_COLS*2
-    mov rsi, scrollback_buf
-    add rsi, rdx
-.sr_copy:
-    imul rdi, rbx, VGA_COLS*2
-    add rdi, VGA_BASE
-    mov rcx, VGA_COLS
-    rep movsw
-    inc rbx
-    jmp .sr_row
-.sr_done:
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
-    pop rax
-    ret
-
-; scrollback_snap_live: jumps straight back to the live view (used when
-; the user types/backspaces/enters while scrolled back - like a normal
-; terminal, any activity snaps the view back to the bottom).
-scrollback_snap_live:
-    mov word [scroll_offset], 0
-    call scrollback_render
-    mov al, [saved_cursor_row]
-    mov [cursor_row], al
-    mov al, [saved_cursor_col]
-    mov [cursor_col], al
-    call update_cursor
     ret
 
 ; erase one character visually (move cursor back, blank it)
@@ -7197,20 +4814,8 @@ ALIGN 8
 cursor_row:   db 0
 cursor_col:   db 0
 shift_state:  db 0
-ctrl_state:   db 0                   ; 1 while either Ctrl key is held
 cur_dir:      dq 0
 auth_valid:   db 0                   ; set by 'auth' command, checked by dangerous commands
-
-; --- command history (Up/Down arrow) ---
-hist_count: dw 0                     ; number of entries stored (caps at HIST_MAX)
-hist_head:  dw 0                     ; ring index of the NEXT slot to write
-
-; --- output scrollback (Ctrl+Up/Ctrl+Down) ---
-scroll_offset:     dw 0              ; 0 = live view; N = N rows scrolled back
-scrollback_write:  dw 0              ; ring index of the NEXT row to write
-scrollback_count:  dw 0              ; rows stored so far (caps at SCROLLBACK_LINES)
-saved_cursor_row:  db 0              ; cursor position captured when a
-saved_cursor_col:  db 0              ; scrollback session begins
 
 banner:
     db "ShellyForever v0.1 -- 'help' for commands", 10, 0
@@ -7251,20 +4856,13 @@ str_eq_sign: db "=", 0
 str_home_name: db "home", 0
 str_auth:   db "auth", 0
 str_vars:   db "vars", 0
-str_dscan:  db "dscan", 0
-str_usbinfo: db "usbinfo", 0
-str_usbdisk: db "usbdisk", 0
-str_usb:     db "usb", 0
-str_usb_list:   db "list", 0
-str_usb_info:   db "info", 0
-str_usb_export: db "export", 0
-str_usb_import: db "import", 0
-str_usb_delete: db "delete", 0
-str_usb_rename: db "rename", 0
 str_rmv_all: db "all", 0
 str_force:  db "-force", 0
 str_silent: db "-silent", 0
 str_info:   db "-info", 0
+str_dscan:  db "dscan", 0
+str_format: db "fmt", 0
+str_mount:  db "mount", 0
 
 tag_folder: db "/", 10, 0
 tag_file:   db "", 10, 0
@@ -7288,6 +4886,36 @@ msg_loaded_fs:  db "Loaded filesystem from disk.", 10, 10, 0
 msg_fresh_fs:   db "No saved filesystem found - starting fresh.", 10, 10, 0
 msg_no_disk:    db "No disk detected - filesystem will not persist.", 10, 10, 0
 msg_sync_failed: db "error: sync failed - disk not available.", 10, 0
+
+; --- SFFS disk / mount messages ---
+msg_dscan_header: db "Scanning for SFFS disks...", 10, 0
+msg_dscan_found1: db "  device ", 0
+msg_dscan_found2: db " (", 0
+msg_dscan_found3: db "): SFFS volume '", 0
+msg_dscan_found4: db "'", 0
+msg_dscan_other2: db "): present, not SFFS", 0
+msg_dscan_none:   db "No SFFS disks found.", 10, 0
+msg_dev_primary:  db "primary ", 0
+msg_dev_secondary: db "secondary ", 0
+msg_dev_master:   db "master", 0
+msg_dev_slave:    db "slave", 0
+msg_fmt_usage:    db "fmt: use 'fmt <label>' to format a drive", 10, 0
+msg_fmt_none:     db "fmt: no unformatted drive found (use 'fmt <label> -force' to reuse one)", 10, 0
+msg_fmt_long:     db "fmt: label too long (max 31 characters)", 10, 0
+msg_fmt_ok1:      db "Formatted ", 0
+msg_fmt_ok2:      db " on ", 0
+msg_fmt_ok3:      db ". Use 'sync' to save, then 'mount <label>'.", 0
+msg_fmt_err:      db "fmt: disk error - failed to write.", 10, 0
+msg_mount_usage:  db "mount: use 'mount <label>' to mount a formatted drive", 10, 0
+msg_mount_none:   db "mount: no disk labeled '", 0
+msg_mount_none2:  db "' found. Run 'dscan'.", 10, 0
+msg_mount_already: db "mount: already mounted: ", 0
+msg_mount_full:   db "mount: too many drives mounted", 10, 0
+msg_mount_fail:   db "mount: failed to read the drive.", 10, 0
+msg_mount_ok1:    db "Mounted ", 0
+msg_mount_ok2:    db " at /", 0
+msg_mount_ok3:    db "/. Use 'cf ", 0
+msg_mount_ok4:    db "' to enter it.", 0
 msg_bad_value:   db "error: invalid value", 10, 0
 msg_calc_err:      db "calc: invalid expression", 10, 0
 msg_calc_need_expr: db "calc: need an expression, e.g. calc 1 + 2 * 3", 10, 0
@@ -7322,78 +4950,6 @@ msg_mkfl_info:     db "mkfl: creating '", 0
 msg_mkfl_info2:    db "' (", 0
 msg_mkfl_info3:    db " bytes)", 10, 0
 
-; --- dscan / PCI messages ---
-msg_dscan_header: db "Scanning PCI bus 0 for controllers...", 10, 0
-msg_dscan_none:   db "No USB host controller found.", 10, 0
-msg_pci_dev:      db "  dev ", 0
-msg_pci_func:     db " func ", 0
-msg_pci_vendor:   db " vendor=0x", 0
-msg_pci_device:   db " device=0x", 0
-msg_uhci_found:   db "    -> UHCI USB controller, I/O base 0x", 0
-msg_usb_other:    db "    -> USB controller (not UHCI - not yet supported)", 10, 0
-msg_uhci_init_ok: db "    -> UHCI controller reset and started.", 10, 0
-msg_uhci_port1_device: db "    -> Port 1: device connected.", 10, 0
-msg_uhci_port1_empty:  db "    -> Port 1: empty.", 10, 0
-msg_uhci_port2_device: db "    -> Port 2: device connected.", 10, 0
-msg_uhci_port2_empty:  db "    -> Port 2: empty.", 10, 0
-
-; --- usbinfo / Phase 3 control-transfer messages ---
-msg_usbinfo_no_ctrl: db "No UHCI controller found - run 'dscan' first.", 10, 0
-msg_usbinfo_no_dev:  db "No device connected on either root hub port.", 10, 0
-msg_usb_addr_ok:     db "    -> Device addressed (address 1).", 10, 0
-msg_usb_addr_fail:   db "    -> SET_ADDRESS failed (no response / transfer error).", 10, 0
-msg_usb_desc_fail:   db "    -> GET_DESCRIPTOR failed (no response / transfer error).", 10, 0
-msg_usb_vendor:      db "    -> Vendor ID: 0x", 0
-msg_usb_product:     db ", Product ID: 0x", 0
-msg_usb_msc_found:   db "    -> Mass-storage interface found.", 10, 0
-msg_usb_no_msc:      db "    -> No mass-storage interface in this configuration.", 10, 0
-msg_usb_bulk_in:     db "    -> Bulk IN endpoint:  0x", 0
-msg_usb_bulk_out:    db ", Bulk OUT endpoint: 0x", 0
-msg_usb_cfg_fail:    db "    -> SET_CONFIGURATION failed (no response / transfer error).", 10, 0
-msg_usb_cfg_ok:      db "    -> Device configured.", 10, 0
-
-; --- usbdisk / Phase 4 bulk-transfer + BOT/SCSI messages ---
-msg_usbdisk_no_msc:      db "usbdisk: run 'usbinfo' first - no mass-storage endpoints found.", 10, 0
-msg_usbdisk_ready:       db "    -> TEST UNIT READY: device reports ready.", 10, 0
-msg_usbdisk_not_ready:   db "    -> TEST UNIT READY: device not ready (continuing anyway).", 10, 0
-msg_usbdisk_inquiry_fail: db "    -> INQUIRY failed (no response / transfer error).", 10, 0
-msg_usbdisk_vendor:      db "    -> Vendor: ", 0
-msg_usbdisk_product:     db ", Product: ", 0
-msg_usbdisk_cap_fail:    db "    -> READ CAPACITY(10) failed (no response / transfer error).", 10, 0
-msg_usbdisk_blocks:      db "    -> Capacity: 0x", 0
-msg_usbdisk_blocksize:   db " blocks x 0x", 0
-msg_usbdisk_bytes_each:  db " bytes each", 10, 0
-msg_usbdisk_read_fail:   db "    -> READ(10) LBA 0 failed (no response / transfer error).", 10, 0
-msg_usbdisk_sector0:     db "    -> First 16 bytes of LBA 0: ", 0
-
-; --- 'usb' project transfer command ---
-msg_usb_no_device:    db "No USB device detected.", 10, 0
-msg_usb_usage:        db "usb: usage: usb <list|info|export|import|delete|rename> [args]", 10, 0
-msg_usb_read_fail:    db "error: Failed to read sector.", 10, 0
-msg_usb_write_fail:   db "error: Failed to write sector.", 10, 0
-msg_usb_full:         db "error: USB storage is full.", 10, 0
-msg_usb_exists:       db "error: Project already exists.", 10, 0
-msg_usb_corrupt:      db "error: Archive is corrupted.", 10, 0
-msg_usb_no_project1:  db 'error: No project named "', 0
-msg_usb_no_project2:  db '".', 10, 0
-msg_usb_none_found:   db "No projects found.", 10, 0
-msg_usb_info_vendor:  db "Vendor : ", 0
-msg_usb_info_product: db "Product: ", 0
-msg_usb_info_capacity: db "Capacity: ", 0
-msg_usb_info_mb:      db " MB", 10, 0
-msg_usb_info_projects: db "Projects: ", 0
-msg_usb_exporting:    db "Exporting project...", 10, 10, 0
-msg_usb_creating_archive: db "Creating archive...", 10, 0
-msg_usb_writing:      db "Writing to USB...", 10, 0
-msg_usb_done:         db "Done.", 10, 0
-msg_usb_creating_project: db "Creating project...", 10, 10, 0
-msg_usb_copying:      db "Copying files...", 10, 0
-msg_usb_deleted1:     db "Deleted project '", 0
-msg_usb_deleted2:     db "'.", 10, 0
-msg_usb_renamed1:     db "Renamed project '", 0
-msg_usb_renamed2:     db "' to '", 0
-msg_usb_renamed3:     db "'.", 10, 0
-
 help_text:
     db "Commands (name args accept paths: docs/notes.txt, ../x, /home/x):", 10
     db "  cf <path>          change folder ('cf ..' up, 'cf /home' root)", 10
@@ -7419,21 +4975,14 @@ help_text:
     db "  calc <expr>        evaluate math, e.g. calc 1 + 2 * 3", 10
     db "  current            print current path", 10
     db "  wipe               clear the screen", 10
-    db "  sync               save the filesystem to disk", 10
+    db "  sync               save the filesystem (and mounted drives) to disk", 10
+    db "  fmt <label>        format a drive with the SFFS format (-force reuses one)", 10
+    db "  dscan              scan for SFFS drives attached to the ATA bus", 10
+    db "  mount <label>      mount a formatted drive at /<label>/", 10
     db "  rboot              save to disk, then restart (requires auth)", 10
     db "  sdown              shut down (requires auth)", 10
-    db "  dscan              scan the PCI bus for a USB storage controller", 10
-    db "  usbinfo            address a USB device found by dscan and probe it", 10
-    db "  usbdisk            probe a USB mass-storage device found by usbinfo", 10
-    db "  usb list/info      list projects on USB, or show USB device info", 10
-    db "  usb export <name>  export a project folder to USB (needs dscan+usbinfo)", 10
-    db "  usb import <name>  import a project folder from USB", 10
-    db "  usb delete <name>  delete a project archive from USB", 10
-    db "  usb rename <a> <b> rename a project archive on USB", 10
     db "  ;                  chain commands, e.g. show hi ; show bye", 10
-    db "  $                  comment line (lines starting with $ are skipped)", 10
-    db "  up/down arrows     recall previously entered commands", 10
-    db "  ctrl+up/down       scroll the screen back/forward through output", 10, 10, 0
+    db "  $                  comment line (lines starting with $ are skipped)", 10, 10, 0
 
 ; --- scancode set 1 -> ascii tables (index = scancode, 0..0x39) ---
 ALIGN 8
@@ -7458,30 +5007,38 @@ kbd_shift:
     db 0,'*',0,' '                                 ; 0x36-0x39
 
 ; --- filesystem storage ---
-; fs_disk_header..fs_image_end is exactly what fs_save/fs_load ship to/from
-; disk as one blob. fs_pad rounds that blob up to a whole number of sectors
-; so sector-sized disk I/O never spills into unrelated memory (path_stack
-; etc.) that happens to sit right after it.
+; One flat node table shared by every mounted volume. The OS volume lives
+; in nodes 0..OS_NODES; mount slot k owns nodes VOL_NODES*(k+1)..VOL_NODES*(k+2)-1.
+; Each volume is persisted separately (superblock + node arrays) to its own
+; device - see the SFFS v2 layout notes near the top of this file.
+;
+; IMPORTANT: ata_read_sector/ata_write_sector always move a full 512-byte
+; sector, so every buffer a sector is staged in/out of must hold 512 bytes.
+; node_type and fs_parent_scratch are exactly that: the type/parent reads
+; in vol_read/vol_write go straight at a whole sector each, and anything
+; smaller would silently overflow into the adjacent arrays (which showed up
+; as a black screen after 'mount' corrupted the node table).
 ALIGN 8
-fs_disk_header:
-    db 'SFFS'                    ; magic
-    db 1                         ; format version
-    db 0, 0, 0                   ; reserved
-fs_image_start:
-node_type:    times MAX_NODES db 0
+fs_super_buf:   times 512 db 0        ; scratch for reading/building superblocks
+fs_parent_scratch: times 512 db 0     ; staging for one full parent sector (512B)
+mount_label:   times MAX_MOUNTS*32 db 0     ; label of each mounted volume
+mount_device:  times MAX_MOUNTS db 0        ; device id each volume came from
+mount_used:    times MAX_MOUNTS db 0        ; 1 = slot in use
+; type sector = 512B per volume (base 0/64/128), so this must span the max
+; extent of a sector write: base + 512. node indices still index it by node
+; (1 byte per node); the per-volume padding holds whatever the sector has.
+node_type:    times 512 * (1 + MAX_MOUNTS) db 0
 node_parent:  times MAX_NODES dw 0
 node_name:    times MAX_NODES*NAME_LEN db 0
 node_content: times MAX_NODES*CONTENT_LEN db 0
-fs_image_end:
-FS_IMAGE_SIZE equ fs_image_end - fs_disk_header
-FS_PAD_SIZE   equ (512 - (FS_IMAGE_SIZE % 512)) % 512
-fs_pad:       times FS_PAD_SIZE db 0
-fs_disk_block_end:
-FS_SECTORS    equ (fs_disk_block_end - fs_disk_header) / 512
 
 fs_loaded_from_disk: db 0
 fs_disk_available:   db 1     ; optimistic default; cleared on first ATA failure
 fs_name_too_long:    db 0     ; set by fs_create_node when a name won't fit
+
+ALIGN 8
+ata_port_base: dw 0x1F0        ; 0x1F0 primary channel, 0x170 secondary
+ata_drive_sel: db 0xE0         ; 0xE0 master, 0xF0 slave
 
 path_stack:   times 16 dw 0
 
@@ -7490,132 +5047,10 @@ path_comp_buf: times 64 db 0     ; one path component at a time
 leaf1_buf:      times 64 db 0    ; resolved leaf name for arg1_buf paths
 leaf2_buf:      times 64 db 0    ; resolved leaf name for arg2_buf paths
 
-; --- USB (dscan/mount) state ---
-; hexbuf is scratch for hex_to_str; 9 bytes covers an 8-digit dword plus
-; null terminator, which is the widest thing we currently print in hex.
-hexbuf:          times 9 db 0
-pci_tmp_vendev:  dd 0
-pci_tmp_class:   dd 0
-usb_uhci_found:  db 0             ; set by dscan once a UHCI controller is seen
-usb_uhci_bus:    db 0
-usb_uhci_dev:    db 0
-usb_uhci_func:   db 0
-usb_uhci_io_base: dw 0            ; UHCI I/O-space base (from BAR4)
-usb_uhci_ready:   db 0             ; set by uhci_init once the controller
-                                   ; has been reset and started
-uhci_port1_status: dw 0            ; last PORTSC1/2 value read by uhci_init
-uhci_port2_status: dw 0            ; (bit0 = device currently connected)
-
-; UHCI's frame list must be 4KB-aligned; ALIGN is computed against this
-; file's actual load address (ORG 0x8000 above), not file offset, so this
-; lands on a real page boundary in memory.
-ALIGN 4096
-uhci_frame_list: times 1024 dd 1  ; 1024 entries, each Terminate-bit-set
-                                  ; (no queue heads scheduled yet)
-
-; --- Phase 3: control-transfer QH/TD pool ---
-; QH and every TD must be 16-byte aligned (their Link/Element Pointer
-; fields reserve the low 4 bits for T/Q/Vf flags).
-ALIGN 16
-uhci_qh: dd 0                     ; Head Link Pointer (unused - Terminate)
-         dd 0                     ; Element Link Pointer -> first TD
-
-; UHCI_MAX_TDS covers SETUP + STATUS + up to 18 data TDs at
-; UHCI_CTRL_MAXPKT(8) bytes each - enough for the largest transfer we
-; issue (a UHCI_CFG_BUFSZ-byte configuration descriptor read).
-UHCI_MAX_TDS equ 20
-ALIGN 16
-uhci_td_pool: times (UHCI_MAX_TDS*16) db 0   ; 16 bytes/TD: link,ctrl,token,buf
-
-; scratch copy of the 8-byte setup packet - this is what the SETUP TD's
-; buffer pointer actually targets, so it needs a stable address of its own
-; rather than pointing directly at caller-supplied stack/buffer memory.
-uhci_setup_pkt: times 8 db 0
-
-; --- uhci_ctrl_transfer's "call frame" (this codebase's usual style of
-; passing state through named globals rather than deep argument lists) ---
-usb_xfer_addr:  db 0               ; target device address for the transfer
-usb_xfer_buf:   dq 0                ; data-stage buffer (linear==physical)
-usb_xfer_len:   dw 0                ; data-stage length in bytes (0 = none)
-usb_xfer_dir:   db 0                ; 1 = IN (device->host), 0 = OUT
-usb_xfer_setup: times 8 db 0        ; 8-byte setup packet, filled by caller
-
-; --- addressed-device state (Phase 3 output, Phase 4 input) ---
-usb_dev_address:   db 0             ; address assigned by usb_set_address
-usb_dev_desc:      times 18 db 0    ; full device descriptor
-UHCI_CFG_BUFSZ equ 128
-usb_cfg_desc:      times UHCI_CFG_BUFSZ db 0   ; full configuration descriptor
-usb_cfg_total_len: dw 0             ; wTotalLength from the config header
-
-usb_msc_iface_num:      db 0xFF     ; 0xFF = "not found"
-usb_msc_iface_class:    db 0
-usb_msc_iface_subclass: db 0
-usb_msc_iface_protocol: db 0
-usb_bulk_in_ep:  db 0xFF            ; endpoint number 0-15, 0xFF = not found
-usb_bulk_out_ep: db 0xFF
-
-; --- uhci_bulk_transfer's "call frame" (mirrors usb_xfer_* above) ---
-usb_bulk_ep:  db 0
-usb_bulk_buf: dq 0
-usb_bulk_len: dw 0
-usb_bulk_dir: db 0
-
-; per-endpoint data toggle state, reset to DATA0 by usb_set_configuration
-; whenever the device is (re-)configured
-usb_bulk_in_toggle:  db 0
-usb_bulk_out_toggle: db 0
-
-; --- USB Mass Storage Bulk-Only Transport / SCSI state ---
-usb_msc_cbw:  times 31 db 0         ; Command Block Wrapper
-usb_msc_csw:  times 13 db 0         ; Command Status Wrapper
-usb_msc_cdb:  times 16 db 0         ; scratch SCSI command block
-usb_msc_cur_tag:  dd 1              ; next dCBWTag to use, incremented each command
-usb_msc_last_tag: dd 0              ; dCBWTag of the in-flight command, for CSW matching
-usb_msc_data_len: dw 0              ; usb_msc_command's "call frame"
-usb_msc_data_dir: db 0
-
-usb_msc_inquiry_buf: times 36 db 0  ; full INQUIRY response
-usb_msc_cap_buf:     times 8  db 0  ; raw READ CAPACITY(10) response
-usb_msc_block_count: dd 0           ; total blocks, host byte order
-usb_msc_block_size:  dd 0           ; bytes/block, host byte order
-usb_msc_sector_buf:  times 512 db 0 ; scratch data-stage buffer for READ(10)
-
-; --- 'usb' project transfer state ---
-usb_idx_header: times 512 db 0                       ; LBA 0 mirror
-ALIGN 8
-usb_idx_table:  times USB_MAX_PROJECTS*USB_ENTRY_SIZE db 0   ; LBA 1..2 mirror (1024 bytes)
-usb_archive_buf: times USB_PROJECT_SLOT_BYTES db 0    ; one project's serialized archive
-usb_archive_ptr:      dq 0     ; usb_archive_emit's current write pointer
-usb_archive_count:    dw 0     ; nodes emitted so far
-usb_archive_overflow: db 0     ; set if a project's archive would exceed its slot
-usb_rec_base:         dq 0     ; scratch: current record's base address
-usb_tmp_dest:         dq 0     ; scratch: saved destination pointer around str_copy
-usb_import_root_real: dq -1    ; real fs node idx of the just-created project root,
-                                ; used to roll back (fs_delete_tree) a failed import
-usb_local_map:  times MAX_NODES dw 0  ; archive-local index -> real fs node idx (import)
-
 ; --- line editing buffers ---
 line_buf: times LINE_MAX db 0
 chain_scan_buf: times LINE_MAX db 0  ; scratch copy for ; chaining
 cmd_buf:  times 32  db 0
-
-; --- command history storage (ring of HIST_MAX previously-entered lines) ---
-ALIGN 8
-hist_buf: times HIST_MAX*LINE_MAX db 0
-; holds whatever the user had typed-but-not-submitted when they started
-; browsing history, so Down can bring them back to it (like real shells).
-hist_saved_line: times LINE_MAX db 0
-
-; --- output scrollback storage ---
-; scrollback_buf holds whole VGA rows (char+attr word per cell, same
-; layout as VGA memory) that have scrolled off the top of the screen.
-; live_snapshot holds the 25 rows that were actually on screen at the
-; moment a scrollback session began, so the real live view can be
-; restored exactly (without re-deriving it) when the user scrolls back
-; down to the bottom.
-ALIGN 8
-scrollback_buf:  times SCROLLBACK_LINES*VGA_COLS dw 0
-live_snapshot:   times VGA_ROWS*VGA_COLS dw 0
 arg1_buf: times 96  db 0
 arg2_buf: times 160 db 0
 arg3_buf: times 32  db 0             ; for flags (-force, -silent, -info)
