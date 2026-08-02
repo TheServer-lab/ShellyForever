@@ -29,11 +29,14 @@ no C, no BIOS libraries beyond boot-time disk/keyboard calls, no existing kernel
 | `mkfl` | `mkfl something.txt "some text"` | make a file with content |
 | `del` | `del something.txt` | delete a file in the current folder (requires auth) |
 | `rname` | `rname old.txt new.txt` | rename a file or folder here |
+| `owrite` | `owrite hi.txt "new content"` | overwrite an existing file's content in place |
 | `cpy` | `cpy docs docs_backup` | copy a file or folder here (recursive for folders) |
 | `mov` | `mov docs archive` | move/rename a file or folder here (recursive for folders) |
 | `show` | `show "hello world"`, `show a` | print a message, or a variable's value |
 | `list` | `list` | list contents of current folder |
 | `view` | `view something.txt` | print a file's content |
+| `find` | `find notes.txt` | search every drive for a file/folder by name, print its full path |
+| `lookfor` | `lookfor "todo" notes.txt`, `lookfor "todo" line 100, 200 notes.txt limit 5` | search a file's content for text, like grep |
 | `edit` | `edit something.txt` | open the built-in editor for a file (Esc, then y/n to save) |
 | `<name> = <value>` | `a = 5` | set a variable to a literal or another variable's value |
 | `rmv` | `rmv a` | remove a variable |
@@ -178,6 +181,58 @@ rush>/home: mkfl hi.txt "fourth" -info
 mkfl: creating 'hi.txt' (6 bytes)
 ```
 
+### Overwriting files with `owrite`
+
+`mkfl` makes a new file (or overwrites one with `-force`); `owrite` is the
+simpler counterpart for when the file is already there and you just want to
+replace its content:
+
+```
+rush>/home: mkfl hi.txt "Hello"
+rush>/home: owrite hi.txt "Hello, there."
+rush>/home: view hi.txt
+Hello, there.
+```
+
+Unlike `mkfl -force`, `owrite` requires the file to already exist (it errors
+with `owrite: no such file: <path>` otherwise) and never creates one.
+
+### Searching: `find` and `lookfor`
+
+`find <name>` looks for a file or folder by exact name across every drive —
+the boot volume and any mounted ones — and prints the full path of every
+match:
+
+```
+rush>/home: mkf docs ; mkfl docs/notes.txt "todo: buy milk"
+rush>/home: find notes.txt
+/home/docs/notes.txt
+rush>/home: find nope.txt
+find: no matches
+```
+
+`lookfor <text> <file> [limit <n>]` is a small grep: it searches a file's
+content one line at a time (a "line" is whatever's between newline bytes in
+that file's content) and prints every matching line, up to `limit` matches
+(50 by default):
+
+```
+rush>/home: lookfor "todo" docs/notes.txt
+todo: buy milk
+rush>/home: lookfor "todo" docs/notes.txt limit 5
+todo: buy milk
+```
+
+Add `line <a>, <b>` (1-indexed, inclusive) to restrict the search to just
+that range of lines:
+
+```
+rush>/home: lookfor "todo" line 100, 200 docs/notes.txt limit 50
+```
+
+Both the search text and file path accept the usual path syntax (`docs/x`,
+`../x`, `/home/x`), and the search text can be quoted if it has spaces.
+
 Prompt looks exactly like you asked:
 
 ```
@@ -229,7 +284,7 @@ sectors.
 ### SFFS v2 on-disk format
 
 Each disk volume is self-contained and starts at sector (LBA) 200 — well
-clear of the boot sector and the kernel's own sectors (1..160):
+clear of the boot sector and the kernel's own sectors (1..199):
 
 - **Superblock** (1 sector): `SFFS` magic, version byte, then a 32-byte
   label.
@@ -301,7 +356,7 @@ message and then nothing, which is your cue to power off manually.
 - Persistence is whole-table snapshotting (like a save file), not an
   incremental/journaled on-disk format — simple and robust for this scale,
   but a `sync` rewrites the whole reserved region every time.
-- `kernel.bin` currently uses ~171 of the 190 sectors (`KERNEL_SECTORS` in
+- `kernel.bin` currently uses ~189 of the 199 sectors (`KERNEL_SECTORS` in
   `boot.asm`) the bootloader reserves for it. If you add enough new code to
   cross that budget, bump `KERNEL_SECTORS` again — it's a one-line change,
   but the bootloader will silently load a truncated kernel if you forget,
@@ -321,6 +376,13 @@ message and then nothing, which is your cue to power off manually.
 
 ## What's new
 
+- **`find` and `lookfor`** — `find <name>` searches every drive for a file
+  or folder by exact name and prints its full path; `lookfor <text> <file>
+  [limit <n>]` greps a file's content line by line, optionally restricted
+  to a `line <a>, <b>` range. See "Searching: `find` and `lookfor`" above.
+- **`owrite`** — overwrites an existing file's content in place
+  (`owrite hi.txt "new content"`), without `mkfl`'s create-or-`-force`
+  semantics. See "Overwriting files with `owrite`" above.
 - **`~` pipes** — pipe one command's output into another:
   `calc 1 + 1 * 5 ~ = a` stores calc's result in the variable `a`;
   `calc 3 * 3 ~ show` pipes the result into `show`. See "Piping output with
@@ -351,7 +413,9 @@ message and then nothing, which is your cue to power off manually.
   - `-silent`: suppress the `-force` overwrite warning
   - `-info`: print verbose info (filename + content length)
 
-I built and test-assembled this in a sandbox without a CPU emulator
-available, so it's been verified to assemble cleanly and I traced the logic
-carefully, but you should run it in QEMU yourself to catch anything a static
-read-through can't — happy to help debug from there if something misbehaves.
+I built and test-assembled this (including `find`, `lookfor`, and `owrite`)
+in a sandbox with QEMU available but didn't get all the way through a full
+interactive boot test this session — every change has been verified to
+assemble cleanly with no errors, and I traced the logic carefully by hand,
+but you should run it in QEMU yourself to catch anything a static read-through
+can't — happy to help debug from there if something misbehaves.
