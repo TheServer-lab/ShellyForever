@@ -33,6 +33,8 @@ MAX_VARS        equ 16
 VAR_NAME_LEN    equ 32
 MAX_CALC_TOKENS equ 32
 
+PIPE_CAP_MAX    equ 192       ; max bytes captured from a "~" pipe's left side
+
 ; ------------------------------------------------------------------
 ;  SFFS v2 -- ShellyForever File Storage format (on-disk layout).
 ;  Every drive (OS boot drive and any data drives) uses the same
@@ -134,6 +136,8 @@ process_chain:
     push r14
     push r15
 
+    mov byte [chain_is_rr], 0
+
     ; Copy line_buf to chain_scan_buf so we can scan without destroying it
     mov rsi, line_buf
     mov rdi, chain_scan_buf
@@ -181,23 +185,9 @@ process_chain:
 .chain_copy_done:
     mov byte [rdi], 0         ; null-terminate line_buf
 
-    ; Tokenize and dispatch the segment
-    mov rsi, line_buf
-    mov rdi, cmd_buf
-    call next_token
-    mov rdi, arg1_buf
-    call next_token
-    mov rdi, arg2_buf
-    call next_token
-    mov rdi, arg3_buf
-    call next_token
-    mov rdi, arg4_buf
-    call next_token
-
-    cmp byte [cmd_buf], 0
-    je .chain_skip
-
-    call dispatch
+    ; Tokenize (and, if a "~" pipe is present, split/capture/rejoin) and
+    ; dispatch the segment - see process_segment below.
+    call process_segment
 
 .chain_skip:
     pop r13                   ; restore scan pointer (points to ;)
@@ -211,22 +201,7 @@ process_chain:
     mov rdi, line_buf
     call str_copy             ; copy last segment to line_buf
 
-    mov rsi, line_buf
-    mov rdi, cmd_buf
-    call next_token
-    mov rdi, arg1_buf
-    call next_token
-    mov rdi, arg2_buf
-    call next_token
-    mov rdi, arg3_buf
-    call next_token
-    mov rdi, arg4_buf
-    call next_token
-
-    cmp byte [cmd_buf], 0
-    je .chain_end
-
-    call dispatch
+    call process_segment
 
 .chain_end:
     pop r15
@@ -249,6 +224,8 @@ process_chain_rr:
     push r13
     push r14
     push r15
+
+    mov byte [chain_is_rr], 1
 
     ; Copy line_buf to chain_scan_buf for scanning
     mov rsi, line_buf
@@ -302,31 +279,10 @@ process_chain_rr:
 .rr_chain_copy_done:
     mov byte [rdi], 0         ; null-terminate line_buf
 
-    ; Tokenize the segment
-    mov rsi, line_buf
-    mov rdi, cmd_buf
-    call next_token
-    mov rdi, arg1_buf
-    call next_token
-    mov rdi, arg2_buf
-    call next_token
-    mov rdi, arg3_buf
-    call next_token
-    mov rdi, arg4_buf
-    call next_token
-
-    ; Skip empty commands
-    cmp byte [cmd_buf], 0
-    je .rr_chain_skip
-
-    ; Save rr_content_ptr and proc_cur_slot before dispatch
-    push qword [rr_content_ptr]
-    movzx rax, byte [proc_cur_slot]
-    push rax
-    call dispatch
-    pop rax
-    mov [proc_cur_slot], al
-    pop qword [rr_content_ptr]
+    ; Tokenize (splitting on "~" if present) and dispatch the segment.
+    ; process_segment itself saves/restores rr_content_ptr/proc_cur_slot
+    ; around every dispatch call it makes, since chain_is_rr is set.
+    call process_segment
 
 .rr_chain_skip:
     pop r13                   ; restore scan pointer (points to ;)
@@ -340,28 +296,7 @@ process_chain_rr:
     mov rdi, line_buf
     call str_copy             ; copy last segment to line_buf
 
-    mov rsi, line_buf
-    mov rdi, cmd_buf
-    call next_token
-    mov rdi, arg1_buf
-    call next_token
-    mov rdi, arg2_buf
-    call next_token
-    mov rdi, arg3_buf
-    call next_token
-    mov rdi, arg4_buf
-    call next_token
-
-    cmp byte [cmd_buf], 0
-    je .rr_chain_end
-
-    push qword [rr_content_ptr]
-    movzx rax, byte [proc_cur_slot]
-    push rax
-    call dispatch
-    pop rax
-    mov [proc_cur_slot], al
-    pop qword [rr_content_ptr]
+    call process_segment
 
 .rr_chain_end:
     pop r15
@@ -377,6 +312,235 @@ process_chain_rr:
     pop r13
     pop r12
     pop rbx
+    ret
+
+; ------------------------------------------------------------
+; process_segment: called with a single ;-delimited command segment
+; sitting null-terminated in line_buf (chain_is_rr says whether this
+; came from process_chain or process_chain_rr, which changes how
+; do_dispatch_call below wraps dispatch). Looks for a "~" outside
+; double quotes:
+;
+;   left ~ right
+;
+; If none is found, this is exactly the original behaviour: tokenize
+; line_buf and dispatch it.
+;
+; If one is found, "left" is run with its output captured instead of
+; printed (e.g. calc's printed result, a variable's show'd value, a
+; file's view'd content). "right" is then either:
+;   - "= name" or "=name"  -> the captured text is parsed as a decimal
+;     integer and stored into that variable (same rules as ordinary
+;     "name = value" assignment).
+;   - any other command    -> the captured text is appended to it as
+;     one extra quoted argument and the whole thing is dispatched, e.g.
+;     "calc 2+2 ~ show" becomes "show 4".
+;
+; Example: calc 1 + 1 * 5 ~ = a ; show a   -->  prints 6
+process_segment:
+    push rbx
+    push r12
+    push r14
+
+    ; --- scan line_buf for '~' outside double quotes ---
+    mov rsi, line_buf
+    xor r14, r14              ; r14b = quote state (0=outside, 1=inside)
+    xor r12, r12               ; r12 = pointer to '~' (0 = none found)
+.pseg_scan:
+    mov al, [rsi]
+    test al, al
+    jz .pseg_scan_done
+    cmp al, '"'
+    je .pseg_toggle
+    cmp al, '~'
+    je .pseg_found
+    inc rsi
+    jmp .pseg_scan
+.pseg_toggle:
+    xor r14b, 1
+    inc rsi
+    jmp .pseg_scan
+.pseg_found:
+    mov r12, rsi
+.pseg_scan_done:
+
+    test r12, r12
+    jz .pseg_plain
+
+    ; ---------- "~" pipe path ----------
+    ; copy the left half [line_buf .. r12) into pipe_left_buf
+    mov rsi, line_buf
+    mov rdi, pipe_left_buf
+.pseg_copyleft:
+    cmp rsi, r12
+    je .pseg_copyleft_done
+    mov al, [rsi]
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    jmp .pseg_copyleft
+.pseg_copyleft_done:
+    mov byte [rdi], 0
+
+    ; copy the right half (r12+1..end), skipping leading spaces, into
+    ; pipe_right_buf. Must happen before line_buf gets overwritten below.
+    lea rsi, [r12+1]
+.pseg_skipsp:
+    cmp byte [rsi], ' '
+    jne .pseg_right_start
+    inc rsi
+    jmp .pseg_skipsp
+.pseg_right_start:
+    mov rdi, pipe_right_buf
+    call str_copy
+
+    ; run the left side with its output captured instead of printed
+    mov rsi, pipe_left_buf
+    mov rdi, line_buf
+    call str_copy
+
+    mov byte [pipe_capture_buf], 0
+    mov qword [pipe_capture_len], 0
+    mov byte [pipe_capture_on], 1
+
+    mov rsi, line_buf
+    mov rdi, cmd_buf
+    call next_token
+    mov rdi, arg1_buf
+    call next_token
+    mov rdi, arg2_buf
+    call next_token
+    mov rdi, arg3_buf
+    call next_token
+    mov rdi, arg4_buf
+    call next_token
+
+    cmp byte [cmd_buf], 0
+    je .pseg_left_empty
+    call do_dispatch_call
+.pseg_left_empty:
+    mov byte [pipe_capture_on], 0
+
+    ; trim a single trailing newline left behind by the captured command
+    mov rax, [pipe_capture_len]
+    test rax, rax
+    jz .pseg_trim_done
+    lea rbx, [pipe_capture_buf + rax - 1]
+    cmp byte [rbx], 10
+    jne .pseg_trim_done
+    mov byte [rbx], 0
+.pseg_trim_done:
+
+    ; tokenize the right side to see if it's the "= name" shorthand
+    mov rsi, pipe_right_buf
+    mov rdi, cmd_buf
+    call next_token
+    mov rdi, arg1_buf
+    call next_token
+
+    cmp byte [cmd_buf], 0
+    je .pseg_done              ; nothing after the pipe - nothing to do
+
+    cmp byte [cmd_buf], '='
+    jne .pseg_generic
+
+    ; assignment shorthand: "= name" (name in arg1_buf) or "=name"
+    ; (name is cmd_buf+1)
+    lea rsi, [cmd_buf+1]
+    cmp byte [rsi], 0
+    jne .pseg_have_name
+    mov rsi, arg1_buf
+.pseg_have_name:
+    push rsi                   ; save name pointer across parse_int
+    mov rsi, pipe_capture_buf
+    call parse_int
+    pop rsi
+    cmp cl, 1
+    jne .pseg_bad_value
+    mov rbx, rax
+    call var_set
+    jmp .pseg_done
+
+.pseg_bad_value:
+    mov rsi, msg_bad_value
+    mov al, ATTR_ERROR
+    call print_string_attr
+    jmp .pseg_done
+
+.pseg_generic:
+    ; rebuild line_buf as: <right side> "<captured value>" and dispatch
+    mov rsi, pipe_right_buf
+    mov rdi, line_buf
+    call str_copy
+    mov rsi, pipe_space_quote_str
+    mov rdi, line_buf
+    call str_append
+    mov rsi, pipe_capture_buf
+    mov rdi, line_buf
+    call str_append
+    mov rsi, pipe_quote_str
+    mov rdi, line_buf
+    call str_append
+
+    mov rsi, line_buf
+    mov rdi, cmd_buf
+    call next_token
+    mov rdi, arg1_buf
+    call next_token
+    mov rdi, arg2_buf
+    call next_token
+    mov rdi, arg3_buf
+    call next_token
+    mov rdi, arg4_buf
+    call next_token
+
+    cmp byte [cmd_buf], 0
+    je .pseg_done
+    call do_dispatch_call
+    jmp .pseg_done
+
+.pseg_plain:
+    ; no "~" pipe: original behaviour - tokenize line_buf as-is, dispatch
+    mov rsi, line_buf
+    mov rdi, cmd_buf
+    call next_token
+    mov rdi, arg1_buf
+    call next_token
+    mov rdi, arg2_buf
+    call next_token
+    mov rdi, arg3_buf
+    call next_token
+    mov rdi, arg4_buf
+    call next_token
+
+    cmp byte [cmd_buf], 0
+    je .pseg_done
+    call do_dispatch_call
+
+.pseg_done:
+    pop r14
+    pop r12
+    pop rbx
+    ret
+
+; do_dispatch_call: calls dispatch on the tokenized cmd_buf/arg*_buf.
+; When chain_is_rr is set (we're running inside an rr script), wraps
+; the call exactly like process_chain_rr always did: dispatch may
+; recurse into cmd_rr, clobbering rr_content_ptr/proc_cur_slot, so
+; those are saved/restored around it.
+do_dispatch_call:
+    cmp byte [chain_is_rr], 0
+    je .ddc_plain
+    push qword [rr_content_ptr]
+    movzx rax, byte [proc_cur_slot]
+    push rax
+    call dispatch
+    pop rax
+    mov [proc_cur_slot], al
+    pop qword [rr_content_ptr]
+    ret
+.ddc_plain:
+    call dispatch
     ret
 
 ; ------------------------------------------------------------
@@ -1201,8 +1365,304 @@ cmd_clear:
     ret
 
 ; ------------------------------------------------------------
+; cmd_help: with no argument, prints the full command list as before.
+; With an argument ("help <command>"), prints just that command's
+; detailed help text instead (see help_lookup/help_* strings below).
 cmd_help:
+    cmp byte [arg1_buf], 0
+    jne help_lookup
     mov rsi, help_text
+    mov al, ATTR_NORMAL
+    call print_string_attr
+    ret
+
+; help_lookup: arg1_buf holds the command name (or symbol - ";", "~",
+; "$" need to be quoted on the command line, e.g. help ";", since
+; unquoted they'd be parsed as chaining/piping/comment syntax first).
+help_lookup:
+    mov rsi, arg1_buf
+    mov rdi, str_cf
+    call str_eq
+    cmp al, 1
+    je .h_cf
+
+    mov rsi, arg1_buf
+    mov rdi, str_mkf
+    call str_eq
+    cmp al, 1
+    je .h_mkf
+
+    mov rsi, arg1_buf
+    mov rdi, str_mkfl
+    call str_eq
+    cmp al, 1
+    je .h_mkfl
+
+    mov rsi, arg1_buf
+    mov rdi, str_show
+    call str_eq
+    cmp al, 1
+    je .h_show
+
+    mov rsi, arg1_buf
+    mov rdi, str_ls
+    call str_eq
+    cmp al, 1
+    je .h_ls
+
+    mov rsi, arg1_buf
+    mov rdi, str_cat
+    call str_eq
+    cmp al, 1
+    je .h_cat
+
+    mov rsi, arg1_buf
+    mov rdi, str_edit
+    call str_eq
+    cmp al, 1
+    je .h_edit
+
+    mov rsi, arg1_buf
+    mov rdi, str_del
+    call str_eq
+    cmp al, 1
+    je .h_del
+
+    mov rsi, arg1_buf
+    mov rdi, str_rname
+    call str_eq
+    cmp al, 1
+    je .h_rname
+
+    mov rsi, arg1_buf
+    mov rdi, str_cpy
+    call str_eq
+    cmp al, 1
+    je .h_cpy
+
+    mov rsi, arg1_buf
+    mov rdi, str_mov
+    call str_eq
+    cmp al, 1
+    je .h_mov
+
+    mov rsi, arg1_buf
+    mov rdi, str_eq_sign
+    call str_eq
+    cmp al, 1
+    je .h_assign
+
+    mov rsi, arg1_buf
+    mov rdi, str_rmv
+    call str_eq
+    cmp al, 1
+    je .h_rmv
+
+    mov rsi, arg1_buf
+    mov rdi, str_vars
+    call str_eq
+    cmp al, 1
+    je .h_vars
+
+    mov rsi, arg1_buf
+    mov rdi, str_calc
+    call str_eq
+    cmp al, 1
+    je .h_calc
+
+    mov rsi, arg1_buf
+    mov rdi, str_rr
+    call str_eq
+    cmp al, 1
+    je .h_rr
+
+    mov rsi, arg1_buf
+    mov rdi, str_prs
+    call str_eq
+    cmp al, 1
+    je .h_prs
+
+    mov rsi, arg1_buf
+    mov rdi, str_auth
+    call str_eq
+    cmp al, 1
+    je .h_auth
+
+    mov rsi, arg1_buf
+    mov rdi, str_pwd
+    call str_eq
+    cmp al, 1
+    je .h_pwd
+
+    mov rsi, arg1_buf
+    mov rdi, str_clear
+    call str_eq
+    cmp al, 1
+    je .h_clear
+
+    mov rsi, arg1_buf
+    mov rdi, str_help
+    call str_eq
+    cmp al, 1
+    je .h_help
+
+    mov rsi, arg1_buf
+    mov rdi, str_dscan
+    call str_eq
+    cmp al, 1
+    je .h_dscan
+
+    mov rsi, arg1_buf
+    mov rdi, str_format
+    call str_eq
+    cmp al, 1
+    je .h_fmt
+
+    mov rsi, arg1_buf
+    mov rdi, str_mount
+    call str_eq
+    cmp al, 1
+    je .h_mount
+
+    mov rsi, arg1_buf
+    mov rdi, str_sync
+    call str_eq
+    cmp al, 1
+    je .h_sync
+
+    mov rsi, arg1_buf
+    mov rdi, str_reboot
+    call str_eq
+    cmp al, 1
+    je .h_rboot
+
+    mov rsi, arg1_buf
+    mov rdi, str_sdown
+    call str_eq
+    cmp al, 1
+    je .h_sdown
+
+    mov rsi, arg1_buf
+    mov rdi, str_semicolon
+    call str_eq
+    cmp al, 1
+    je .h_semicolon
+
+    mov rsi, arg1_buf
+    mov rdi, str_tilde
+    call str_eq
+    cmp al, 1
+    je .h_tilde
+
+    mov rsi, arg1_buf
+    mov rdi, str_dollar
+    call str_eq
+    cmp al, 1
+    je .h_dollar
+
+    ; unknown command name
+    mov rsi, msg_help_unknown1
+    mov al, ATTR_ERROR
+    call print_string_attr
+    mov rsi, arg1_buf
+    mov al, ATTR_ERROR
+    call print_string_attr
+    mov rsi, msg_help_unknown2
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+
+.h_cf:
+    mov rsi, help_cf
+    jmp .h_print
+.h_mkf:
+    mov rsi, help_mkf
+    jmp .h_print
+.h_mkfl:
+    mov rsi, help_mkfl
+    jmp .h_print
+.h_show:
+    mov rsi, help_show
+    jmp .h_print
+.h_ls:
+    mov rsi, help_ls
+    jmp .h_print
+.h_cat:
+    mov rsi, help_cat
+    jmp .h_print
+.h_edit:
+    mov rsi, help_edit
+    jmp .h_print
+.h_del:
+    mov rsi, help_del
+    jmp .h_print
+.h_rname:
+    mov rsi, help_rname
+    jmp .h_print
+.h_cpy:
+    mov rsi, help_cpy
+    jmp .h_print
+.h_mov:
+    mov rsi, help_mov
+    jmp .h_print
+.h_assign:
+    mov rsi, help_assign
+    jmp .h_print
+.h_rmv:
+    mov rsi, help_rmv
+    jmp .h_print
+.h_vars:
+    mov rsi, help_vars
+    jmp .h_print
+.h_calc:
+    mov rsi, help_calc
+    jmp .h_print
+.h_rr:
+    mov rsi, help_rr
+    jmp .h_print
+.h_prs:
+    mov rsi, help_prs
+    jmp .h_print
+.h_auth:
+    mov rsi, help_auth
+    jmp .h_print
+.h_pwd:
+    mov rsi, help_pwd
+    jmp .h_print
+.h_clear:
+    mov rsi, help_clear
+    jmp .h_print
+.h_help:
+    mov rsi, help_help
+    jmp .h_print
+.h_dscan:
+    mov rsi, help_dscan
+    jmp .h_print
+.h_fmt:
+    mov rsi, help_fmt
+    jmp .h_print
+.h_mount:
+    mov rsi, help_mount
+    jmp .h_print
+.h_sync:
+    mov rsi, help_sync
+    jmp .h_print
+.h_rboot:
+    mov rsi, help_rboot
+    jmp .h_print
+.h_sdown:
+    mov rsi, help_sdown
+    jmp .h_print
+.h_semicolon:
+    mov rsi, help_semicolon
+    jmp .h_print
+.h_tilde:
+    mov rsi, help_tilde
+    jmp .h_print
+.h_dollar:
+    mov rsi, help_dollar
+
+.h_print:
     mov al, ATTR_NORMAL
     call print_string_attr
     ret
@@ -4510,6 +4970,31 @@ str_copy:
     pop rax
     ret
 
+; str_append: appends null-terminated string rsi onto the end of the
+; null-terminated buffer starting at rdi (rdi = start of the buffer,
+; not its current end - this walks to the end itself).
+str_append:
+    push rax
+    push rsi
+    push rdi
+.sa_find_end:
+    cmp byte [rdi], 0
+    je .sa_end_found
+    inc rdi
+    jmp .sa_find_end
+.sa_end_found:
+.sa_copy:
+    mov al, [rsi]
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    cmp al, 0
+    jne .sa_copy
+    pop rdi
+    pop rsi
+    pop rax
+    ret
+
 ; str_eq: rsi, rdi null-terminated strings. returns al=1 if equal else 0
 str_eq:
     push rsi
@@ -4620,6 +5105,9 @@ print_string_attr:
 
 ; putchar: al = char to print, uses attribute in bl if caller set it via
 ; print_string_attr; falls back to ATTR_NORMAL when called directly.
+; When pipe_capture_on is set (a "~" pipe is capturing a command's
+; output - see process_segment), characters are appended to
+; pipe_capture_buf instead of touching the screen/cursor at all.
 putchar:
     push rax
     push rbx
@@ -4627,6 +5115,27 @@ putchar:
     push rdx
     push rdi
 
+    cmp byte [pipe_capture_on], 0
+    je .not_capturing
+    cmp al, 0x0D
+    je .cap_done              ; ignore carriage returns
+    mov rcx, [pipe_capture_len]
+    cmp rcx, PIPE_CAP_MAX-1
+    jae .cap_done              ; capture buffer full - silently truncate
+    lea rdi, [pipe_capture_buf]
+    add rdi, rcx
+    mov [rdi], al
+    inc rcx
+    mov [pipe_capture_len], rcx
+    mov byte [pipe_capture_buf + rcx], 0
+.cap_done:
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+.not_capturing:
     cmp al, 0x0A
     je .newline
     cmp al, 0x0D
@@ -5269,6 +5778,9 @@ str_info:   db "-info", 0
 str_dscan:  db "dscan", 0
 str_format: db "fmt", 0
 str_mount:  db "mount", 0
+str_semicolon: db ";", 0
+str_tilde:     db "~", 0
+str_dollar:    db "$", 0
 
 tag_folder: db "/", 10, 0
 tag_file:   db "", 10, 0
@@ -5388,7 +5900,166 @@ help_text:
     db "  rboot              save to disk, then restart (requires auth)", 10
     db "  sdown              shut down (requires auth)", 10
     db "  ;                  chain commands, e.g. show hi ; show bye", 10
-    db "  $                  comment line (lines starting with $ are skipped)", 10, 10, 0
+    db "  ~                  pipe output, e.g. calc 1+2*3 ~ = a ; show a", 10
+    db "  $                  comment line (lines starting with $ are skipped)", 10
+    db "  help <command>     show detailed help for one command", 10, 10, 0
+
+; --- per-command detail text for "help <command>" (see help_lookup) ---
+msg_help_unknown1: db "help: unknown command '", 0
+msg_help_unknown2: db "'", 10, 0
+
+help_cf:
+    db "cf <path>", 10
+    db "  Change the current folder.", 10
+    db "  e.g. cf docs        (descend into 'docs' here)", 10
+    db "       cf ..          (go up one level)", 10
+    db "       cf /home       (jump to the root)", 10, 0
+
+help_mkf:
+    db "mkf <path>", 10
+    db "  Make a new folder in the current directory (or at a path).", 10
+    db "  e.g. mkf docs", 10, 0
+
+help_mkfl:
+    db 'mkfl <path> "text" [-force] [-silent] [-info]', 10
+    db "  Make a file here with the given text content.", 10
+    db "  -force overwrites an existing file (prints a warning).", 10
+    db "  -silent suppresses that overwrite warning.", 10
+    db "  -info prints the filename and content length.", 10
+    db '  e.g. mkfl hi.txt "hello" -force -silent', 10, 0
+
+help_show:
+    db 'show "text" | show <name>', 10
+    db "  Print a literal message, or print a variable's current value.", 10
+    db '  e.g. show "hello world"      show a', 10, 0
+
+help_ls:
+    db "list", 10
+    db "  List the contents of the current folder.", 10, 0
+
+help_cat:
+    db "view <path>", 10
+    db "  Print a file's content.", 10, 0
+
+help_edit:
+    db "edit <path>", 10
+    db "  Open the built-in line editor on a file's content.", 10
+    db "  Esc ends editing, then y/n saves or discards the change.", 10, 0
+
+help_del:
+    db "del <path>", 10
+    db "  Delete a file in the current folder. Requires auth:", 10
+    db "  auth del <path>", 10, 0
+
+help_rname:
+    db "rname <path> <new>", 10
+    db "  Rename a file or folder. The new name stays in the same", 10
+    db "  folder as the original.", 10, 0
+
+help_cpy:
+    db "cpy <src> <dest>", 10
+    db "  Copy a file or folder here (recursive for folders).", 10, 0
+
+help_mov:
+    db "mov <src> <dest>", 10
+    db "  Move/rename a file or folder here (recursive for folders).", 10, 0
+
+help_assign:
+    db "<name> = <value>", 10
+    db "  Set a variable to a literal integer or another variable's", 10
+    db "  value.  e.g. a = 5", 10, 0
+
+help_rmv:
+    db "rmv <name>", 10
+    db "  Remove a variable.", 10, 0
+
+help_vars:
+    db "vars | vars rmv all", 10
+    db "  List all variables, or clear all of them. Clearing requires", 10
+    db "  auth: auth vars rmv all", 10, 0
+
+help_calc:
+    db "calc <expr>", 10
+    db "  Evaluate a math expression (+ - * /), left-to-right with", 10
+    db "  normal operator precedence.  e.g. calc 1 + 2 * 3", 10, 0
+
+help_rr:
+    db "rr <script.rsh>", 10
+    db "  Run a rush script file line by line. Lines starting with $", 10
+    db "  are comments, skipped just like at the interactive prompt.", 10
+    db "  Esc interrupts a running script. ; chaining works inside", 10
+    db "  script lines too.", 10, 0
+
+help_prs:
+    db "prs | prs kill <id> | prs kill <name>", 10
+    db "  List currently running rr scripts, or kill one by its PID", 10
+    db "  or by name.  e.g. prs kill 1        prs kill rushrun", 10, 0
+
+help_auth:
+    db "auth <command> [args]", 10
+    db "  Elevate privileges for the one command that immediately", 10
+    db "  follows (like sudo). Required for: sdown, rboot, del,", 10
+    db "  and vars rmv all.  e.g. auth sdown", 10, 0
+
+help_pwd:
+    db "current", 10
+    db "  Print the current folder's path.", 10, 0
+
+help_clear:
+    db "wipe", 10
+    db "  Clear the screen.", 10, 0
+
+help_help:
+    db "help | help <command>", 10
+    db "  List every command, or show detailed help for just one.", 10
+    db "  e.g. help calc", 10, 0
+
+help_dscan:
+    db "dscan", 10
+    db "  Scan all four ATA drive slots for SFFS volumes and report", 10
+    db "  which ones are formatted.", 10, 0
+
+help_fmt:
+    db "fmt <label> [-force]", 10
+    db "  Format the first unformatted drive with an SFFS label.", 10
+    db "  -force lets you reuse an already-formatted, non-boot drive.", 10, 0
+
+help_mount:
+    db "mount <label>", 10
+    db "  Mount a formatted drive's volume under /<label>/, next to", 10
+    db "  /home. Up to 2 drives can be mounted at once.", 10, 0
+
+help_sync:
+    db "sync", 10
+    db "  Save the filesystem (and any mounted volumes) to disk.", 10, 0
+
+help_rboot:
+    db "rboot", 10
+    db "  Save to disk, then restart. Requires auth: auth rboot", 10, 0
+
+help_sdown:
+    db "sdown", 10
+    db "  Save to disk, then shut down. Requires auth: auth sdown", 10, 0
+
+help_semicolon:
+    db "; (command chaining)", 10
+    db "  Run multiple commands on one line, e.g. show hi ; show bye.", 10
+    db "  A ; inside double quotes is literal, not a separator - this", 10
+    db "  works inside rr scripts too.", 10, 0
+
+help_tilde:
+    db "~ (pipe)", 10
+    db "  Pipe one command's output into another.", 10
+    db "  calc 1+2*3 ~ = a     stores the result in the variable a", 10
+    db "  calc 3 * 3 ~ show    pipes the result into show, prints 9", 10
+    db "  The right side is '= name' (assign) or any other command,", 10
+    db "  which gets the captured text appended as a quoted argument.", 10, 0
+
+help_dollar:
+    db "$ (comment)", 10
+    db "  A line whose first character is $ is skipped, both at the", 10
+    db "  interactive prompt and when running an rr script.", 10, 0
+
 
 ; --- scancode set 1 -> ascii tables (index = scancode, 0..0x39) ---
 ALIGN 8
@@ -5461,6 +6132,17 @@ arg1_buf: times 96  db 0
 arg2_buf: times 160 db 0
 arg3_buf: times 32  db 0             ; for flags (-force, -silent, -info)
 arg4_buf: times 32  db 0             ; for additional flags
+
+; --- "~" pipe scratch (see process_segment) ---
+chain_is_rr:       db 0             ; 0 = process_chain, 1 = process_chain_rr
+pipe_left_buf:     times LINE_MAX db 0
+pipe_right_buf:    times LINE_MAX db 0
+pipe_capture_on:   db 0
+ALIGN 8
+pipe_capture_len:  dq 0
+pipe_capture_buf:  times PIPE_CAP_MAX db 0
+pipe_quote_str:       db '"', 0
+pipe_space_quote_str: db ' ', '"', 0
 
 ; --- variables table (used by assignment, show, and calc) ---
 ALIGN 8
