@@ -89,6 +89,41 @@ This also works inside `rr` script files, so a single `.rsh` line can run
 multiple commands in sequence. Press Esc to interrupt a running script at any
 point — including between `;`-chained segments on the same line.
 
+### Piping output with `~`
+
+You can pipe the output of one command into another with `~`:
+
+```
+rush>/home: calc 1 + 1 * 5 ~ = a ; show a
+6
+```
+
+The left side of `~` runs normally except its output is captured instead of
+being printed. What happens with that captured text depends on the right
+side:
+
+- **`= <name>`** (or `=<name>` with no space) parses the captured text as a
+  decimal integer and stores it in that variable, just like a normal
+  `<name> = <value>` assignment:
+  ```
+  rush>/home: calc 10 - 3 ~ = b
+  rush>/home: show b
+  7
+  ```
+- **Any other command** gets the captured text appended as one extra quoted
+  argument and is then run as-is:
+  ```
+  rush>/home: calc 3 * 3 ~ show
+  9
+  rush>/home: view notes.txt ~ mkfl copy.txt
+  ```
+  (the second example pipes a file's content into a new file, using `view`'s
+  output as `mkfl`'s content argument)
+
+Like `;`, a `~` inside double quotes is treated literally, not as a pipe, and
+this works inside `rr` scripts too. Only one `~` per chained segment is
+supported (i.e. `a ~ b ~ c` is not).
+
 ### Comments with `$`
 
 Any line whose first character is `$` is treated as a comment and skipped by
@@ -256,6 +291,13 @@ message and then nothing, which is your cue to power off manually.
 - `cpy`/`mov` only operate within the current folder (no path arguments like
   `../docs`), matching how `cf`/`mkf`/etc. already work one directory at a
   time.
+- `~` piping captures a command's printed output into a fixed-size buffer
+  (192 bytes) and, for the generic (non-`= name`) case, rebuilds the right
+  side's command line by wrapping that captured text in double quotes before
+  re-parsing it — a captured value that itself contains a `"` will break
+  that reconstruction, and very long captured output (e.g. piping `list` on
+  a folder with many files) is silently truncated rather than growing the
+  buffer.
 - Persistence is whole-table snapshotting (like a save file), not an
   incremental/journaled on-disk format — simple and robust for this scale,
   but a `sync` rewrites the whole reserved region every time.
@@ -279,6 +321,10 @@ message and then nothing, which is your cue to power off manually.
 
 ## What's new
 
+- **`~` pipes** — pipe one command's output into another:
+  `calc 1 + 1 * 5 ~ = a` stores calc's result in the variable `a`;
+  `calc 3 * 3 ~ show` pipes the result into `show`. See "Piping output with
+  `~`" above.
 - **Command history (Up/Down)** and **scrollback (Ctrl+Up/Ctrl+Down)** — see
   "Line editing: history and scrollback" above.
 - **`;` command chaining** — run multiple commands on one line:
