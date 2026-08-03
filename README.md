@@ -49,9 +49,10 @@ no C, no BIOS libraries beyond boot-time disk/keyboard calls, no existing kernel
 | `current` | `current` | print current path |
 | `wipe` | `wipe` | clear the screen |
 | `help` | `help` | list commands |
-| `dscan` | `dscan` | scan all ATA drives for SFFS volumes |
+| `dscan` | `dscan` | scan all ATA and AHCI drives for SFFS volumes |
 | `fmt` | `fmt data` | format the first unformatted drive with an SFFS label (`-force` to reuse one) |
 | `mount` | `mount data` | mount a formatted drive's volume under `/<label>/` |
+| `label` | `label old new` | rename a formatted drive's label in place, without touching its files |
 | `sync` | `sync` | save the filesystem (and mounted volumes) to disk |
 | `rboot` | `rboot` | save to disk, then restart (requires auth) |
 | `sdown` | `sdown` | save to disk, then shut down (requires auth) |
@@ -279,7 +280,12 @@ menu with legacy/CSM mode enabled.
 The filesystem survives reboots. There's a hand-written ATA PIO driver
 (primary/secondary buses, both master/slave, LBA28, polling BSY/DRQ — no
 IRQs, matching the polled keyboard driver's style) that reads and writes raw
-sectors.
+sectors, plus a hand-written AHCI driver (PCI class-code scan for the
+controller, MMIO register access, up to `AHCI_MAX_PORTS` (4) ports polled to
+completion per command, no interrupts here either) for real SATA controllers
+that don't expose legacy IDE at all. `dscan`/`fmt`/`mount`/`sync` treat both
+transports as one unified list of device slots — ids `0..3` are the legacy
+ATA slots, ids `4..4+AHCI_MAX_PORTS-1` are AHCI ports discovered at boot.
 
 ### SFFS v2 on-disk format
 
@@ -296,13 +302,18 @@ clear of the boot sector and the kernel's own sectors (1..199):
 ### One boot drive, up to two mounted drives
 
 - The boot drive's volume is the OS filesystem (rooted at `/home`).
-- `dscan` probes all 4 ATA slots (primary/secondary × master/slave) and
-  reports which contain SFFS volumes.
+- `dscan` probes all legacy ATA slots (primary/secondary × master/slave) and
+  every AHCI port found on the controller, and reports which contain SFFS
+  volumes.
 - `fmt <label>` formats the first *unformatted* drive present (the boot
   drive is skipped unless you pass `-force`).
 - `mount <label>` finds the drive whose label matches, loads it into memory
   under `/<label>/` next to `/home`, and you can `cf /<label>` into it like
   any folder.
+- `label <old> <new>` renames a drive's label in place by rewriting just its
+  superblock — the drive's files are left untouched. Refuses if `<new>` is
+  already used by another drive. If that drive happens to be mounted at the
+  time, the live mount name updates immediately too.
 - `sync`, `rboot`, and `sdown` write the boot volume *and* every mounted
   volume back to their own drives.
 

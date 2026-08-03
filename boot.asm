@@ -24,7 +24,8 @@ jmp start
 
 KERNEL_LOAD_SEG   equ 0x0000
 KERNEL_LOAD_OFF   equ 0x8000
-KERNEL_SECTORS    equ 190         ; how many 512B sectors to load (95KB). Bumped from 160
+KERNEL_SECTORS    equ 260         ; how many 512B sectors to load (130KB). Bumped from
+                                  ; 190 to make room for the AHCI/PCI driver in kernel.asm
                                    ; when the scrollback-view and command-history buffers
                                    ; were added (kernel.bin now needs ~171 sectors, so this
                                    ; leaves some headroom). Must be <= 255 (CHS fallback

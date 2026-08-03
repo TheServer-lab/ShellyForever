@@ -18,6 +18,14 @@ ATTR_ERROR      equ 0x0C          ; red
 
 OS_NODES        equ 64              ; nodes per volume (each drive holds its own 64-node table)
 MAX_MOUNTS      equ 2               ; how many extra drives can be mounted at once
+
+; AHCI (SATA) support: device ids 0-3 are still the legacy ATA PIO slots
+; (primary/secondary x master/slave); ids 4..4+AHCI_MAX_PORTS-1 are AHCI
+; ports discovered at boot (see ahci_init). dscan/fmt/mount all iterate
+; 0..TOTAL_DEVICES-1 and go through disk_select_device, which routes each
+; id to the right driver - see that routine for the full explanation.
+AHCI_MAX_PORTS  equ 4
+TOTAL_DEVICES   equ 4 + AHCI_MAX_PORTS
 VOL_NODES       equ OS_NODES        ; every volume, OS or mounted, is the same size
 MAX_NODES       equ OS_NODES * (1 + MAX_MOUNTS)   ; 192 = OS volume + 2 mounts
 NAME_LEN        equ 32
@@ -50,10 +58,10 @@ PIPE_CAP_MAX    equ 192       ; max bytes captured from a "~" pipe's left side
 ;  dscan probes all four ATA device slots for the magic, format writes
 ;  a fresh empty volume + label, and mount loads a volume's node table
 ;  into memory (remapping its parent indices) rooted at /<label>/.
-;  The kernel occupies LBA 1..160 (KERNEL_SECTORS in boot.asm), so the
-;  filesystem region at LBA 200 is well clear of it.
+;  The kernel occupies LBA 1..260 (KERNEL_SECTORS in boot.asm), so the
+;  filesystem region at LBA 300 is well clear of it.
 ; ------------------------------------------------------------------
-FS_LBA_START    equ 200
+FS_LBA_START    equ 300
 SFFS_VERSION    equ 2
 SUPER_LABEL_OFF equ 8               ; label lives at superblock offset 8..39
 SUPER_LBA       equ FS_LBA_START
@@ -69,12 +77,34 @@ kernel_entry:
     cli
     mov rsp, 0x9F000
 
+    ; --- TEMPORARY diagnostic checkpoint A: proves boot.asm's real-mode ->
+    ; protected-mode -> long-mode transition landed here at all, before
+    ; expand_identity_map or ahci_init get a chance to run/crash. If you
+    ; only ever see "12" and never "A", the failure is inside boot.asm's
+    ; mode-switch code (A20/GDT/paging/long-mode jump), not in the kernel.
+    mov rdi, 0xB8000 + (24*80 + 6) * 2
+    mov byte [rdi], 'A'
+    mov byte [rdi+1], 0x1F
+
     ; boot.asm only had room (512-byte sector) to identity-map the first
     ; 64MB. That's not enough for acpi_shutdown's ACPI table walk later -
     ; firmware can put the FADT/DSDT well above 64MB (e.g. ~127MB on a
     ; 128MB guest) - so extend the map to 4GB right away, before anything
     ; else runs. See expand_identity_map below for details.
     call expand_identity_map
+
+    ; --- TEMPORARY diagnostic checkpoint X: expand_identity_map returned
+    ; without crashing/hanging. If "A" shows but "X" doesn't, the 4GB
+    ; identity-map rebuild is where things go wrong on this hardware.
+    mov rdi, 0xB8000 + (24*80 + 7) * 2
+    mov byte [rdi], 'X'
+    mov byte [rdi+1], 0x1F
+
+    ; probe for a PCI AHCI (SATA) controller and bring up its ports, if any,
+    ; as extra disk device slots (4..4+AHCI_MAX_PORTS-1) alongside the four
+    ; legacy ATA slots. Inert/no-op if there isn't one (ahci_port_count stays
+    ; 0) - the OS behaves exactly as it always did in that case.
+    call ahci_init
 
     ; checkpoint 9: kernel code is executing (proves boot.asm's jump into
     ; 0x8000 landed correctly). Matches the DBG16/32/64 checkpoints in
@@ -766,6 +796,12 @@ dispatch:
     call str_eq
     cmp al, 1
     je cmd_mount
+
+    mov rsi, cmd_buf
+    mov rdi, str_label
+    call str_eq
+    cmp al, 1
+    je cmd_label
 
     ; unknown command
     mov rsi, msg_unknown1
@@ -1525,6 +1561,12 @@ help_lookup:
     je .h_mount
 
     mov rsi, arg1_buf
+    mov rdi, str_label
+    call str_eq
+    cmp al, 1
+    je .h_label
+
+    mov rsi, arg1_buf
     mov rdi, str_sync
     call str_eq
     cmp al, 1
@@ -1644,6 +1686,9 @@ help_lookup:
 .h_mount:
     mov rsi, help_mount
     jmp .h_print
+.h_label:
+    mov rsi, help_label
+    jmp .h_print
 .h_sync:
     mov rsi, help_sync
     jmp .h_print
@@ -1693,13 +1738,13 @@ cmd_dscan:
     xor r15, r15                ; found-any flag
     xor r13, r13                ; device id
 .scan:
-    cmp r13, 4
+    cmp r13, TOTAL_DEVICES
     jae .done
     mov al, r13b
-    call ata_select_device
+    call disk_select_device
     mov rax, SUPER_LBA
     lea rdi, [fs_super_buf]
-    call ata_read_sector
+    call disk_read_sector
     jc .next                    ; no response -> slot is empty
     ; present; check for the SFFS magic + version
     cmp byte [fs_super_buf+0], 'S'
@@ -1768,11 +1813,16 @@ cmd_dscan:
     pop r13
     ret
 
-; print_device_name: al = device id 0..3 -> prints "primary master" etc.
+; print_device_name: al = device id 0..TOTAL_DEVICES-1 -> prints "primary
+; master" etc. for ids 0-3 (legacy ATA), or "ahci port <n>" (n = the real
+; physical AHCI port number, from ahci_port_num) for ids 4+.
 print_device_name:
+    push rax
     push rbx
     push rsi
     mov bl, al
+    cmp bl, 4
+    jae .ahci
     and bl, 3
     cmp bl, 2
     jb .primary
@@ -1790,9 +1840,21 @@ print_device_name:
 .master:
     mov rsi, msg_dev_master
     call print_string
+    jmp .done
+.ahci:
+    mov rsi, msg_dev_ahci
+    call print_string
+    sub bl, 4
+    movzx eax, bl
+    mov eax, [ahci_port_num + rax*4]
+    lea rdi, [dev_name_num_buf]
+    call int_to_str
+    mov rsi, dev_name_num_buf
+    call print_string
 .done:
     pop rsi
     pop rbx
+    pop rax
     ret
 
 ; ------------------------------------------------------------
@@ -1817,13 +1879,13 @@ cmd_format:
     xor rbx, rbx                ; last valid SFFS device seen (for -force)
     mov r14b, 0                 ; any valid SFFS device seen?
 .scan:
-    cmp r13, 4
+    cmp r13, TOTAL_DEVICES
     jae .scan_done
     mov al, r13b
-    call ata_select_device
+    call disk_select_device
     mov rax, SUPER_LBA
     lea rdi, [fs_super_buf]
-    call ata_read_sector
+    call disk_read_sector
     jc .next                    ; absent
     cmp byte [fs_super_buf+0], 'S'
     jne .unformatted
@@ -1871,7 +1933,7 @@ cmd_format:
     ; format the first unformatted drive we hit
 .format_target:
     mov al, r13b
-    call ata_select_device
+    call disk_select_device
     ; superblock: magic + version + label
     mov rdi, fs_super_buf
     mov rcx, 512 / 8
@@ -1887,7 +1949,7 @@ cmd_format:
     call str_copy
     mov rax, SUPER_LBA
     lea rsi, [fs_super_buf]
-    call ata_write_sector
+    call disk_write_sector
     jc .disk_err
     ; node_type: a single root folder
     mov rdi, fs_super_buf
@@ -1897,7 +1959,7 @@ cmd_format:
     mov byte [fs_super_buf], 1
     mov rax, TYPE_LBA
     lea rsi, [fs_super_buf]
-    call ata_write_sector
+    call disk_write_sector
     jc .disk_err
     ; node_parent: root parent = 0xFFFF
     mov rdi, fs_super_buf
@@ -1907,7 +1969,7 @@ cmd_format:
     mov word [fs_super_buf], 0xFFFF
     mov rax, PARENT_LBA
     lea rsi, [fs_super_buf]
-    call ata_write_sector
+    call disk_write_sector
     jc .disk_err
     ; node_name: root named <label>, then zero sectors
     mov rdi, fs_super_buf
@@ -1923,7 +1985,7 @@ cmd_format:
     push rax
     push rcx
     lea rsi, [fs_super_buf]
-    call ata_write_sector
+    call disk_write_sector
     pop rcx
     pop rax
     jc .disk_err
@@ -1940,7 +2002,7 @@ cmd_format:
     push rax
     push rcx
     lea rsi, [fs_super_buf]
-    call ata_write_sector
+    call disk_write_sector
     pop rcx
     pop rax
     jc .disk_err
@@ -2002,13 +2064,13 @@ cmd_mount:
     ; find a device whose label matches
     xor r13, r13
 .scan:
-    cmp r13, 4
+    cmp r13, TOTAL_DEVICES
     jae .not_found
     mov al, r13b
-    call ata_select_device
+    call disk_select_device
     mov rax, SUPER_LBA
     lea rdi, [fs_super_buf]
-    call ata_read_sector
+    call disk_read_sector
     jc .scan_next
     cmp byte [fs_super_buf+0], 'S'
     jne .scan_next
@@ -2108,6 +2170,180 @@ cmd_mount:
     ret
 .load_fail:
     mov rsi, msg_mount_fail
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+
+; ------------------------------------------------------------
+; cmd_label: rename a formatted drive's label in place.
+;   label <old> <new>
+; Finds the device whose on-disk superblock label is <old> and
+; overwrites just the label field with <new> - the volume's node table
+; (files/folders) is never touched, so this is safe even on a drive
+; that already has data on it. Refuses if <new> is already in use by
+; a different drive. If the target drive happens to be currently
+; mounted, the in-memory mount_label and the mount's root folder name
+; are updated too, so the change is visible immediately.
+cmd_label:
+    cmp byte [arg1_buf], 0
+    jne .have_old
+    mov rsi, msg_label_usage
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+.have_old:
+    cmp byte [arg2_buf], 0
+    jne .have_new
+    mov rsi, msg_label_usage
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+.have_new:
+    mov rsi, arg2_buf
+    call str_len
+    cmp rax, NAME_LEN
+    jae .too_long
+    ; refuse if <new> is already used by some other drive
+    xor r13, r13
+.dup_scan:
+    cmp r13, TOTAL_DEVICES
+    jae .dup_done
+    mov al, r13b
+    call disk_select_device
+    mov rax, SUPER_LBA
+    lea rdi, [fs_super_buf]
+    call disk_read_sector
+    jc .dup_next
+    cmp byte [fs_super_buf+0], 'S'
+    jne .dup_next
+    cmp byte [fs_super_buf+1], 'F'
+    jne .dup_next
+    cmp byte [fs_super_buf+2], 'F'
+    jne .dup_next
+    cmp byte [fs_super_buf+3], 'S'
+    jne .dup_next
+    cmp byte [fs_super_buf+4], SFFS_VERSION
+    jne .dup_next
+    lea rsi, [fs_super_buf + SUPER_LABEL_OFF]
+    mov rdi, arg2_buf
+    call str_eq
+    cmp al, 1
+    je .in_use
+.dup_next:
+    inc r13
+    jmp .dup_scan
+.dup_done:
+    ; find the target device whose label matches <old>
+    xor r13, r13
+.scan:
+    cmp r13, TOTAL_DEVICES
+    jae .not_found
+    mov al, r13b
+    call disk_select_device
+    mov rax, SUPER_LBA
+    lea rdi, [fs_super_buf]
+    call disk_read_sector
+    jc .scan_next
+    cmp byte [fs_super_buf+0], 'S'
+    jne .scan_next
+    cmp byte [fs_super_buf+1], 'F'
+    jne .scan_next
+    cmp byte [fs_super_buf+2], 'F'
+    jne .scan_next
+    cmp byte [fs_super_buf+3], 'S'
+    jne .scan_next
+    cmp byte [fs_super_buf+4], SFFS_VERSION
+    jne .scan_next
+    lea rsi, [fs_super_buf + SUPER_LABEL_OFF]
+    mov rdi, arg1_buf
+    call str_eq
+    cmp al, 1
+    je .found
+.scan_next:
+    inc r13
+    jmp .scan
+.found:
+    ; fs_super_buf still holds this device's just-read superblock;
+    ; overwrite only the label field, leave everything else as-is
+    mov rdi, fs_super_buf
+    add rdi, SUPER_LABEL_OFF
+    mov rcx, NAME_LEN
+    xor al, al
+    rep stosb
+    mov rsi, arg2_buf
+    mov rdi, fs_super_buf
+    add rdi, SUPER_LABEL_OFF
+    call str_copy
+    ; the device is still selected from the scan above - write the
+    ; patched superblock straight back (node table sectors are untouched)
+    mov rax, SUPER_LBA
+    lea rsi, [fs_super_buf]
+    call disk_write_sector
+    jc .io_fail
+    ; if this device is currently mounted, keep live state in sync too
+    xor r12, r12
+.mount_check:
+    cmp r12, MAX_MOUNTS
+    jae .report
+    cmp byte [mount_used + r12], 0
+    je .mount_next
+    movzx eax, byte [mount_device + r12]
+    cmp eax, r13d
+    jne .mount_next
+    mov rax, r12
+    imul rax, 32
+    lea rdi, [mount_label + rax]
+    mov rsi, arg2_buf
+    call str_copy
+    mov rdi, r12
+    inc rdi
+    imul rdi, VOL_NODES
+    imul rdi, NAME_LEN
+    lea rdi, [node_name + rdi]
+    mov rsi, arg2_buf
+    call str_copy
+    jmp .report
+.mount_next:
+    inc r12
+    jmp .mount_check
+.report:
+    mov rsi, msg_label_ok1      ; "Relabeled '"
+    mov al, ATTR_NORMAL
+    call print_string_attr
+    mov rsi, arg1_buf
+    call print_string
+    mov rsi, msg_label_ok2      ; "' to '"
+    call print_string
+    mov rsi, arg2_buf
+    call print_string
+    mov rsi, msg_label_ok3      ; "'."
+    call print_string
+    ret
+.in_use:
+    mov rsi, msg_label_inuse1
+    mov al, ATTR_ERROR
+    call print_string_attr
+    mov rsi, arg2_buf
+    call print_string
+    mov rsi, msg_label_inuse2
+    call print_string
+    ret
+.not_found:
+    mov rsi, msg_label_none1
+    mov al, ATTR_ERROR
+    call print_string_attr
+    mov rsi, arg1_buf
+    call print_string
+    mov rsi, msg_label_none2
+    call print_string
+    ret
+.io_fail:
+    mov rsi, msg_label_iofail
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+.too_long:
+    mov rsi, msg_label_long
     mov al, ATTR_ERROR
     call print_string_attr
     ret
@@ -3492,9 +3728,22 @@ fs_create_node:
     call str_len
     cmp rax, NAME_LEN
     jae .name_too_long
-    xor r9, r9
+    ; Nodes are partitioned into fixed VOL_NODES-sized slices, one per
+    ; volume (OS volume first, then each mount slot). Search only within
+    ; the parent's own slice - never across into another volume's range,
+    ; or a node created here could get an index outside the volume it
+    ; actually belongs to, and that volume's vol_write would never
+    ; include it (silently losing it on the next sync/reboot).
+    mov rax, r8
+    xor rdx, rdx
+    mov rcx, VOL_NODES
+    div rcx                     ; rax = volume index = parent_idx / VOL_NODES
+    imul rax, VOL_NODES         ; rax = first node index of that volume
+    mov r9, rax
+    mov rbx, r9
+    add rbx, VOL_NODES          ; rbx = one-past-last node index of that volume
 .loop:
-    cmp r9, MAX_NODES
+    cmp r9, rbx
     jae .full
     cmp byte [node_type + r9], 0
     je .free
@@ -4030,6 +4279,556 @@ ata_write_sector:
     ret
 
 ; ------------------------------------------------------------------
+;  disk_*: dispatcher in front of the two disk drivers below (legacy ATA
+;  PIO above, AHCI further down). Every caller in this file - vol_read,
+;  vol_write, dscan, fmt, mount - goes through these three routines with
+;  al = device id, exactly like it always called ata_select_device /
+;  ata_read_sector / ata_write_sector directly before. Ids 0-3 still mean
+;  what they always meant (primary/secondary x master/slave); ids 4 and up
+;  mean an AHCI port slot claimed by ahci_init at boot.
+; ------------------------------------------------------------------
+
+; disk_select_device: al = device id (0..TOTAL_DEVICES-1).
+disk_select_device:
+    push rax
+    cmp al, 4
+    jb .use_ata
+    mov byte [disk_use_ahci], 1
+    sub al, 4
+    mov byte [ahci_cur_slot], al
+    jmp .done
+.use_ata:
+    mov byte [disk_use_ahci], 0
+    call ata_select_device
+.done:
+    pop rax
+    ret
+
+; disk_read_sector: rax=LBA, rdi=dest buffer. Same in/out contract as
+; ata_read_sector - tail-jumps into whichever driver disk_select_device
+; picked, so its own CF/register contract passes straight through.
+disk_read_sector:
+    cmp byte [disk_use_ahci], 0
+    je ata_read_sector
+    jmp ahci_read_sector
+
+; disk_write_sector: rax=LBA, rsi=source buffer. Same contract as above.
+disk_write_sector:
+    cmp byte [disk_use_ahci], 0
+    je ata_write_sector
+    jmp ahci_write_sector
+
+; ------------------------------------------------------------------
+;  PCI configuration space access (legacy 0xCF8/0xCFC I/O ports). Used
+;  only to find and configure the AHCI controller below.
+; ------------------------------------------------------------------
+PCI_CFG_ADDR equ 0x0CF8
+PCI_CFG_DATA equ 0x0CFC
+
+; pci_read32: ebx=bus, ecx=device(0-31), edx=function(0-7), r8b=offset
+; (byte, dword-aligned - low 2 bits ignored). Returns eax = the 32-bit
+; config space value at that offset. Preserves ebx/ecx/edx; clobbers r9.
+pci_read32:
+    push rbx
+    push rcx
+    push rdx
+    push r9
+    xor r9d, r9d
+    mov r9b, bl
+    shl r9d, 16                  ; bus -> bits 23:16
+    mov eax, ecx
+    and eax, 0x1F
+    shl eax, 11                  ; device -> bits 15:11
+    or r9d, eax
+    mov eax, edx
+    and eax, 0x07
+    shl eax, 8                   ; function -> bits 10:8
+    or r9d, eax
+    mov eax, r8d
+    and eax, 0xFC                ; register -> bits 7:2
+    or r9d, eax
+    or r9d, 0x80000000           ; enable bit
+    mov eax, r9d
+    mov dx, PCI_CFG_ADDR
+    out dx, eax
+    mov dx, PCI_CFG_DATA
+    in eax, dx
+    pop r9
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; pci_write32: ebx=bus, ecx=device, edx=function, r8b=offset, r10d=value.
+; Preserves ebx/ecx/edx; clobbers r9.
+pci_write32:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push r9
+    xor r9d, r9d
+    mov r9b, bl
+    shl r9d, 16
+    mov eax, ecx
+    and eax, 0x1F
+    shl eax, 11
+    or r9d, eax
+    mov eax, edx
+    and eax, 0x07
+    shl eax, 8
+    or r9d, eax
+    mov eax, r8d
+    and eax, 0xFC
+    or r9d, eax
+    or r9d, 0x80000000
+    mov eax, r9d
+    mov dx, PCI_CFG_ADDR
+    out dx, eax
+    mov eax, r10d
+    mov dx, PCI_CFG_DATA
+    out dx, eax
+    pop r9
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; pci_find_ahci: brute-force scan of PCI bus 0 only (per-device, and every
+; function of a multi-function device). This covers the common case - the
+; chipset's root complex, where AHCI controllers normally live, and is
+; where QEMU/Bochs/VirtualBox and most real desktop chipsets put theirs -
+; but doesn't walk PCI-to-PCI bridges out to other buses, which unusual
+; multi-bus hardware could need. Looks for class 0x01 (mass storage),
+; subclass 0x06 (SATA), regardless of programming interface.
+; On success: CF=0, [ahci_pci_bus/dev/func] set. On failure: CF=1.
+pci_find_ahci:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push r8
+    push r9
+    push r10
+    xor ebx, ebx                 ; bus 0 only
+    xor ecx, ecx                 ; device 0..31
+.dev_loop:
+    cmp ecx, 32
+    jae .not_found
+    xor edx, edx                 ; try function 0 first
+    xor r8, r8
+    call pci_read32
+    cmp eax, 0xFFFFFFFF
+    je .next_dev                 ; nothing in this slot
+    mov r8b, 0x0C                ; header type lives at offset 0x0C, byte 2
+    call pci_read32
+    shr eax, 16
+    and eax, 0xFF
+    mov [pci_scratch_hdrtype], al
+    mov r9d, 1                   ; how many functions to check
+    test byte [pci_scratch_hdrtype], 0x80
+    jz .func_loop_start
+    mov r9d, 8                   ; multi-function device - check them all
+.func_loop_start:
+    xor edx, edx
+.func_loop:
+    cmp edx, r9d
+    jae .next_dev
+    xor r8, r8
+    call pci_read32
+    cmp eax, 0xFFFFFFFF
+    je .func_next
+    mov r8b, 0x08                ; class code dword
+    call pci_read32
+    mov r10d, eax
+    shr r10d, 24                 ; class
+    cmp r10b, 0x01
+    jne .func_next
+    mov r10d, eax
+    shr r10d, 16
+    and r10d, 0xFF                ; subclass
+    cmp r10b, 0x06
+    jne .func_next
+    mov [ahci_pci_bus], bl
+    mov [ahci_pci_dev], cl
+    mov [ahci_pci_func], dl
+    jmp .found
+.func_next:
+    inc edx
+    jmp .func_loop
+.next_dev:
+    inc ecx
+    jmp .dev_loop
+.not_found:
+    pop r10
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    stc
+    ret
+.found:
+    pop r10
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    clc
+    ret
+
+; ------------------------------------------------------------------
+;  AHCI (SATA) driver. Talks to the HBA over MMIO (its ABAR, found via
+;  PCI BAR5) instead of legacy IDE ports - a different I/O model from the
+;  ata_* driver above, but the disk is identity-mapped memory either way
+;  once ahci_mark_uncached has run, so it's read/written with plain
+;  mov/or/and just like any other buffer in this file. No interrupts are
+;  used here either, matching the polled style of the rest of the OS:
+;  commands are issued and then polled for completion on PxCI.
+; ------------------------------------------------------------------
+PCI_CMD_OFFSET  equ 0x04
+PCI_BAR5_OFFSET equ 0x24
+AHCI_TIMEOUT    equ 0x400000
+
+; ahci_mark_uncached: edi = a physical address inside the 2MB page to mark
+; uncached (sets PCD, bit4) in the identity-map PDs built by
+; expand_identity_map (4 contiguous page directories at 0x3000..0x6FFF,
+; 512 entries each, 2MB pages). Without this, polling an HBA register
+; through a cacheable mapping could read back a stale value instead of
+; what the device just wrote - the ABAR sits in a dedicated MMIO range
+; that nothing else in this kernel uses, so marking its whole 2MB page
+; uncached doesn't affect anything else.
+ahci_mark_uncached:
+    push rax
+    push rcx
+    mov eax, edi
+    shr eax, 21                  ; which 2MB page, 0..2047, across all 4 PDs
+    mov ecx, eax
+    shl ecx, 3                   ; * 8 (each PD entry is a qword)
+    add ecx, 0x3000              ; PD0 starts at 0x3000 (see expand_identity_map)
+    or qword [rcx], 0x10         ; set PCD
+    mov rax, cr3
+    mov cr3, rax                 ; flush stale TLB entries
+    pop rcx
+    pop rax
+    ret
+
+; ahci_port_init: rbx = this port's register base (ABAR + 0x100 +
+; port*0x80), r14d = slot index (0..AHCI_MAX_PORTS-1, picks which static
+; command-list/FIS buffer this port uses). Stops the port if it was
+; already running, points it at our buffers, then starts it.
+ahci_port_init:
+    push rax
+    push rcx
+    push rdi
+
+    mov eax, [rbx + 0x18]        ; PxCMD
+    and eax, 0xFFFFFFFE          ; clear ST
+    mov [rbx + 0x18], eax
+    and eax, 0xFFFFFFEF          ; clear FRE
+    mov [rbx + 0x18], eax
+
+    ; wait for FR/CR to clear, but don't spin forever - some real
+    ; controllers (unlike QEMU's virtual AHCI) can take a while here, or in
+    ; rare cases never quiesce from this code's point of view. Bail out
+    ; and skip this port rather than hanging the whole boot if it doesn't
+    ; clear within AHCI_TIMEOUT iterations.
+    mov rcx, AHCI_TIMEOUT
+.wait_stop:
+    mov eax, [rbx + 0x18]
+    test eax, 0x8000             ; FR - FIS receive still running?
+    jnz .wait_stop_dec
+    mov eax, [rbx + 0x18]
+    test eax, 0x4000             ; CR - command list still running?
+    jz .stopped
+.wait_stop_dec:
+    loop .wait_stop
+    jmp .skip_port               ; timed out - leave this port unclaimed
+.stopped:
+
+    mov eax, r14d
+    imul eax, 1024
+    lea rdi, [ahci_clb + rax]    ; this slot's 1KB-aligned command list
+    mov [rbx + 0x00], edi        ; PxCLB
+    mov dword [rbx + 0x04], 0    ; PxCLBU (we're always <4GB here)
+
+    mov eax, r14d
+    imul eax, 256
+    lea rdi, [ahci_fis + rax]    ; this slot's 256B-aligned FIS receive area
+    mov [rbx + 0x08], edi        ; PxFB
+    mov dword [rbx + 0x0C], 0    ; PxFBU
+
+    mov dword [rbx + 0x30], 0xFFFFFFFF   ; PxSERR - clear (write-1-to-clear)
+
+    mov eax, [rbx + 0x18]
+    or eax, 0x10                 ; FRE
+    mov [rbx + 0x18], eax
+    mov eax, [rbx + 0x18]
+    or eax, 0x01                 ; ST
+    mov [rbx + 0x18], eax
+
+.skip_port:
+    pop rdi
+    pop rcx
+    pop rax
+    ret
+
+; ahci_init: called once at boot. Finds a PCI AHCI controller if one's
+; present, enables it, and brings up to AHCI_MAX_PORTS of its ports (that
+; have an actual SATA disk attached) as extra disk device slots, ids
+; 4..4+AHCI_MAX_PORTS-1. Completely inert if there's no AHCI controller:
+; [ahci_port_count] stays 0 and the OS behaves exactly as it always did.
+ahci_init:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rdi
+    push r8
+    push r10
+    push r12
+    push r13
+    push r14
+
+    call pci_find_ahci
+    jc .done
+
+    ; Memory Space (bit1) + Bus Master (bit2) in the PCI command register -
+    ; usually already on if firmware set the machine up, but make sure.
+    movzx ebx, byte [ahci_pci_bus]
+    movzx ecx, byte [ahci_pci_dev]
+    movzx edx, byte [ahci_pci_func]
+    mov r8b, PCI_CMD_OFFSET
+    call pci_read32
+    or eax, 0x0006
+    mov r10d, eax
+    movzx ebx, byte [ahci_pci_bus]
+    movzx ecx, byte [ahci_pci_dev]
+    movzx edx, byte [ahci_pci_func]
+    mov r8b, PCI_CMD_OFFSET
+    call pci_write32
+
+    ; BAR5 = ABAR, the AHCI MMIO register window
+    movzx ebx, byte [ahci_pci_bus]
+    movzx ecx, byte [ahci_pci_dev]
+    movzx edx, byte [ahci_pci_func]
+    mov r8b, PCI_BAR5_OFFSET
+    call pci_read32
+    and eax, 0xFFFFFFF0           ; drop the low flag bits, keep the base
+    mov [ahci_abar], eax
+    mov edi, eax
+    call ahci_mark_uncached
+
+    mov ebx, [ahci_abar]          ; 32-bit load zero-extends into rbx - ahci_abar
+                                   ; is only a dd, so a 64-bit load here would pull
+                                   ; in the following ahci_ports_impl dword too
+    mov eax, [rbx + 0x04]         ; GHC
+    or eax, 0x80000000            ; AE - AHCI Enable
+    mov [rbx + 0x04], eax
+
+    mov eax, [rbx + 0x0C]         ; PI - ports implemented bitmap
+    mov [ahci_ports_impl], eax
+
+    xor r12d, r12d                ; physical port index, 0..31
+    xor r13d, r13d                ; usable ports claimed so far
+.port_scan:
+    cmp r12d, 32
+    jae .scan_done
+    cmp r13d, AHCI_MAX_PORTS
+    jae .scan_done
+    mov eax, 1
+    mov ecx, r12d
+    shl eax, cl
+    test eax, [ahci_ports_impl]
+    jz .port_next                 ; this port number isn't implemented
+    mov ebx, [ahci_abar]          ; 32-bit load, see note above - this is the site
+                                   ; that was faulting once ahci_ports_impl went nonzero
+    add rbx, 0x100
+    mov eax, r12d
+    shl eax, 7                    ; port registers are 0x80 bytes apart
+    add rbx, rax
+    mov eax, [rbx + 0x28]         ; PxSSTS
+    and eax, 0x0F                 ; DET field
+    cmp eax, 0x03                 ; 3 = device present, comms established
+    jne .port_next
+    mov eax, [rbx + 0x24]         ; PxSIG
+    cmp eax, 0xEB140101            ; ATAPI signature - skip optical drives
+    je .port_next
+    mov eax, r13d
+    mov [ahci_port_num + rax*4], r12d   ; remember the real port number
+    mov rax, r13
+    imul rax, 8
+    mov [ahci_port_base + rax], rbx     ; remember its register base
+    mov r14d, r13d
+    call ahci_port_init
+    inc r13d
+.port_next:
+    inc r12d
+    jmp .port_scan
+.scan_done:
+    mov [ahci_port_count], r13b
+.done:
+    pop r14
+    pop r13
+    pop r12
+    pop r10
+    pop r8
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; ahci_read_sector / ahci_write_sector: same calling convention as their
+; ata_* counterparts (rax=LBA, rdi=dest / rsi=src, CF=0/1 on return), for
+; whichever port [ahci_cur_slot] currently names. They just set which ATA
+; command to send and which direction the data goes, then share the actual
+; command-submission logic in ahci_rw_common below.
+ahci_read_sector:
+    mov byte [ahci_op_cmd], 0x25    ; READ DMA EXT
+    mov byte [ahci_op_write], 0
+    jmp ahci_rw_common
+
+ahci_write_sector:
+    mov byte [ahci_op_cmd], 0x35    ; WRITE DMA EXT
+    mov byte [ahci_op_write], 1
+    mov rdi, rsi                    ; unify on rdi as "the buffer" below
+    jmp ahci_rw_common
+
+; ahci_rw_common: rax=LBA, rdi=buffer, using [ahci_op_cmd]/[ahci_op_write]
+; set by the caller above. Builds one command (command-list entry 0, its
+; command table, and a Register H2D FIS) for a single 512-byte sector
+; transfer, issues it, and polls PxCI until it clears (or times out).
+; Returns CF=0 on success, CF=1 on failure/timeout.
+ahci_rw_common:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov r12, rax                  ; r12 = LBA
+    mov r13, rdi                  ; r13 = buffer pointer
+
+    movzx r14d, byte [ahci_cur_slot]
+    mov rax, r14
+    imul rax, 8
+    mov r15, [ahci_port_base + rax]   ; r15 = this port's register base
+
+    mov rax, r14
+    imul rax, 1024
+    lea r8, [ahci_clb + rax]      ; r8 = this port's command list (entry 0)
+
+    xor eax, eax
+    mov al, 5                     ; CFL = 5 DWORDS (20-byte Reg H2D FIS)
+    cmp byte [ahci_op_write], 0
+    je .no_w
+    or eax, 0x40                  ; W bit - this is a write
+.no_w:
+    or eax, (1 << 16)             ; PRDTL = 1 (one PRDT entry)
+    mov [r8], eax
+    mov dword [r8 + 4], 0         ; PRDBC, cleared before each command
+
+    mov rax, r14
+    imul rax, 256
+    lea r9, [ahci_cmdtbl + rax]   ; r9 = this port's command table
+    mov [r8 + 8], r9d             ; CTBA
+    mov dword [r8 + 12], 0        ; CTBAU
+
+    ; zero the command table's FIS area (first 64 bytes) before building it
+    push rdi
+    mov rdi, r9
+    xor eax, eax
+    mov rcx, 8
+    rep stosq
+    pop rdi
+
+    ; Register H2D FIS at command table offset 0
+    mov byte [r9 + 0], 0x27       ; FIS_TYPE_REG_H2D
+    mov byte [r9 + 1], 0x80       ; C = 1 (this FIS carries a Command)
+    mov al, [ahci_op_cmd]
+    mov byte [r9 + 2], al         ; Command register
+
+    mov rax, r12
+    mov byte [r9 + 4], al         ; LBA[7:0]
+    mov rcx, rax
+    shr rcx, 8
+    mov byte [r9 + 5], cl         ; LBA[15:8]
+    mov rcx, rax
+    shr rcx, 16
+    mov byte [r9 + 6], cl         ; LBA[23:16]
+    mov byte [r9 + 7], 0x40       ; Device (LBA mode)
+    mov rcx, rax
+    shr rcx, 24
+    mov byte [r9 + 8], cl         ; LBA[31:24]
+    mov rcx, rax
+    shr rcx, 32
+    mov byte [r9 + 9], cl         ; LBA[39:32]
+    mov rcx, rax
+    shr rcx, 40
+    mov byte [r9 + 10], cl        ; LBA[47:40]
+    mov byte [r9 + 12], 1         ; sector count = 1
+
+    ; PRDT entry, at command table offset 128: points straight at the
+    ; caller's buffer (identity-mapped, so virtual == physical here).
+    mov [r9 + 128], r13d          ; DBA
+    mov dword [r9 + 132], 0       ; DBAU
+    mov dword [r9 + 136], 0       ; reserved
+    mov eax, 511                  ; byte count field is (N-1); no IRQ bit
+    mov [r9 + 140], eax
+
+    mov dword [r15 + 0x10], 0xFFFFFFFF   ; PxIS - clear stale status
+    mov eax, 1
+    mov [r15 + 0x38], eax                ; PxCI - issue command slot 0
+
+    mov rcx, AHCI_TIMEOUT
+.wait:
+    mov eax, [r15 + 0x38]
+    test eax, 1
+    jz .check_err
+    mov eax, [r15 + 0x20]         ; PxTFD - bail early on a device error
+    test eax, 1
+    jnz .fail
+    loop .wait
+    jmp .fail                     ; timed out
+.check_err:
+    mov eax, [r15 + 0x20]
+    test eax, 1
+    jnz .fail
+    clc
+    jmp .rw_done
+.fail:
+    stc
+.rw_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; ------------------------------------------------------------------
 ;  SFFS v2 volume I/O
 ; ------------------------------------------------------------------
 
@@ -4051,10 +4850,10 @@ vol_read:
     push r8
     push r9
     mov r8, rdi                 ; r8 = base node index
-    call ata_select_device
+    call disk_select_device
     mov rax, SUPER_LBA
     lea rdi, [fs_super_buf]
-    call ata_read_sector
+    call disk_read_sector
     jc .nodisk
     cmp byte [fs_super_buf+0], 'S'
     jne .fail
@@ -4070,12 +4869,12 @@ vol_read:
     mov rax, TYPE_LBA
     lea rdi, [node_type]
     add rdi, r8
-    call ata_read_sector
+    call disk_read_sector
     jc .fail
     ; node_parent -> scratch, then remap into place
     mov rax, PARENT_LBA
     lea rdi, [fs_parent_scratch]
-    call ata_read_sector
+    call disk_read_sector
     jc .fail
     mov r9, r8                   ; r9 = base + i (live table index)
     xor rcx, rcx                 ; rcx = i
@@ -4114,7 +4913,7 @@ vol_read:
     push rax
     push rcx
     push rdi
-    call ata_read_sector
+    call disk_read_sector
     pop rdi
     pop rcx
     pop rax
@@ -4133,7 +4932,7 @@ vol_read:
     push rax
     push rcx
     push rdi
-    call ata_read_sector
+    call disk_read_sector
     pop rdi
     pop rcx
     pop rax
@@ -4173,7 +4972,7 @@ vol_write:
     push r9
     mov r8, rdi                 ; r8 = base node index
     mov r9, rsi                 ; r9 = label ptr
-    call ata_select_device
+    call disk_select_device
     ; --- build and write the superblock ---
     mov byte [fs_super_buf+0], 'S'
     mov byte [fs_super_buf+1], 'F'
@@ -4206,13 +5005,13 @@ vol_write:
 .label_done:
     mov rax, SUPER_LBA
     lea rsi, [fs_super_buf]
-    call ata_write_sector
+    call disk_write_sector
     jc .fail
     ; --- node_type ---
     mov rax, TYPE_LBA
     lea rsi, [node_type]
     add rsi, r8
-    call ata_write_sector
+    call disk_write_sector
     jc .fail
     ; --- node_parent (remap to on-disk relative indices) ---
     xor rcx, rcx
@@ -4221,7 +5020,10 @@ vol_write:
     jae .parent_done
     cmp rcx, 0
     je .parent_root
-    movzx rax, word [node_parent + r8 + rcx*2]
+    mov rax, r8
+    add rax, rcx                 ; rax = global node index (base+i)
+    shl rax, 1                   ; rax = byte offset into node_parent (word-sized)
+    movzx rax, word [node_parent + rax]
     sub rax, r8
     mov [fs_parent_scratch + rcx*2], ax
     jmp .parent_next
@@ -4233,7 +5035,7 @@ vol_write:
 .parent_done:
     mov rax, PARENT_LBA
     lea rsi, [fs_parent_scratch]
-    call ata_write_sector
+    call disk_write_sector
     jc .fail
     ; --- node_name ---
     mov rax, NAME_LBA
@@ -4246,7 +5048,7 @@ vol_write:
     push rax
     push rcx
     push rsi
-    call ata_write_sector
+    call disk_write_sector
     pop rsi
     pop rcx
     pop rax
@@ -4265,7 +5067,7 @@ vol_write:
     push rax
     push rcx
     push rsi
-    call ata_write_sector
+    call disk_write_sector
     pop rsi
     pop rcx
     pop rax
@@ -4298,19 +5100,24 @@ fs_save:
     push rsi
     push rdi
     push r13
+    push r14
+    xor r14b, r14b                ; r14b = 1 once anything has actually been saved
     cmp byte [fs_disk_available], 0
-    je .fail                     ; already known-absent this session, don't retry
+    je .skip_os_volume            ; no legacy-ATA OS disk this session - don't retry
+                                   ; it, but still try any mounted AHCI volumes below
     ; OS volume: device 0, base 0, label = root node's name
     lea rsi, [node_name]
     xor rdi, rdi
     xor al, al
     call vol_write
     jc .disk_gone
+    mov r14b, 1
+.skip_os_volume:
     ; mounted volumes
     xor r13, r13
 .mount_loop:
     cmp r13, MAX_MOUNTS
-    jae .done
+    jae .check_any
     cmp byte [mount_used + r13], 0
     je .mount_next
     movzx rax, byte [mount_device + r13]
@@ -4321,11 +5128,15 @@ fs_save:
     imul rbx, 32
     lea rsi, [mount_label + rbx]
     call vol_write
-    ; a mounted volume failing to save is not fatal; keep it mounted
+    jc .mount_next                ; a mounted volume failing to save is not fatal;
+    mov r14b, 1                   ; keep it mounted, just don't count it as saved
 .mount_next:
     inc r13
     jmp .mount_loop
-.done:
+.check_any:
+    cmp r14b, 0
+    je .fail                      ; nothing at all got saved - genuinely no disk
+    pop r14
     pop r13
     pop rdi
     pop rsi
@@ -4335,7 +5146,9 @@ fs_save:
     ret
 .disk_gone:
     mov byte [fs_disk_available], 0
+    jmp .skip_os_volume
 .fail:
+    pop r14
     pop r13
     pop rdi
     pop rsi
@@ -5778,6 +6591,7 @@ str_info:   db "-info", 0
 str_dscan:  db "dscan", 0
 str_format: db "fmt", 0
 str_mount:  db "mount", 0
+str_label:  db "label", 0
 str_semicolon: db ";", 0
 str_tilde:     db "~", 0
 str_dollar:    db "$", 0
@@ -5817,6 +6631,7 @@ msg_dev_primary:  db "primary ", 0
 msg_dev_secondary: db "secondary ", 0
 msg_dev_master:   db "master", 0
 msg_dev_slave:    db "slave", 0
+msg_dev_ahci:     db "ahci port ", 0
 msg_fmt_usage:    db "fmt: use 'fmt <label>' to format a drive", 10, 0
 msg_fmt_none:     db "fmt: no unformatted drive found (use 'fmt <label> -force' to reuse one)", 10, 0
 msg_fmt_long:     db "fmt: label too long (max 31 characters)", 10, 0
@@ -5834,6 +6649,16 @@ msg_mount_ok1:    db "Mounted ", 0
 msg_mount_ok2:    db " at /", 0
 msg_mount_ok3:    db "/. Use 'cf ", 0
 msg_mount_ok4:    db "' to enter it.", 0
+msg_label_usage:  db "label: use 'label <old> <new>' to rename a drive", 10, 0
+msg_label_long:   db "label: new label too long (max 31 characters)", 10, 0
+msg_label_none1:  db "label: no drive labeled '", 0
+msg_label_none2:  db "' found. Run 'dscan'.", 10, 0
+msg_label_inuse1: db "label: '", 0
+msg_label_inuse2: db "' is already used by another drive.", 10, 0
+msg_label_iofail: db "label: disk error - failed to write.", 10, 0
+msg_label_ok1:    db "Relabeled '", 0
+msg_label_ok2:    db "' to '", 0
+msg_label_ok3:    db "'.", 10, 0
 msg_bad_value:   db "error: invalid value", 10, 0
 msg_calc_err:      db "calc: invalid expression", 10, 0
 msg_calc_need_expr: db "calc: need an expression, e.g. calc 1 + 2 * 3", 10, 0
@@ -5897,6 +6722,7 @@ help_text:
     db "  fmt <label>        format a drive with the SFFS format (-force reuses one)", 10
     db "  dscan              scan for SFFS drives attached to the ATA bus", 10
     db "  mount <label>      mount a formatted drive at /<label>/", 10
+    db "  label <old> <new>  rename a formatted drive without touching its data", 10
     db "  rboot              save to disk, then restart (requires auth)", 10
     db "  sdown              shut down (requires auth)", 10
     db "  ;                  chain commands, e.g. show hi ; show bye", 10
@@ -6029,6 +6855,12 @@ help_mount:
     db "  Mount a formatted drive's volume under /<label>/, next to", 10
     db "  /home. Up to 2 drives can be mounted at once.", 10, 0
 
+help_label:
+    db "label <old> <new>", 10
+    db "  Rename a formatted drive's label in place. Only the superblock's", 10
+    db "  label is rewritten - the drive's files are left untouched. Fails", 10
+    db "  if <new> is already used by another drive.", 10, 0
+
 help_sync:
     db "sync", 10
     db "  Save the filesystem (and any mounted volumes) to disk.", 10, 0
@@ -6117,6 +6949,36 @@ ALIGN 8
 ata_port_base: dw 0x1F0        ; 0x1F0 primary channel, 0x170 secondary
 ata_drive_sel: db 0xE0         ; 0xE0 master, 0xF0 slave
 
+; --- AHCI (SATA) driver state ---
+pci_scratch_hdrtype: db 0
+ahci_pci_bus:     db 0
+ahci_pci_dev:     db 0
+ahci_pci_func:    db 0
+ALIGN 4
+ahci_abar:        dd 0             ; physical base of the AHCI MMIO register window
+ahci_ports_impl:  dd 0             ; PI bitmap read from the HBA at boot
+ahci_port_count:  db 0             ; how many of ahci_port_num/base are valid
+ahci_port_num:    times AHCI_MAX_PORTS dd 0   ; slot -> real HBA port number
+ALIGN 8
+ahci_port_base:   times AHCI_MAX_PORTS dq 0   ; slot -> port register base ptr
+disk_use_ahci:    db 0             ; set by disk_select_device: 0=ATA, 1=AHCI
+ahci_cur_slot:    db 0             ; which AHCI slot is currently selected
+ahci_op_cmd:      db 0             ; pending ATA command byte (read vs write)
+ahci_op_write:    db 0             ; 1 if the pending op is a write
+
+; Command list (1KB/port, must be 1KB-aligned), FIS receive area (256B/port,
+; must be 256B-aligned), and command table (256B/port, must be 128B-aligned,
+; and big enough for a 20-byte Reg H2D FIS plus one 16-byte PRDT entry) for
+; each AHCI port slot we bring up. Identity-mapped, so these labels' linked
+; addresses double as the physical addresses the HBA needs - same trick the
+; rest of this file already relies on for fs_super_buf and friends.
+ALIGN 1024
+ahci_clb:    times AHCI_MAX_PORTS*1024 db 0
+ALIGN 256
+ahci_fis:    times AHCI_MAX_PORTS*256 db 0
+ALIGN 128
+ahci_cmdtbl: times AHCI_MAX_PORTS*256 db 0
+
 path_stack:   times 16 dw 0
 
 ; --- scratch for fs_resolve_path ---
@@ -6158,6 +7020,7 @@ calc_ops:   times MAX_CALC_TOKENS db 0
 calc_ops2:  times MAX_CALC_TOKENS db 0
 calc_out_buf: times 24 db 0
 show_num_buf: times 24 db 0
+dev_name_num_buf: times 24 db 0
 ident_buf:  times 40 db 0
 
 ; --- built-in editor buffer (one file's worth of content) ---
