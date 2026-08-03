@@ -50,7 +50,7 @@ ALIAS_MAX_DEPTH equ 8          ; guards against an alias (in)directly invoking i
 PIPE_CAP_MAX    equ 192       ; max bytes captured from a "~" pipe's left side
 
 ; ------------------------------------------------------------------
-;  SFFS v2 -- ShellyForever File Storage format (on-disk layout).
+;  SFFS v3 -- ShellyForever File Storage format (on-disk layout).
 ;  Every drive (OS boot drive and any data drives) uses the same
 ;  fixed layout so any drive can be scanned, formatted, and mounted:
 ;
@@ -58,8 +58,18 @@ PIPE_CAP_MAX    equ 192       ; max bytes captured from a "~" pipe's left side
 ;                             byte, reserved, 32-byte disk label
 ;    LBA  FS_LBA_START+1   : node_type[VOL_NODES]  (1 sector, padded)
 ;    LBA  FS_LBA_START+2   : node_parent[VOL_NODES] (1 sector, padded)
-;    LBA  FS_LBA_START+3.. : node_name[VOL_NODES*NAME_LEN] (4 sectors)
-;    LBA  FS_LBA_START+7.. : node_content[VOL_NODES*CONTENT_LEN] (20)
+;    LBA  FS_LBA_START+3   : node_next[VOL_NODES]  (1 sector; 0xFFFF = no
+;                             continuation). v3 only - v2 has no next sector.
+;    LBA  FS_LBA_START+4.. : node_name[VOL_NODES*NAME_LEN] (4 sectors)
+;    LBA  FS_LBA_START+8.. : node_content[VOL_NODES*CONTENT_LEN] (20)
+;
+;  A file whose content exceeds one 159-byte slot is stored as a chain:
+;  the file's own node holds the first chunk, and its node_next points at
+;  NODE_TYPE_CHAIN (type-3) continuation nodes, each holding the next 159
+;  bytes and linked through their own node_next (0xFFFF terminates). Chain
+;  nodes are invisible to path lookup, listing, and the allocator, and are
+;  freed along with the file. v2 volumes (no node_next sector, name LBA at
+;  +3 / content at +7) still load and read fine; a sync upgrades them to v3.
 ;
 ;  dscan probes all four ATA device slots for the magic, format writes
 ;  a fresh empty volume + label, and mount loads a volume's node table
@@ -68,15 +78,19 @@ PIPE_CAP_MAX    equ 192       ; max bytes captured from a "~" pipe's left side
 ;  filesystem region at LBA 300 is well clear of it.
 ; ------------------------------------------------------------------
 FS_LBA_START    equ 300
-SFFS_VERSION    equ 2
+SFFS_VERSION    equ 3
+SFFS_VERSION_V2 equ 2               ; old format, still readable
 SUPER_LABEL_OFF equ 8               ; label lives at superblock offset 8..39
 SUPER_LBA       equ FS_LBA_START
 TYPE_LBA        equ SUPER_LBA + 1
 PARENT_LBA      equ SUPER_LBA + 2
-NAME_LBA        equ SUPER_LBA + 3
-CONTENT_LBA     equ SUPER_LBA + 7
+NEXT_LBA        equ SUPER_LBA + 3
+NAME_LBA        equ SUPER_LBA + 4
+CONTENT_LBA     equ SUPER_LBA + 8
 NAME_SECTORS    equ (VOL_NODES * NAME_LEN) / 512          ; 4
 CONTENT_SECTORS equ (VOL_NODES * CONTENT_LEN) / 512       ; 20
+NODE_TYPE_CHAIN equ 3               ; continuation node in a file's content chain
+EDIT_MAX        equ VOL_NODES * CONTENT_LEN   ; max bytes one file can hold (64*160)
 
 ; ============================================================
 kernel_entry:
@@ -865,6 +879,12 @@ dispatch:
     cmp al, 1
     je cmd_shelly
 
+    mov rsi, cmd_buf
+    mov rdi, str_party
+    call str_eq
+    cmp al, 1
+    je cmd_party
+
     ; --- user-defined alias? (see "ali <name> <commands>") ---
     mov rsi, cmd_buf
     call alias_lookup
@@ -1030,13 +1050,10 @@ cmd_mkfl:
     call fs_create_node
     cmp rax, -1
     je .full
-    ; rax = new node index, copy arg2 into its content
+    ; rax = new node index, write arg2 into its content
     mov rbx, rax
-    mov rdi, rbx
-    imul rdi, CONTENT_LEN
-    lea rdi, [node_content + rdi]
-    mov rsi, arg2_buf
-    call str_copy
+    lea rsi, [arg2_buf]
+    call fs_write_file
 
     ; Check -info flag
     mov rsi, arg3_buf
@@ -1134,11 +1151,8 @@ cmd_mkfl:
 .overwrite:
     ; rbx = existing node index, overwrite content
     mov rax, rbx
-    mov rdi, rax
-    imul rdi, CONTENT_LEN
-    lea rdi, [node_content + rdi]
-    mov rsi, arg2_buf
-    call str_copy
+    lea rsi, [arg2_buf]
+    call fs_write_file
 
     ; Check -info flag
     mov rsi, arg3_buf
@@ -1384,11 +1398,8 @@ cmd_edit:
     push r15
     mov r15, rax
 
-    mov rdi, rax
-    imul rdi, CONTENT_LEN
-    lea rsi, [node_content + rdi]
-    lea rdi, [edit_buf]
-    call str_copy
+    lea rdi, [fs_io_buf]
+    call fs_read_file
 
     call clear_screen
     mov rsi, msg_edit_header1
@@ -1401,11 +1412,11 @@ cmd_edit:
     mov al, ATTR_PROMPT
     call print_string_attr
 
-    lea rsi, [edit_buf]
+    lea rsi, [fs_io_buf]
     mov al, [cur_normal_attr]
     call print_string_attr
 
-    lea rsi, [edit_buf]
+    lea rsi, [fs_io_buf]
     call str_len
     push r14
     mov r14, rax
@@ -1421,9 +1432,9 @@ cmd_edit:
     je .ce_loop                  ; no history/scrollback editing here, ignore
     cmp al, KEY_DOWN
     je .ce_loop
-    cmp r14, CONTENT_LEN-1
+    cmp r14, EDIT_MAX-1
     jae .ce_loop
-    lea rdi, [edit_buf]
+    lea rdi, [fs_io_buf]
     mov [rdi + r14], al
     inc r14
     mov byte [rdi + r14], 0
@@ -1433,9 +1444,9 @@ cmd_edit:
     pop rbx
     jmp .ce_loop
 .ce_newline:
-    cmp r14, CONTENT_LEN-1
+    cmp r14, EDIT_MAX-1
     jae .ce_loop
-    lea rdi, [edit_buf]
+    lea rdi, [fs_io_buf]
     mov byte [rdi + r14], 10
     inc r14
     mov byte [rdi + r14], 0
@@ -1449,7 +1460,7 @@ cmd_edit:
     cmp r14, 0
     je .ce_loop
     dec r14
-    lea rdi, [edit_buf]
+    lea rdi, [fs_io_buf]
     mov byte [rdi + r14], 0
     call do_backspace
     jmp .ce_loop
@@ -1469,11 +1480,9 @@ cmd_edit:
     je .ce_discard
     jmp .ce_wait_key
 .ce_save:
-    mov rdi, r15
-    imul rdi, CONTENT_LEN
-    lea rdi, [node_content + rdi]
-    lea rsi, [edit_buf]
-    call str_copy
+    mov rax, r15
+    lea rsi, [fs_io_buf]
+    call fs_write_file
     call clear_screen
     mov rsi, msg_saved
     mov al, [cur_normal_attr]
@@ -1514,6 +1523,8 @@ cmd_ls:
     cmp r9, MAX_NODES
     jae .done
     cmp byte [node_type + r9], 0
+    je .next
+    cmp byte [node_type + r9], NODE_TYPE_CHAIN
     je .next
     movzx rax, word [node_parent + r9*2]
     cmp rax, [cur_dir]
@@ -1562,9 +1573,9 @@ cmd_cat:
     call fs_find_child
     cmp rax, -1
     je .not_found
-    mov rdi, rax
-    imul rdi, CONTENT_LEN
-    lea rsi, [node_content + rdi]
+    lea rdi, [fs_io_buf]
+    call fs_read_file
+    lea rsi, [fs_io_buf]
     mov al, [cur_normal_attr]
     call print_string_attr
     mov rsi, newline_str
@@ -2018,7 +2029,10 @@ cmd_dscan:
     cmp byte [fs_super_buf+3], 'S'
     jne .other
     cmp byte [fs_super_buf+4], SFFS_VERSION
+    je .valid_sffs
+    cmp byte [fs_super_buf+4], SFFS_VERSION_V2
     jne .other
+.valid_sffs:
     ; valid SFFS volume
     mov r15, 1
     mov rsi, msg_dscan_found1   ; "  device "
@@ -2216,7 +2230,10 @@ cmd_format:
     cmp byte [fs_super_buf+3], 'S'
     jne .fu_unformatted
     cmp byte [fs_super_buf+4], SFFS_VERSION
+    je .fu_is_sffs
+    cmp byte [fs_super_buf+4], SFFS_VERSION_V2
     jne .fu_unformatted
+.fu_is_sffs:
     ; already an SFFS volume - remember it for the -force path
     mov rbx, r13
     mov r14b, 1
@@ -2273,7 +2290,10 @@ cmd_format:
     cmp byte [fs_super_buf+3], 'S'
     jne .tg_next
     cmp byte [fs_super_buf+4], SFFS_VERSION
+    je .tg_is_sffs
+    cmp byte [fs_super_buf+4], SFFS_VERSION_V2
     jne .tg_next
+.tg_is_sffs:
     mov rsi, arg1_buf
     lea rdi, [fs_super_buf + SUPER_LABEL_OFF]
     call str_eq
@@ -2356,6 +2376,15 @@ cmd_format:
     rep stosq
     mov word [fs_super_buf], 0xFFFF
     mov rax, PARENT_LBA
+    lea rsi, [fs_super_buf]
+    call disk_write_sector
+    jc .disk_err
+    ; node_next: every node starts with no continuation
+    mov rdi, fs_super_buf
+    mov rcx, 512 / 2
+    mov ax, 0xFFFF
+    rep stosw
+    mov rax, NEXT_LBA
     lea rsi, [fs_super_buf]
     call disk_write_sector
     jc .disk_err
@@ -2496,7 +2525,10 @@ cmd_mount:
     cmp byte [fs_super_buf+3], 'S'
     jne .scan_next
     cmp byte [fs_super_buf+4], SFFS_VERSION
+    je .scan_is_sffs
+    cmp byte [fs_super_buf+4], SFFS_VERSION_V2
     jne .scan_next
+.scan_is_sffs:
     lea rsi, [fs_super_buf + SUPER_LABEL_OFF]
     mov rdi, arg1_buf
     call str_eq
@@ -2743,7 +2775,10 @@ cmd_label:
     cmp byte [fs_super_buf+3], 'S'
     jne .dup_next
     cmp byte [fs_super_buf+4], SFFS_VERSION
+    je .dup_is_sffs
+    cmp byte [fs_super_buf+4], SFFS_VERSION_V2
     jne .dup_next
+.dup_is_sffs:
     lea rsi, [fs_super_buf + SUPER_LABEL_OFF]
     mov rdi, arg2_buf
     call str_eq
@@ -2773,7 +2808,10 @@ cmd_label:
     cmp byte [fs_super_buf+3], 'S'
     jne .scan_next
     cmp byte [fs_super_buf+4], SFFS_VERSION
+    je .scan_is_sffs
+    cmp byte [fs_super_buf+4], SFFS_VERSION_V2
     jne .scan_next
+.scan_is_sffs:
     lea rsi, [fs_super_buf + SUPER_LABEL_OFF]
     mov rdi, arg1_buf
     call str_eq
@@ -4838,6 +4876,11 @@ fs_init:
     mov rcx, MAX_NODES
     xor al, al
     rep stosb
+    ; node_next: every node starts with no chain
+    mov rdi, node_next
+    mov rcx, MAX_NODES
+    mov ax, 0xFFFF
+    rep stosw
     mov byte [node_type], 1          ; root: folder
     mov word [node_parent], 0xFFFF
     lea rdi, [node_name]
@@ -4874,6 +4917,8 @@ fs_find_child:
     cmp r9, MAX_NODES
     jae .notfound
     cmp byte [node_type + r9], 0
+    je .next
+    cmp byte [node_type + r9], NODE_TYPE_CHAIN
     je .next
     cmp r10, -1
     je .typeok
@@ -4952,6 +4997,7 @@ fs_create_node:
 .free:
     mov byte [node_type + r9], r10b
     mov [node_parent + r9*2], r8w
+    mov word [node_next + r9*2], 0xFFFF
     mov rdi, r9
     imul rdi, NAME_LEN
     lea rdi, [node_name + rdi]
@@ -4986,6 +5032,7 @@ fs_delete_node:
     mov r9, rax
     mov byte [node_type + r9], 0
     mov word [node_parent + r9*2], 0
+    mov word [node_next + r9*2], 0xFFFF
     mov rdi, r9
     imul rdi, NAME_LEN
     lea rdi, [node_name + rdi]
@@ -5004,6 +5051,160 @@ fs_delete_node:
     pop rax
     ret
 
+; fs_file_len: rax = file node index. Returns rax = total content bytes
+; (each slot stores a 0-terminated chunk, so this is the logical length).
+fs_file_len:
+    push rbx
+    push rcx
+    push rsi
+    mov rcx, rax                ; current node in the chain
+    xor rbx, rbx                ; running total
+.len_loop:
+    mov rsi, rcx
+    imul rsi, CONTENT_LEN
+    lea rsi, [node_content + rsi]
+    call str_len
+    add rbx, rax
+    movzx rax, word [node_next + rcx*2]
+    cmp rax, 0xFFFF
+    je .done
+    mov rcx, rax
+    jmp .len_loop
+.done:
+    mov rax, rbx
+    pop rsi
+    pop rcx
+    pop rbx
+    ret
+
+; fs_read_file: rax = file node index, rdi = destination buffer. Concatenates
+; every chunk in the file's chain into the destination (0-terminated). The
+; destination buffer must hold fs_file_len bytes + 1.
+fs_read_file:
+    push rbx
+    push rsi
+    push rdi
+    mov rbx, rax                ; current node
+.read_loop:
+    mov rsi, rbx
+    imul rsi, CONTENT_LEN
+    lea rsi, [node_content + rsi]
+    call str_copy               ; rdi ends up just past the NUL
+    movzx rax, word [node_next + rbx*2]
+    cmp rax, 0xFFFF
+    je .done
+    dec rdi                     ; step back over the NUL: the next chunk overwrites it
+    mov rbx, rax
+    jmp .read_loop
+.done:
+    pop rdi
+    pop rsi
+    pop rbx
+    ret
+
+; fs_write_file: rax = file node index, rsi = content to store (0-terminated).
+; Writes the content across the file's chain, allocating NODE_TYPE_CHAIN
+; continuation nodes in the same volume slice as needed and freeing any that
+; become surplus. Returns CF=0 on success, CF=1 if the volume ran out of
+; nodes (partial write possible - the file is still valid, just truncated).
+fs_write_file:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push r8
+    mov rbx, rax                ; current node (starts at the file's head)
+    mov r8, rsi                 ; r8 = remaining content ptr
+.write_loop:
+    ; copy one chunk into the current node
+    mov rdi, rbx
+    imul rdi, CONTENT_LEN
+    lea rdi, [node_content + rdi]
+    mov rcx, 0
+.copy_char:
+    mov al, [r8]
+    cmp al, 0
+    je .chunk_done
+    cmp rcx, CONTENT_LEN - 1
+    jae .need_next
+    mov [rdi + rcx], al
+    inc r8
+    inc rcx
+    jmp .copy_char
+.chunk_done:
+    mov byte [rdi + rcx], 0     ; NUL-terminate this chunk
+    mov [rdi + CONTENT_LEN - 1], byte 0
+    jmp .finish
+.need_next:
+    ; this node is full - link a continuation node if we don't have one
+    mov byte [rdi + CONTENT_LEN - 1], 0
+    movzx rdx, word [node_next + rbx*2]
+    cmp rdx, 0xFFFF
+    jne .use_next
+    ; allocate a chain node in this volume's slice (parent = the file head)
+    push rsi
+    push r8
+    mov rax, rbx
+    mov rsi, empty_str
+    mov r10, NODE_TYPE_CHAIN
+    call fs_create_node
+    pop r8
+    pop rsi
+    cmp rax, -1
+    je .no_space
+    mov rdx, rax
+    mov [node_next + rbx*2], dx
+.use_next:
+    mov rbx, rdx
+    jmp .write_loop
+.finish:
+    ; truncate any leftover chain nodes beyond what we wrote
+    movzx rcx, word [node_next + rbx*2]
+    cmp rcx, 0xFFFF
+    je .clean
+    mov [node_next + rbx*2], word 0xFFFF
+    mov rax, rcx
+    call fs_free_chain
+.clean:
+    clc
+    jmp .out
+.no_space:
+    stc
+.out:
+    pop r8
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; fs_free_chain: rax = node index. Frees every continuation node linked after
+; it (not the node itself) and unlinks them. Never used on a folder.
+fs_free_chain:
+    push rax
+    push rbx
+    push rcx
+.free_loop:
+    movzx rbx, word [node_next + rax*2]
+    cmp rbx, 0xFFFF
+    je .done
+    movzx rcx, word [node_next + rbx*2]   ; remember what follows the freed node
+    mov [node_next + rax*2], word 0xFFFF  ; unlink it first
+    push rax
+    mov rax, rbx
+    call fs_delete_node
+    pop rax
+    mov rbx, rcx
+    cmp rbx, 0xFFFF
+    jne .free_loop
+.done:
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
 ; fs_delete_tree: rax = node index. Recursively frees the node and, if
 ; it's a folder, everything inside it too.
 fs_delete_tree:
@@ -5019,6 +5220,8 @@ fs_delete_tree:
     jae .leaf
     cmp byte [node_type + r13], 0
     je .next
+    cmp byte [node_type + r13], NODE_TYPE_CHAIN
+    je .next
     movzx rax, word [node_parent + r13*2]
     cmp rax, r8
     jne .next
@@ -5028,6 +5231,12 @@ fs_delete_tree:
     inc r13
     jmp .loop
 .leaf:
+    ; a file may own a chain of continuation nodes - free it first
+    cmp byte [node_type + r8], 2
+    jne .no_chain
+    mov rax, r8
+    call fs_free_chain
+.no_chain:
     mov rax, r8
     call fs_delete_node
     pop r13
@@ -5069,13 +5278,13 @@ fs_copy_node:
 
     cmp r11, 2
     jne .isfolder
-    mov rdi, r12
-    imul rdi, CONTENT_LEN
-    lea rdi, [node_content + rdi]
+    ; copy the whole file (possibly a multi-node chain) through staging
     mov rax, r8
-    imul rax, CONTENT_LEN
-    lea rsi, [node_content + rax]
-    call str_copy
+    lea rdi, [fs_io_buf]
+    call fs_read_file
+    mov rax, r12
+    lea rsi, [fs_io_buf]
+    call fs_write_file
     jmp .done
 .isfolder:
     xor r13, r13
@@ -5083,6 +5292,8 @@ fs_copy_node:
     cmp r13, MAX_NODES
     jae .done
     cmp byte [node_type + r13], 0
+    je .childnext
+    cmp byte [node_type + r13], NODE_TYPE_CHAIN
     je .childnext
     movzx rax, word [node_parent + r13*2]
     cmp rax, r8
@@ -6063,8 +6274,18 @@ vol_read:
     jne .fail
     cmp byte [fs_super_buf+3], 'S'
     jne .fail
+    ; accept both v3 (current) and v2 (old single-block) formats
+    mov byte [fs_layout_v3], 0
     cmp byte [fs_super_buf+4], SFFS_VERSION
+    je .version_ok
+    cmp byte [fs_super_buf+4], SFFS_VERSION_V2
     jne .fail
+    jmp .version_ok
+.version_ok:
+    cmp byte [fs_super_buf+4], SFFS_VERSION
+    jne .version_v2
+    mov byte [fs_layout_v3], 1
+.version_v2:
     ; node_type
     mov rax, TYPE_LBA
     lea rdi, [node_type]
@@ -6102,8 +6323,32 @@ vol_read:
     inc r9
     jmp .remap
 .remap_done:
-    ; node_name
+    ; node_next (v3 only) - a v2 volume gets a fresh no-chain slice instead
+    cmp byte [fs_layout_v3], 0
+    je .next_v2
+    mov rax, NEXT_LBA
+    lea rdi, [fs_next_scratch]
+    call disk_read_sector
+    jc .fail
+    lea rsi, [fs_next_scratch]
+    lea rdi, [node_next + r8*2]
+    mov rcx, VOL_NODES
+    rep movsw
+    jmp .next_loaded
+.next_v2:
+    lea rdi, [node_next + r8*2]
+    mov rcx, VOL_NODES
+    mov ax, 0xFFFF
+    rep stosw
+.next_loaded:
+    ; node_name (LBA differs between v2 and v3)
+    cmp byte [fs_layout_v3], 0
+    jne .name_v3
+    mov rax, SUPER_LBA + 3
+    jmp .name_go
+.name_v3:
     mov rax, NAME_LBA
+.name_go:
     mov rcx, NAME_SECTORS
     lea rdi, [node_name]
     mov r9, r8
@@ -6122,7 +6367,13 @@ vol_read:
     inc rax
     loop .name_loop
     ; node_content
+    cmp byte [fs_layout_v3], 0
+    jne .content_v3
+    mov rax, SUPER_LBA + 7
+    jmp .content_go
+.content_v3:
     mov rax, CONTENT_LBA
+.content_go:
     mov rcx, CONTENT_SECTORS
     lea rdi, [node_content]
     mov r9, r8
@@ -6235,6 +6486,19 @@ vol_write:
 .parent_done:
     mov rax, PARENT_LBA
     lea rsi, [fs_parent_scratch]
+    call disk_write_sector
+    jc .fail
+    ; --- node_next: this volume's 64 words padded to a full 0xFFFF sector ---
+    mov rdi, fs_next_scratch
+    mov rcx, 512 / 2
+    mov ax, 0xFFFF
+    rep stosw
+    lea rsi, [node_next + r8*2]
+    lea rdi, [fs_next_scratch]
+    mov rcx, VOL_NODES
+    rep movsw
+    mov rax, NEXT_LBA
+    lea rsi, [fs_next_scratch]
     call disk_write_sector
     jc .fail
     ; --- node_name ---
@@ -7178,19 +7442,13 @@ cmd_write:
     call fs_create_node
     cmp rax, -1
     je .cw_full
-    mov rdi, rax
-    imul rdi, CONTENT_LEN
-    lea rdi, [node_content + rdi]
-    mov rsi, arg2_buf
-    call str_copy
+    lea rsi, [arg2_buf]
+    call fs_write_file
     ret
 .cw_overwrite:
     ; rax = existing file node index, replace its content
-    mov rdi, rax
-    imul rdi, CONTENT_LEN
-    lea rdi, [node_content + rdi]
-    mov rsi, arg2_buf
-    call str_copy
+    lea rsi, [arg2_buf]
+    call fs_write_file
     ret
 .cw_exists:
     mov rsi, msg_exists
@@ -7360,6 +7618,8 @@ cmd_shelly_rainbow:
     pop rbx
     pop rax
     ret
+
+%include "party.asm"
 
 ; print_prompt: prints "rush>" + current path + ": "
 print_prompt:
@@ -9191,10 +9451,12 @@ node_type:    times 512 * (1 + MAX_MOUNTS) db 0
 node_parent:  times MAX_NODES dw 0
 node_name:    times MAX_NODES*NAME_LEN db 0
 node_content: times MAX_NODES*CONTENT_LEN db 0
+node_next:    times MAX_NODES dw 0xFFFF   ; 0xFFFF = end of chain (or no chain)
 
 fs_loaded_from_disk: db 0
 fs_disk_available:   db 1     ; optimistic default; cleared on first ATA failure
 fs_name_too_long:    db 0     ; set by fs_create_node when a name won't fit
+fs_layout_v3:        db 0     ; set by vol_read: 1 = on-disk v3 (has node_next sector)
 
 mkfl_test_flag:      db 0     ; set by cmd_mkfl when -test appears in arg2/3/4
 ALIGN 8
@@ -9286,9 +9548,6 @@ show_num_buf: times 24 db 0
 dev_name_num_buf: times 24 db 0
 ident_buf:  times 40 db 0
 
-; --- built-in editor buffer (one file's worth of content) ---
-edit_buf: times CONTENT_LEN db 0
-
 ; --- process table for rush scripts ---
 MAX_PROCESSES equ 4
 proc_id:       times MAX_PROCESSES dw 0
@@ -9298,3 +9557,9 @@ proc_next_pid: dw 1
 proc_cur_slot: db 0                         ; slot index of currently running script
 kill_flag:     db 0                         ; set by Esc key or prs kill
 rr_content_ptr: dq 0                         ; cursor into script file content
+
+; --- large staging buffers. A file can span a whole 64-node volume slice, so
+; these are sized to hold a full file's content (EDIT_MAX). Declared at the
+; very end of the file, after all code, so any growth doesn't move anything. ---
+fs_next_scratch: times 512 db 0     ; staging for one full node_next sector
+fs_io_buf:  times EDIT_MAX db 0     ; editor + view/read/copy staging for multi-block files
