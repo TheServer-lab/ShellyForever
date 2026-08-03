@@ -1,5 +1,7 @@
 # ShellyForever
 
+**Version:** 0.1.1
+
 A 64-bit shell-based OS written entirely in x86-64 NASM assembly, from scratch —
 no C, no BIOS libraries beyond boot-time disk/keyboard calls, no existing kernel.
 
@@ -26,7 +28,7 @@ no C, no BIOS libraries beyond boot-time disk/keyboard calls, no existing kernel
 |---|---|---|
 | `cf` | `cf docs`, `cf ..`, `cf /home` | change folder |
 | `mkf` | `mkf docs` | make a folder in the current directory |
-| `mkfl` | `mkfl something.txt "some text"` | make a file with content |
+| `mkfl` | `mkfl something.txt "some text"` | make a file with content (`-force`/`-silent`/`-info`/`-test`) |
 | `del` | `del something.txt` | delete a file in the current folder (requires auth) |
 | `rname` | `rname old.txt new.txt` | rename a file or folder here |
 | `owrite` | `owrite hi.txt "new content"` | overwrite an existing file's content in place |
@@ -49,10 +51,15 @@ no C, no BIOS libraries beyond boot-time disk/keyboard calls, no existing kernel
 | `current` | `current` | print current path |
 | `wipe` | `wipe` | clear the screen |
 | `help` | `help` | list commands |
-| `dscan` | `dscan` | scan all ATA and AHCI drives for SFFS volumes |
+| `dscan` | `dscan` | scan all ATA and AHCI drives for SFFS volumes (shows each drive's `disk<N>` target label) |
 | `fmt` | `fmt data` | format the first unformatted drive with an SFFS label (`-force` to reuse one) |
+| `fmt` | `fmt disk1 data` | format a SPECIFIC drive by the `disk<N>` label `dscan` shows for it |
 | `mount` | `mount data` | mount a formatted drive's volume under `/<label>/` |
 | `label` | `label old new` | rename a formatted drive's label in place, without touching its files |
+| `ali` | `ali gs list ~ show` | create an alias: shorthand for a stored command (or chain of commands) |
+| `alis` | `alis` | list all aliases and their bodies |
+| `rmv ali` | `rmv ali gs` | remove one alias |
+| `color` | `color cyan`, `color list`, `color reset` | change the normal-text output color (16 VGA colors) |
 | `sync` | `sync` | save the filesystem (and mounted volumes) to disk |
 | `rboot` | `rboot` | save to disk, then restart (requires auth) |
 | `sdown` | `sdown` | save to disk, then shut down (requires auth) |
@@ -141,8 +148,8 @@ hi
 
 ### Elevation system (auth)
 
-Dangerous commands — `sdown`, `rboot`, `del`, and `vars rmv all` — require
-authentication. Prefix the command with `auth` (like `sudo`):
+Dangerous commands — `sdown`, `rboot`, `del`, `vars rmv all`, and `rmv ali
+all` — require authentication. Prefix the command with `auth` (like `sudo`):
 
 ```
 rush>/home: sdown
@@ -161,15 +168,16 @@ Authentication granted.
 done
 ```
 
-### Flags: `-force`, `-silent`, `-info`
+### Flags: `-force`, `-silent`, `-info`, `-test`
 
-`mkfl` supports three flags (passed as extra arguments after the content):
+`mkfl` supports four flags (passed as extra arguments after the content):
 
 | Flag | Effect |
 |---|---|
 | `-force` | Overwrite an existing file (prints a warning) |
 | `-silent` | Suppress the `-force` overwrite warning |
 | `-info` | Print verbose info: filename and content length |
+| `-test` | Dry run: report what would happen, make no changes |
 
 ```
 rush>/home: mkfl hi.txt "first" ; show hi
@@ -180,6 +188,18 @@ mkfl: overwriting existing file hi.txt
 rush>/home: mkfl hi.txt "third" -force -silent
 rush>/home: mkfl hi.txt "fourth" -info
 mkfl: creating 'hi.txt' (6 bytes)
+```
+
+`-test` works with or without content, and reports the same outcome a real
+run would have without ever touching the filesystem:
+
+```
+rush>/home: mkfl newfile.txt -test
+mkfl: [test] would create 'newfile.txt' (0 bytes) - test mode, no changes made
+rush>/home: mkfl hi.txt -test
+mkfl: [test] 'hi.txt' already exists - would fail (use -force to overwrite)
+rush>/home: mkfl hi.txt "changed" -force -test
+mkfl: [test] would overwrite 'hi.txt' (7 bytes) - test mode, no changes made
 ```
 
 ### Overwriting files with `owrite`
@@ -387,6 +407,46 @@ message and then nothing, which is your cue to power off manually.
 
 ## What's new
 
+- **`-test` flag for `mkfl`** — dry run: reports whether a file would be
+  created, overwritten, or rejected (already exists, no `-force`), and the
+  content length that would be written, without touching the filesystem.
+  Works whether or not content text is given (`mkfl new.txt -test` or
+  `mkfl new.txt "text" -test`). See "Flags" above.
+- **Aliases (`ali`/`alis`/`rmv ali`)** — `ali <name> <commands>` stores a
+  command (or `;`/`~` chain) verbatim under `<name>`; running `<name>`
+  re-runs it fresh, so it always sees the current variables/files. Aliases
+  can call other aliases (nested up to 8 deep). `alis` lists them all;
+  `rmv ali <name>` removes one; `auth rmv ali all` clears every alias.
+  ```
+  rush>/home: ali testmath calc 5 + 5 ~ = a ; show a
+  rush>/home: testmath
+  10
+  rush>/home: alis
+  Aliases:
+  testmath: calc 5 + 5 ~ = a ; show a
+  rush>/home: rmv ali testmath
+  ```
+- **`color`** — change the color normal output (`show`, `list`, etc.) is
+  printed in. All 16 standard VGA colors are available, with dark/light
+  variants: `color cyan`, `color dblue`, `color list` (see every name),
+  `color reset` (back to green). Prompt (yellow) and error (red) text are
+  left alone, since those colors are meaningful cues.
+- **Targeted `fmt`** — `dscan` now shows an original `disk<N>` label for
+  every drive that isn't already an SFFS volume, so you can format a
+  *specific* drive instead of whichever happens to be first-unformatted:
+  ```
+  rush>/home: dscan
+    device 1 (primary slave): present, not SFFS - fmt target: disk1
+  rush>/home: fmt disk1 backups
+  Formatted backups on primary slave. Use 'sync' to save, then 'mount backups'.
+  ```
+  `fmt <label>` (no target) still works exactly as before, for when there's
+  only one drive to format. Reformatting a drive that already has an SFFS
+  volume - whether targeted by its `disk<N>` label or its current label -
+  requires `-force`, same as before.
+- **Loading spinner** — `dscan` and `fmt` animate a small `|/-\` spinner
+  in place while they scan or write sectors, so a multi-drive scan or a
+  format doesn't look like the shell has frozen.
 - **`find` and `lookfor`** — `find <name>` searches every drive for a file
   or folder by exact name and prints its full path; `lookfor <text> <file>
   [limit <n>]` greps a file's content line by line, optionally restricted
@@ -423,10 +483,14 @@ message and then nothing, which is your cue to power off manually.
   - `-force`: overwrite an existing file (prints a warning)
   - `-silent`: suppress the `-force` overwrite warning
   - `-info`: print verbose info (filename + content length)
+  - (`-test` added later — see the entry at the top of this section)
 
 I built and test-assembled this (including `find`, `lookfor`, and `owrite`)
-in a sandbox with QEMU available but didn't get all the way through a full
-interactive boot test this session — every change has been verified to
-assemble cleanly with no errors, and I traced the logic carefully by hand,
-but you should run it in QEMU yourself to catch anything a static read-through
-can't — happy to help debug from there if something misbehaves.
+in a sandbox with QEMU available. The `-test` flag was verified end-to-end
+with an automated QEMU boot (screendump of the running shell confirmed the
+create/overwrite/blocked-without-`-force` messages all print correctly and
+no file content changes on disk). Earlier features were checked by assembling
+cleanly with no errors and a careful hand trace of the logic, but weren't all
+run interactively — worth exercising yourself in QEMU to catch anything a
+static read-through can't, and happy to help debug from there if something
+misbehaves.

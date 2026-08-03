@@ -41,6 +41,11 @@ MAX_VARS        equ 16
 VAR_NAME_LEN    equ 32
 MAX_CALC_TOKENS equ 32
 
+MAX_ALIASES     equ 12         ; how many "ali <name> <commands>" aliases can exist at once
+ALIAS_NAME_LEN  equ 32
+ALIAS_BODY_LEN  equ LINE_MAX   ; an alias body is at most one full input line
+ALIAS_MAX_DEPTH equ 8          ; guards against an alias (in)directly invoking itself
+
 PIPE_CAP_MAX    equ 192       ; max bytes captured from a "~" pipe's left side
 
 ; ------------------------------------------------------------------
@@ -118,7 +123,7 @@ kernel_entry:
     call fs_load                ; loads persisted fs from disk, or fs_init's a fresh one
 
     mov rsi, banner
-    mov al, ATTR_NORMAL
+    mov al, [cur_normal_attr]
     call print_string_attr
 
     cmp byte [fs_disk_available], 0
@@ -126,12 +131,12 @@ kernel_entry:
     cmp byte [fs_loaded_from_disk], 1
     je .say_loaded
     mov rsi, msg_fresh_fs
-    mov al, ATTR_NORMAL
+    mov al, [cur_normal_attr]
     call print_string_attr
     jmp .banner_done
 .say_loaded:
     mov rsi, msg_loaded_fs
-    mov al, ATTR_NORMAL
+    mov al, [cur_normal_attr]
     call print_string_attr
     jmp .banner_done
 .say_no_disk:
@@ -149,6 +154,14 @@ kernel_entry:
     
         ; skip $ comments (lines starting with $)
         cmp byte [line_buf], '$'
+        je .shell_loop
+
+        ; "ali <name> <commands>" defines an alias. This has to be
+        ; intercepted here, before ; chaining/tokenizing get anywhere
+        ; near the line, so that a body like "calc 5 + 5 ~ = a ; show a"
+        ; is stored verbatim instead of being split on ; or ~ right now.
+        call try_handle_ali_line
+        cmp al, 1
         je .shell_loop
     
         ; process ;-chained commands (tokenize + dispatch each segment)
@@ -803,6 +816,27 @@ dispatch:
     cmp al, 1
     je cmd_label
 
+    mov rsi, cmd_buf
+    mov rdi, str_alis
+    call str_eq
+    cmp al, 1
+    je cmd_alis
+
+    mov rsi, cmd_buf
+    mov rdi, str_color
+    call str_eq
+    cmp al, 1
+    je cmd_color
+
+    ; --- user-defined alias? (see "ali <name> <commands>") ---
+    mov rsi, cmd_buf
+    call alias_lookup
+    cmp rax, -1
+    je .no_alias_match
+    mov [alias_match_idx], al
+    jmp cmd_alias_invoke
+.no_alias_match:
+
     ; unknown command
     mov rsi, msg_unknown1
     mov al, ATTR_ERROR
@@ -909,6 +943,35 @@ cmd_mkfl:
     call print_string_attr
     ret
 .have_arg:
+    ; --- detect -test flag; it may land in arg2 (no content given, e.g.
+    ; "mkfl hi.txt -test") or in arg3/arg4 alongside real content/flags ---
+    mov byte [mkfl_test_flag], 0
+    lea rax, [arg2_buf]
+    mov [mkfl_content_ptr], rax
+    mov rsi, arg2_buf
+    mov rdi, str_test
+    call str_eq
+    cmp al, 1
+    jne .mkfl_arg2_not_test
+    mov byte [mkfl_test_flag], 1
+    lea rax, [empty_str]
+    mov [mkfl_content_ptr], rax
+.mkfl_arg2_not_test:
+    mov rsi, arg3_buf
+    mov rdi, str_test
+    call str_eq
+    cmp al, 1
+    jne .mkfl_arg3_not_test
+    mov byte [mkfl_test_flag], 1
+.mkfl_arg3_not_test:
+    mov rsi, arg4_buf
+    mov rdi, str_test
+    call str_eq
+    cmp al, 1
+    jne .mkfl_arg4_not_test
+    mov byte [mkfl_test_flag], 1
+.mkfl_arg4_not_test:
+
     mov rax, [cur_dir]
     mov rsi, arg1_buf
     mov rdi, leaf1_buf
@@ -922,6 +985,8 @@ cmd_mkfl:
     call fs_find_child
     cmp rax, -1
     jne .exists
+    cmp byte [mkfl_test_flag], 1
+    je .test_would_create
     mov rax, r11
     mov rsi, leaf1_buf
     mov r10, 2                  ; type file
@@ -951,7 +1016,7 @@ cmd_mkfl:
 
 .print_info_new:
     mov rsi, msg_mkfl_info
-    mov al, ATTR_NORMAL
+    mov al, [cur_normal_attr]
     call print_string_attr
     mov rsi, arg1_buf
     call print_string
@@ -979,6 +1044,23 @@ cmd_mkfl:
     ; rax = existing node index; save it (str_eq clobbers al)
     mov rbx, rax
 
+    cmp byte [mkfl_test_flag], 1
+    jne .exists_not_test
+    ; test mode: still check -force so the report matches what a real
+    ; run would do, but never touch the existing node either way
+    mov rsi, arg3_buf
+    mov rdi, str_force
+    call str_eq
+    cmp al, 1
+    je .test_would_overwrite
+    mov rsi, arg4_buf
+    mov rdi, str_force
+    call str_eq
+    cmp al, 1
+    je .test_would_overwrite
+    jmp .test_blocked_no_force
+.exists_not_test:
+
     ; Check -force flag in arg3_buf or arg4_buf
     mov rsi, arg3_buf
     mov rdi, str_force
@@ -1005,7 +1087,7 @@ cmd_mkfl:
     cmp al, 1
     je .overwrite
     mov rsi, msg_mkfl_overwrite
-    mov al, ATTR_NORMAL
+    mov al, [cur_normal_attr]
     call print_string_attr
     mov rsi, arg1_buf
     call print_string
@@ -1036,7 +1118,7 @@ cmd_mkfl:
 
 .print_info_overwrite:
     mov rsi, msg_mkfl_info
-    mov al, ATTR_NORMAL
+    mov al, [cur_normal_attr]
     call print_string_attr
     mov rsi, arg1_buf
     call print_string
@@ -1086,6 +1168,72 @@ cmd_mkfl:
     mov rsi, newline_str
     call print_string
     ret
+
+.test_would_create:
+    ; file doesn't exist yet and -test was given: report, touch nothing
+    mov rsi, msg_mkfl_test_create
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    mov rsi, arg1_buf
+    call print_string
+    mov rsi, msg_mkfl_info2
+    call print_string
+    mov rsi, [mkfl_content_ptr]
+    xor rcx, rcx
+.test_cr_strlen:
+    cmp byte [rsi], 0
+    je .test_cr_strlen_done
+    inc rcx
+    inc rsi
+    jmp .test_cr_strlen
+.test_cr_strlen_done:
+    mov rax, rcx
+    lea rdi, [show_num_buf]
+    call int_to_str
+    mov rsi, show_num_buf
+    call print_string
+    mov rsi, msg_mkfl_test_suffix
+    call print_string
+    jmp .mkfl_done
+
+.test_would_overwrite:
+    ; file exists and -force + -test were both given: report, touch nothing
+    mov rsi, msg_mkfl_test_overwrite
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    mov rsi, arg1_buf
+    call print_string
+    mov rsi, msg_mkfl_info2
+    call print_string
+    mov rsi, [mkfl_content_ptr]
+    xor rcx, rcx
+.test_ov_strlen:
+    cmp byte [rsi], 0
+    je .test_ov_strlen_done
+    inc rcx
+    inc rsi
+    jmp .test_ov_strlen
+.test_ov_strlen_done:
+    mov rax, rcx
+    lea rdi, [show_num_buf]
+    call int_to_str
+    mov rsi, show_num_buf
+    call print_string
+    mov rsi, msg_mkfl_test_suffix
+    call print_string
+    jmp .mkfl_done
+
+.test_blocked_no_force:
+    ; file exists, -test given, no -force: a real run would refuse - say so
+    mov rsi, msg_mkfl_test_blocked1
+    mov al, ATTR_ERROR
+    call print_string_attr
+    mov rsi, arg1_buf
+    call print_string
+    mov rsi, msg_mkfl_test_blocked2
+    call print_string
+    ret
+
 .mkfl_done:
     ret
 
@@ -1096,7 +1244,7 @@ cmd_show:
     cmp cl, 1
     je .show_var
     mov rsi, arg1_buf
-    mov al, ATTR_NORMAL
+    mov al, [cur_normal_attr]
     call print_string_attr
     mov rsi, newline_str
     call print_string
@@ -1105,7 +1253,7 @@ cmd_show:
     lea rdi, [show_num_buf]
     call int_to_str
     mov rsi, show_num_buf
-    mov al, ATTR_NORMAL
+    mov al, [cur_normal_attr]
     call print_string_attr
     mov rsi, newline_str
     call print_string
@@ -1162,7 +1310,7 @@ cmd_calc:
     lea rdi, [calc_out_buf]
     call int_to_str
     mov rsi, calc_out_buf
-    mov al, ATTR_NORMAL
+    mov al, [cur_normal_attr]
     call print_string_attr
     mov rsi, newline_str
     call print_string
@@ -1217,7 +1365,7 @@ cmd_edit:
     call print_string_attr
 
     lea rsi, [edit_buf]
-    mov al, ATTR_NORMAL
+    mov al, [cur_normal_attr]
     call print_string_attr
 
     lea rsi, [edit_buf]
@@ -1243,7 +1391,7 @@ cmd_edit:
     inc r14
     mov byte [rdi + r14], 0
     push rbx
-    mov bl, ATTR_NORMAL
+    mov bl, [cur_normal_attr]
     call putchar
     pop rbx
     jmp .ce_loop
@@ -1291,7 +1439,7 @@ cmd_edit:
     call str_copy
     call clear_screen
     mov rsi, msg_saved
-    mov al, ATTR_NORMAL
+    mov al, [cur_normal_attr]
     call print_string_attr
     pop r14
     pop r15
@@ -1299,7 +1447,7 @@ cmd_edit:
 .ce_discard:
     call clear_screen
     mov rsi, msg_discarded
-    mov al, ATTR_NORMAL
+    mov al, [cur_normal_attr]
     call print_string_attr
     pop r14
     pop r15
@@ -1337,7 +1485,7 @@ cmd_ls:
     mov rdi, r9
     imul rdi, NAME_LEN
     lea rsi, [node_name + rdi]
-    mov al, ATTR_NORMAL
+    mov al, [cur_normal_attr]
     call print_string_attr
     cmp byte [node_type + r9], 1
     jne .isfile
@@ -1380,7 +1528,7 @@ cmd_cat:
     mov rdi, rax
     imul rdi, CONTENT_LEN
     lea rsi, [node_content + rdi]
-    mov al, ATTR_NORMAL
+    mov al, [cur_normal_attr]
     call print_string_attr
     mov rsi, newline_str
     call print_string
@@ -1408,7 +1556,7 @@ cmd_help:
     cmp byte [arg1_buf], 0
     jne help_lookup
     mov rsi, help_text
-    mov al, ATTR_NORMAL
+    mov al, [cur_normal_attr]
     call print_string_attr
     ret
 
@@ -1499,6 +1647,18 @@ help_lookup:
     call str_eq
     cmp al, 1
     je .h_vars
+
+    mov rsi, arg1_buf
+    mov rdi, str_ali
+    call str_eq
+    cmp al, 1
+    je .h_ali
+
+    mov rsi, arg1_buf
+    mov rdi, str_alis
+    call str_eq
+    cmp al, 1
+    je .h_alis
 
     mov rsi, arg1_buf
     mov rdi, str_calc
@@ -1656,6 +1816,12 @@ help_lookup:
 .h_vars:
     mov rsi, help_vars
     jmp .h_print
+.h_ali:
+    mov rsi, help_ali
+    jmp .h_print
+.h_alis:
+    mov rsi, help_alis
+    jmp .h_print
 .h_calc:
     mov rsi, help_calc
     jmp .h_print
@@ -1708,7 +1874,7 @@ help_lookup:
     mov rsi, help_dollar
 
 .h_print:
-    mov al, ATTR_NORMAL
+    mov al, [cur_normal_attr]
     call print_string_attr
     ret
 
@@ -1717,7 +1883,7 @@ cmd_sync:
     call fs_save
     jc .fail
     mov rsi, msg_synced
-    mov al, ATTR_NORMAL
+    mov al, [cur_normal_attr]
     call print_string_attr
     ret
 .fail:
@@ -1733,13 +1899,14 @@ cmd_dscan:
     push r13
     push r15
     mov rsi, msg_dscan_header
-    mov al, ATTR_NORMAL
+    mov al, [cur_normal_attr]
     call print_string_attr
     xor r15, r15                ; found-any flag
     xor r13, r13                ; device id
 .scan:
     cmp r13, TOTAL_DEVICES
     jae .done
+    call spinner_step
     mov al, r13b
     call disk_select_device
     mov rax, SUPER_LBA
@@ -1760,7 +1927,7 @@ cmd_dscan:
     ; valid SFFS volume
     mov r15, 1
     mov rsi, msg_dscan_found1   ; "  device "
-    mov al, ATTR_NORMAL
+    mov al, [cur_normal_attr]
     call print_string_attr
     mov rax, r13
     lea rdi, [show_num_buf]
@@ -1784,7 +1951,7 @@ cmd_dscan:
     ; a drive is there but it isn't ours
     mov r15, 1
     mov rsi, msg_dscan_found1   ; "  device "
-    mov al, ATTR_NORMAL
+    mov al, [cur_normal_attr]
     call print_string_attr
     mov rax, r13
     lea rdi, [show_num_buf]
@@ -1797,16 +1964,23 @@ cmd_dscan:
     call print_device_name
     mov rsi, msg_dscan_other2   ; "): present, not SFFS"
     call print_string
+    mov rsi, msg_dscan_orig     ; " - fmt target: "
+    call print_string
+    mov al, r13b
+    call gen_orig_label
+    mov rsi, orig_label_buf
+    call print_string
     mov rsi, newline_str
     call print_string
 .next:
     inc r13
     jmp .scan
 .done:
+    call spinner_clear
     cmp r15, 0
     jne .has
     mov rsi, msg_dscan_none
-    mov al, ATTR_NORMAL
+    mov al, [cur_normal_attr]
     call print_string_attr
 .has:
     pop r15
@@ -1859,8 +2033,13 @@ print_device_name:
 
 ; ------------------------------------------------------------
 ; cmd_format: format a drive with the SFFS format and give it a label.
-;   fmt <label>             first present drive that isn't SFFS yet        
-;   fmt <label> -force      first present drive (even an existing volume)  
+;   fmt <label>                       first unformatted drive gets this label
+;   fmt <label> -force                first present drive (even an existing volume)
+;   fmt <target> <new-label> [-force] format a SPECIFIC drive: <target> is
+;                                      either the original label dscan shows
+;                                      for it ("disk0", "disk1", ...) or an
+;                                      existing SFFS volume's current label
+;                                      (requires -force to reformat it)
 ; The boot drive (device 0) is never touched unless -force is given.
 cmd_format:
     cmp byte [arg1_buf], 0
@@ -1870,70 +2049,184 @@ cmd_format:
     call print_string_attr
     ret
 .have_arg:
+    xor r15b, r15b                      ; force = 0 by default
+    cmp byte [arg2_buf], 0
+    je .single_setup                    ; fmt <label>
+    mov rsi, arg2_buf
+    mov rdi, str_force
+    call str_eq
+    cmp al, 1
+    je .single_force_setup              ; fmt <label> -force
+    jmp .target_setup                   ; fmt <target> <new-label> [-force]
+
+.single_setup:
     mov rsi, arg1_buf
     call str_len
     cmp rax, 32
     jae .too_long
-    ; find the target device
+    lea rdi, [fmt_new_label]
+    mov rsi, arg1_buf
+    call str_copy
+    jmp .scan_first_unformatted
+
+.single_force_setup:
+    mov rsi, arg1_buf
+    call str_len
+    cmp rax, 32
+    jae .too_long
+    mov r15b, 1
+    lea rdi, [fmt_new_label]
+    mov rsi, arg1_buf
+    call str_copy
+    jmp .scan_first_unformatted
+
+.target_setup:
+    mov rsi, arg2_buf
+    call str_len
+    cmp rax, 32
+    jae .too_long
+    mov rsi, arg3_buf
+    mov rdi, str_force
+    call str_eq
+    cmp al, 1
+    jne .ts_noforce
+    mov r15b, 1
+.ts_noforce:
+    lea rdi, [fmt_new_label]
+    mov rsi, arg2_buf
+    call str_copy
+    jmp .scan_by_target
+
+; --- form 1: first unformatted drive (or, with -force, first present drive
+; that already has an SFFS volume) - original behaviour, unchanged. ---
+.scan_first_unformatted:
     xor r13, r13                ; device being scanned
     xor rbx, rbx                ; last valid SFFS device seen (for -force)
     mov r14b, 0                 ; any valid SFFS device seen?
-.scan:
+.fu_scan:
     cmp r13, TOTAL_DEVICES
-    jae .scan_done
+    jae .fu_scan_done
     mov al, r13b
     call disk_select_device
     mov rax, SUPER_LBA
     lea rdi, [fs_super_buf]
     call disk_read_sector
-    jc .next                    ; absent
+    jc .fu_next                 ; absent
     cmp byte [fs_super_buf+0], 'S'
-    jne .unformatted
+    jne .fu_unformatted
     cmp byte [fs_super_buf+1], 'F'
-    jne .unformatted
+    jne .fu_unformatted
     cmp byte [fs_super_buf+2], 'F'
-    jne .unformatted
+    jne .fu_unformatted
     cmp byte [fs_super_buf+3], 'S'
-    jne .unformatted
+    jne .fu_unformatted
     cmp byte [fs_super_buf+4], SFFS_VERSION
-    jne .unformatted
+    jne .fu_unformatted
     ; already an SFFS volume - remember it for the -force path
     mov rbx, r13
     mov r14b, 1
-    jmp .next
-.unformatted:
+    jmp .fu_next
+.fu_unformatted:
     ; skip the boot drive (device 0) unless -force; it holds the OS
     cmp r13, 0
-    je .next
-    jmp .found
-.next:
+    je .fu_next
+    jmp .format_target
+.fu_next:
     inc r13
-    jmp .scan
-.scan_done:
-    mov rsi, arg2_buf
-    mov rdi, str_force
-    call str_eq
-    cmp al, 1
-    jne .none
+    jmp .fu_scan
+.fu_scan_done:
+    cmp r15b, 1
+    jne .fu_none
     cmp r14b, 1
-    jne .none
+    jne .fu_none
     mov r13, rbx
     jmp .format_target
-.none:
+.fu_none:
     mov rsi, msg_fmt_none
     mov al, ATTR_ERROR
     call print_string_attr
     ret
+
+; --- form 2: a specific drive, chosen by its original "diskN" label or by
+; an existing SFFS label. ---
+.scan_by_target:
+    xor r13, r13
+.tg_scan:
+    cmp r13, TOTAL_DEVICES
+    jae .tg_not_found
+    mov al, r13b
+    call disk_select_device
+    mov rax, SUPER_LBA
+    lea rdi, [fs_super_buf]
+    call disk_read_sector
+    jc .tg_next                 ; absent - can't be a target
+    ; does the original "diskN" label match?
+    mov al, r13b
+    call gen_orig_label
+    mov rsi, arg1_buf
+    mov rdi, orig_label_buf
+    call str_eq
+    cmp al, 1
+    je .tg_found_orig
+    ; does it already hold an SFFS volume whose label matches?
+    cmp byte [fs_super_buf+0], 'S'
+    jne .tg_next
+    cmp byte [fs_super_buf+1], 'F'
+    jne .tg_next
+    cmp byte [fs_super_buf+2], 'F'
+    jne .tg_next
+    cmp byte [fs_super_buf+3], 'S'
+    jne .tg_next
+    cmp byte [fs_super_buf+4], SFFS_VERSION
+    jne .tg_next
+    mov rsi, arg1_buf
+    lea rdi, [fs_super_buf + SUPER_LABEL_OFF]
+    call str_eq
+    cmp al, 1
+    jne .tg_next
+    ; matched an existing SFFS volume by its current label - reformatting
+    ; it (even to the same label) is destructive, so require -force
+    cmp r15b, 1
+    je .format_target
+    mov rsi, msg_fmt_already
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+.tg_found_orig:
+    ; matched by the original diskN label - still don't touch the boot
+    ; drive (device 0) unless -force
+    cmp r13, 0
+    jne .format_target
+    cmp r15b, 1
+    je .format_target
+    mov rsi, msg_fmt_boot_drive
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+.tg_next:
+    inc r13
+    jmp .tg_scan
+.tg_not_found:
+    mov rsi, msg_fmt_no_such
+    mov al, ATTR_ERROR
+    call print_string_attr
+    mov rsi, arg1_buf
+    call print_string
+    mov rsi, newline_str
+    call print_string
+    ret
+
 .too_long:
     mov rsi, msg_fmt_long
     mov al, ATTR_ERROR
     call print_string_attr
     ret
-.found:
-    ; format the first unformatted drive we hit
+
 .format_target:
+    ; format the drive now selected in r13, labelling it fmt_new_label
     mov al, r13b
     call disk_select_device
+    call spinner_step
     ; superblock: magic + version + label
     mov rdi, fs_super_buf
     mov rcx, 512 / 8
@@ -1944,7 +2237,7 @@ cmd_format:
     mov byte [fs_super_buf+2], 'F'
     mov byte [fs_super_buf+3], 'S'
     mov byte [fs_super_buf+4], SFFS_VERSION
-    mov rsi, arg1_buf
+    mov rsi, fmt_new_label
     lea rdi, [fs_super_buf + SUPER_LABEL_OFF]
     call str_copy
     mov rax, SUPER_LBA
@@ -1976,7 +2269,7 @@ cmd_format:
     mov rcx, 512 / 8
     xor rax, rax
     rep stosq
-    mov rsi, arg1_buf
+    mov rsi, fmt_new_label
     lea rdi, [fs_super_buf]
     call str_copy
     mov rax, NAME_LBA
@@ -1984,6 +2277,7 @@ cmd_format:
 .name_wr:
     push rax
     push rcx
+    call spinner_step
     lea rsi, [fs_super_buf]
     call disk_write_sector
     pop rcx
@@ -2001,6 +2295,7 @@ cmd_format:
 .content_wr:
     push rax
     push rcx
+    call spinner_step
     lea rsi, [fs_super_buf]
     call disk_write_sector
     pop rcx
@@ -2008,11 +2303,12 @@ cmd_format:
     jc .disk_err
     inc rax
     loop .content_wr
+    call spinner_clear
     ; report
     mov rsi, msg_fmt_ok1
-    mov al, ATTR_NORMAL
+    mov al, [cur_normal_attr]
     call print_string_attr
-    mov rsi, arg1_buf
+    mov rsi, fmt_new_label
     call print_string
     mov rsi, msg_fmt_ok2
     call print_string
@@ -2027,6 +2323,29 @@ cmd_format:
     mov rsi, msg_fmt_err
     mov al, ATTR_ERROR
     call print_string_attr
+    ret
+
+; gen_orig_label: al = device id. Fills orig_label_buf with that device's
+; original, always-available label ("disk0", "disk1", ...), derived purely
+; from its slot number so it's stable and known before anything is ever
+; formatted - this is what 'fmt <target> <new-label>' matches against to
+; pick a specific drive instead of guessing "the first unformatted one".
+gen_orig_label:
+    push rax
+    push rdi
+    push rsi
+    movzx rax, al
+    lea rdi, [orig_label_buf]
+    mov rsi, str_disk_prefix
+    call str_copy
+    lea rdi, [orig_label_num_tmp]
+    call int_to_str
+    lea rdi, [orig_label_buf]
+    mov rsi, orig_label_num_tmp
+    call str_append
+    pop rsi
+    pop rdi
+    pop rax
     ret
 
 ; ------------------------------------------------------------
@@ -2128,7 +2447,7 @@ cmd_mount:
     call str_copy
     ; report
     mov rsi, msg_mount_ok1      ; "Mounted "
-    mov al, ATTR_NORMAL
+    mov al, [cur_normal_attr]
     call print_string_attr
     mov rsi, arg1_buf
     call print_string
@@ -2308,7 +2627,7 @@ cmd_label:
     jmp .mount_check
 .report:
     mov rsi, msg_label_ok1      ; "Relabeled '"
-    mov al, ATTR_NORMAL
+    mov al, [cur_normal_attr]
     call print_string_attr
     mov rsi, arg1_buf
     call print_string
@@ -2446,6 +2765,13 @@ cmd_rmv:
     call print_string_attr
     ret
 .have_arg:
+    ; "rmv ali <name>" / "auth rmv ali all" - alias removal, not a variable
+    mov rsi, arg1_buf
+    mov rdi, str_ali
+    call str_eq
+    cmp al, 1
+    je .rmv_ali
+
     mov rsi, arg1_buf
     call var_find
     cmp rax, -1
@@ -2470,6 +2796,53 @@ cmd_rmv:
     call print_string
     ret
 
+.rmv_ali:
+    cmp byte [arg2_buf], 0
+    jne .rmv_ali_have_name
+    mov rsi, msg_need_name
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+.rmv_ali_have_name:
+    ; "rmv ali all" only clears everything when run as "auth rmv ali all"
+    mov rsi, arg2_buf
+    mov rdi, str_rmv_all
+    call str_eq
+    cmp al, 1
+    je .rmv_ali_all
+
+    mov rsi, arg2_buf
+    call alias_lookup
+    cmp rax, -1
+    je .rmv_ali_not_found
+    mov rcx, rax
+    mov byte [alias_used + rcx], 0
+    ret
+.rmv_ali_not_found:
+    mov rsi, msg_no_alias
+    mov al, ATTR_ERROR
+    call print_string_attr
+    mov rsi, arg2_buf
+    call print_string
+    mov rsi, newline_str
+    call print_string
+    ret
+
+.rmv_ali_all:
+    cmp byte [auth_valid], 0
+    jne .rmv_ali_all_ok
+    mov rsi, msg_auth_required
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+.rmv_ali_all_ok:
+    mov byte [auth_valid], 0
+    call aliases_clear_all
+    mov rsi, msg_aliases_cleared
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    ret
+
 ; ------------------------------------------------------------
 ; cmd_sdown: save the filesystem, then power off. Tries a real ACPI
 ; shutdown first (finds the FADT/_S5 via the RSDP, which is what real
@@ -2486,7 +2859,7 @@ cmd_sdown:
 .sdown_ok:
     call fs_save
     mov rsi, msg_shutting_down
-    mov al, ATTR_NORMAL
+    mov al, [cur_normal_attr]
     call print_string_attr
     call acpi_shutdown            ; if this works, we never come back
     mov dx, 0x604                ; QEMU (older versions) ACPI PM control
@@ -3233,7 +3606,7 @@ cmd_rr:
 
     ; Print "runrush <filename> (pid N)"
     mov rsi, msg_rr_running
-    mov al, ATTR_NORMAL
+    mov al, [cur_normal_attr]
     call print_string_attr
     mov rsi, arg1_buf
     call print_string
@@ -3242,7 +3615,7 @@ cmd_rr:
     lea rdi, [show_num_buf]
     call int_to_str
     mov rsi, msg_rr_pid1
-    mov al, ATTR_NORMAL
+    mov al, [cur_normal_attr]
     call print_string_attr
     mov rsi, show_num_buf
     call print_string
@@ -3300,6 +3673,13 @@ cmd_rr:
     cmp byte [line_buf], 0
     je .rr_next_line
 
+    ; "ali <name> <commands>" defines an alias - same raw-line
+    ; interception as the interactive shell (see try_handle_ali_line),
+    ; so alias bodies containing ; or ~ survive intact inside scripts too.
+    call try_handle_ali_line
+    cmp al, 1
+    je .rr_next_line
+
     ; Process ;-chained commands with kill_flag checks between segments
     call process_chain_rr
 
@@ -3311,7 +3691,7 @@ cmd_rr:
     mov rdi, rax
     call proc_free_slot
     mov rsi, msg_rr_done
-    mov al, ATTR_NORMAL
+    mov al, [cur_normal_attr]
     call print_string_attr
     ret
 
@@ -3390,7 +3770,7 @@ cmd_prs:
 .kill_found_pid:
     mov byte [kill_flag], 1
     mov rsi, msg_prs_killed
-    mov al, ATTR_NORMAL
+    mov al, [cur_normal_attr]
     call print_string_attr
     mov rax, r12
     lea rdi, [show_num_buf]
@@ -3422,7 +3802,7 @@ cmd_prs:
 .kill_found_rushrun:
     mov byte [kill_flag], 1
     mov rsi, msg_prs_killed
-    mov al, ATTR_NORMAL
+    mov al, [cur_normal_attr]
     call print_string_attr
     mov rsi, str_rushrun
     call print_string
@@ -3445,7 +3825,7 @@ cmd_prs:
 ; prs_show: display process table
 prs_show:
     mov rsi, msg_prs_header
-    mov al, ATTR_NORMAL
+    mov al, [cur_normal_attr]
     call print_string_attr
     xor r13, r13
 .prs_show_loop:
@@ -3457,14 +3837,14 @@ prs_show:
     lea rdi, [show_num_buf]
     call int_to_str
     mov rsi, show_num_buf
-    mov al, ATTR_NORMAL
+    mov al, [cur_normal_attr]
     call print_string_attr
     mov rsi, prs_spaces
     call print_string
     mov rax, r13
     imul rax, 32
     lea rsi, [proc_name + rax]
-    mov al, ATTR_NORMAL
+    mov al, [cur_normal_attr]
     call print_string_attr
     mov rsi, newline_str
     call print_string
@@ -3494,7 +3874,7 @@ cmd_auth:
 
     ; Print auth message
     mov rsi, msg_auth_granted
-    mov al, ATTR_NORMAL
+    mov al, [cur_normal_attr]
     call print_string_attr
 
     ; Shift arguments: arg1 -> cmd_buf, arg2 -> arg1_buf, etc.
@@ -3548,7 +3928,7 @@ cmd_vars:
     mov byte [auth_valid], 0
     call vars_clear_all
     mov rsi, msg_vars_cleared
-    mov al, ATTR_NORMAL
+    mov al, [cur_normal_attr]
     call print_string_attr
     ret
 
@@ -3570,7 +3950,7 @@ vars_list:
     push rsi
 
     mov rsi, msg_vars_header
-    mov al, ATTR_NORMAL
+    mov al, [cur_normal_attr]
     call print_string_attr
 
     xor rcx, rcx                    ; variable index
@@ -3583,7 +3963,7 @@ vars_list:
     mov rdi, rcx
     imul rdi, VAR_NAME_LEN
     lea rsi, [var_name + rdi]
-    mov al, ATTR_NORMAL
+    mov al, [cur_normal_attr]
     call print_string_attr
     mov rsi, msg_vars_sep
     call print_string
@@ -3592,7 +3972,7 @@ vars_list:
     lea rdi, [show_num_buf]
     call int_to_str
     mov rsi, show_num_buf
-    mov al, ATTR_NORMAL
+    mov al, [cur_normal_attr]
     call print_string_attr
     mov rsi, newline_str
     call print_string
@@ -3632,6 +4012,625 @@ vars_clear_all:
     pop rcx
     pop rax
     ret
+
+; ============================================================
+;  Aliases ("ali <name> <commands>")
+;
+;  An alias binds a name to an arbitrary command string (which may
+;  itself contain ; chains and a ~ pipe). Defining one is intercepted
+;  as raw text before ; splitting ever sees it (try_handle_ali_line,
+;  called from the interactive shell loop and from cmd_rr's script
+;  loop); invoking one happens inside dispatch, when cmd_buf doesn't
+;  match any built-in command but does match an alias name.
+; ============================================================
+
+; try_handle_ali_line: line_buf holds a raw, not-yet-tokenized input
+; line. If it starts with the exact word "ali" followed by a name and
+; at least one command, stores the alias and returns al=1 (caller
+; should treat the line as fully handled and not process it further).
+; Otherwise returns al=0 and leaves line_buf untouched, so the caller
+; processes the line normally.
+try_handle_ali_line:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+
+    mov al, [line_buf]
+    cmp al, 'a'
+    jne .thal_no
+    mov al, [line_buf+1]
+    cmp al, 'l'
+    jne .thal_no
+    mov al, [line_buf+2]
+    cmp al, 'i'
+    jne .thal_no
+    mov al, [line_buf+3]
+    cmp al, ' '
+    jne .thal_no             ; "ali" alone (NUL) or a longer word ("alias")
+
+    lea rsi, [line_buf+4]
+.thal_skip_sp1:
+    cmp byte [rsi], ' '
+    jne .thal_name_start
+    inc rsi
+    jmp .thal_skip_sp1
+.thal_name_start:
+    cmp byte [rsi], 0
+    jne .thal_read_name
+    jmp .thal_usage           ; only whitespace after "ali" - no name
+
+.thal_read_name:
+    lea rdi, [ali_name_tmp]
+    xor rcx, rcx
+.thal_name_loop:
+    mov dl, [rsi]
+    cmp dl, 0
+    je .thal_name_done
+    cmp dl, ' '
+    je .thal_name_done
+    cmp rcx, ALIAS_NAME_LEN-1
+    jae .thal_name_skipchar   ; name too long: keep scanning, stop storing
+    mov [rdi+rcx], dl
+    inc rcx
+.thal_name_skipchar:
+    inc rsi
+    jmp .thal_name_loop
+.thal_name_done:
+    mov byte [rdi+rcx], 0
+
+    cmp byte [rsi], 0
+    jne .thal_skip_sp2
+    jmp .thal_usage           ; got a name but nothing after it
+
+.thal_skip_sp2:
+    cmp byte [rsi], ' '
+    jne .thal_body_check
+    inc rsi
+    jmp .thal_skip_sp2
+.thal_body_check:
+    cmp byte [rsi], 0
+    jne .thal_have_body
+    jmp .thal_usage           ; only whitespace after the name
+
+.thal_have_body:
+    ; rsi -> rest of the line, verbatim (kept as-is, ; and ~ included)
+    lea rdi, [ali_body_tmp]
+    call str_copy
+    call alias_store
+    mov al, 1
+    jmp .thal_ret
+
+.thal_usage:
+    mov rsi, msg_alias_usage
+    mov al, ATTR_ERROR
+    call print_string_attr
+    mov al, 1
+    jmp .thal_ret
+
+.thal_no:
+    mov al, 0
+
+.thal_ret:
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; alias_store: stores ali_name_tmp/ali_body_tmp into the alias table,
+; overwriting an existing alias of the same name if one exists,
+; otherwise using the first free slot. Prints an error if the table
+; is full and the name isn't already present.
+alias_store:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+
+    mov rbx, -1               ; rbx = first free slot seen so far
+    xor rcx, rcx
+.as_scan:
+    cmp rcx, MAX_ALIASES
+    jae .as_scan_done
+    cmp byte [alias_used + rcx], 0
+    je .as_free_candidate
+    mov rdi, rcx
+    imul rdi, ALIAS_NAME_LEN
+    lea rdi, [alias_names + rdi]
+    mov rsi, ali_name_tmp
+    call str_eq
+    cmp al, 1
+    je .as_write              ; existing alias with this name - overwrite
+    jmp .as_scan_next
+.as_free_candidate:
+    cmp rbx, -1
+    jne .as_scan_next
+    mov rbx, rcx
+.as_scan_next:
+    inc rcx
+    jmp .as_scan
+.as_scan_done:
+    cmp rbx, -1
+    je .as_full
+    mov rcx, rbx
+    mov byte [alias_used + rcx], 1
+    jmp .as_write
+
+.as_full:
+    mov rsi, msg_alias_full
+    mov al, ATTR_ERROR
+    call print_string_attr
+    jmp .as_ret
+
+.as_write:
+    mov rdi, rcx
+    imul rdi, ALIAS_NAME_LEN
+    lea rdi, [alias_names + rdi]
+    mov rsi, ali_name_tmp
+    call str_copy
+    mov rdi, rcx
+    imul rdi, ALIAS_BODY_LEN
+    lea rdi, [alias_bodies + rdi]
+    mov rsi, ali_body_tmp
+    call str_copy
+
+.as_ret:
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; alias_lookup: rsi = name to find. Returns rax = alias index, or -1.
+alias_lookup:
+    push rbx
+    push rcx
+    push rdi
+    mov rbx, rsi
+    xor rcx, rcx
+.al_loop:
+    cmp rcx, MAX_ALIASES
+    jae .al_notfound
+    cmp byte [alias_used + rcx], 0
+    je .al_next
+    mov rdi, rcx
+    imul rdi, ALIAS_NAME_LEN
+    lea rdi, [alias_names + rdi]
+    mov rsi, rbx
+    call str_eq
+    cmp al, 1
+    je .al_found
+.al_next:
+    inc rcx
+    jmp .al_loop
+.al_found:
+    mov rax, rcx
+    pop rdi
+    pop rcx
+    pop rbx
+    ret
+.al_notfound:
+    mov rax, -1
+    pop rdi
+    pop rcx
+    pop rbx
+    ret
+
+; cmd_alias_invoke: called from dispatch when cmd_buf matched an alias
+; name, with [alias_match_idx] set to that alias's table index. Runs
+; the alias's stored body exactly like a freshly-typed line, through
+; the same chain processor (process_chain or process_chain_rr) that's
+; currently active, so ; chaining and ~ piping inside the alias work
+; normally and nested alias calls work too.
+;
+; This has to protect two pieces of global, shared state that would
+; otherwise be clobbered by that nested call:
+;   - chain_scan_buf: the outer process_chain(_rr) is still mid-scan
+;     over it (via r12/r13), so it's backed up on the stack, restored
+;     after the nested call returns. r12/r13 are ordinary registers,
+;     saved/restored by normal callee-saved discipline, so only the
+;     memory needs protecting, not the pointers themselves.
+;   - chain_is_rr: process_chain/process_chain_rr each set this as a
+;     side effect, so it's saved and restored too, otherwise an alias
+;     call partway through an rr script could leave later segments in
+;     that script using the wrong dispatch-wrapping behaviour.
+; alias_depth guards against runaway recursion (an alias that invokes
+; itself, directly or indirectly) overrunning the stack.
+cmd_alias_invoke:
+    push rax
+    push rbx
+
+    movzx rax, byte [alias_depth]
+    cmp rax, ALIAS_MAX_DEPTH
+    jl .cai_depth_ok
+    mov rsi, msg_alias_too_deep
+    mov al, ATTR_ERROR
+    call print_string_attr
+    pop rbx
+    pop rax
+    ret
+.cai_depth_ok:
+    inc byte [alias_depth]
+
+    movzx rax, byte [chain_is_rr]
+    push rax                        ; saved chain_is_rr, at [rsp+224] after the sub below
+
+    sub rsp, 224                    ; > LINE_MAX, room to back up chain_scan_buf
+    mov rsi, chain_scan_buf
+    mov rdi, rsp
+    call str_copy
+
+    movzx rax, byte [alias_match_idx]
+    mov rbx, ALIAS_BODY_LEN
+    imul rax, rbx
+    lea rsi, [alias_bodies + rax]
+    mov rdi, line_buf
+    call str_copy
+
+    mov rax, [rsp+224]
+    cmp al, 0
+    je .cai_plain
+    call process_chain_rr
+    jmp .cai_after
+.cai_plain:
+    call process_chain
+.cai_after:
+
+    mov rsi, rsp
+    mov rdi, chain_scan_buf
+    call str_copy
+    add rsp, 224
+
+    pop rax
+    mov [chain_is_rr], al
+
+    dec byte [alias_depth]
+    pop rbx
+    pop rax
+    ret
+
+; ------------------------------------------------------------
+; cmd_alis: list user-defined aliases.
+;   alis                list all aliases and their bodies
+; Removing aliases is done via cmd_rmv instead, for consistency with
+; how variables are removed:
+;   rmv ali <name>      remove one alias
+;   auth rmv ali all     remove every alias (requires auth, since it's
+;                         destructive)
+cmd_alis:
+    call aliases_list
+    ret
+
+; aliases_list: print every defined alias as "name: body"
+aliases_list:
+    push rbx
+    push rcx
+    push rdi
+    push rsi
+
+    mov rsi, msg_alis_header
+    mov al, [cur_normal_attr]
+    call print_string_attr
+
+    xor rcx, rcx
+.aal_loop:
+    cmp rcx, MAX_ALIASES
+    jae .aal_done
+    cmp byte [alias_used + rcx], 0
+    je .aal_next
+    mov rdi, rcx
+    imul rdi, ALIAS_NAME_LEN
+    lea rsi, [alias_names + rdi]
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    mov rsi, msg_alis_sep
+    call print_string
+    mov rdi, rcx
+    imul rdi, ALIAS_BODY_LEN
+    lea rsi, [alias_bodies + rdi]
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    mov rsi, newline_str
+    call print_string
+.aal_next:
+    inc rcx
+    jmp .aal_loop
+.aal_done:
+    pop rsi
+    pop rdi
+    pop rcx
+    pop rbx
+    ret
+
+; aliases_clear_all: clear every alias in the table
+aliases_clear_all:
+    push rax
+    push rcx
+    push rdi
+    push r8
+    xor r8, r8
+.aca_loop:
+    cmp r8, MAX_ALIASES
+    jae .aca_done
+    mov byte [alias_used + r8], 0
+    mov rdi, r8
+    imul rdi, ALIAS_NAME_LEN
+    lea rdi, [alias_names + rdi]
+    mov rcx, ALIAS_NAME_LEN
+    xor al, al
+    rep stosb
+    mov rdi, r8
+    imul rdi, ALIAS_BODY_LEN
+    lea rdi, [alias_bodies + rdi]
+    mov rcx, ALIAS_BODY_LEN
+    xor al, al
+    rep stosb
+    inc r8
+    jmp .aca_loop
+.aca_done:
+    pop r8
+    pop rdi
+    pop rcx
+    pop rax
+    ret
+
+; ============================================================
+;  color: change the foreground color used for normal ("show", "list",
+;  etc.) output. Prompt (yellow) and error (red) messages are
+;  deliberately left alone, since those colors are meaningful cues.
+;    color               show current color + the list of names
+;    color list          just the list of names
+;    color reset         back to the default (green)
+;    color <name>        set it
+; ============================================================
+cmd_color:
+    cmp byte [arg1_buf], 0
+    jne .col_have_arg
+    call color_print_list
+    ret
+
+.col_have_arg:
+    mov rsi, arg1_buf
+    mov rdi, str_col_list
+    call str_eq
+    cmp al, 1
+    je .col_list
+
+    mov rsi, arg1_buf
+    mov rdi, str_col_reset
+    call str_eq
+    cmp al, 1
+    je .col_do_reset
+
+    mov rsi, arg1_buf
+    mov rdi, str_col_black
+    call str_eq
+    cmp al, 1
+    je .col_black
+
+    mov rsi, arg1_buf
+    mov rdi, str_col_dblue
+    call str_eq
+    cmp al, 1
+    je .col_dblue
+
+    mov rsi, arg1_buf
+    mov rdi, str_col_blue
+    call str_eq
+    cmp al, 1
+    je .col_blue
+
+    mov rsi, arg1_buf
+    mov rdi, str_col_lblue
+    call str_eq
+    cmp al, 1
+    je .col_blue
+
+    mov rsi, arg1_buf
+    mov rdi, str_col_dgreen
+    call str_eq
+    cmp al, 1
+    je .col_dgreen
+
+    mov rsi, arg1_buf
+    mov rdi, str_col_green
+    call str_eq
+    cmp al, 1
+    je .col_green
+
+    mov rsi, arg1_buf
+    mov rdi, str_col_lgreen
+    call str_eq
+    cmp al, 1
+    je .col_green
+
+    mov rsi, arg1_buf
+    mov rdi, str_col_dcyan
+    call str_eq
+    cmp al, 1
+    je .col_dcyan
+
+    mov rsi, arg1_buf
+    mov rdi, str_col_cyan
+    call str_eq
+    cmp al, 1
+    je .col_cyan
+
+    mov rsi, arg1_buf
+    mov rdi, str_col_lcyan
+    call str_eq
+    cmp al, 1
+    je .col_cyan
+
+    mov rsi, arg1_buf
+    mov rdi, str_col_dred
+    call str_eq
+    cmp al, 1
+    je .col_dred
+
+    mov rsi, arg1_buf
+    mov rdi, str_col_red
+    call str_eq
+    cmp al, 1
+    je .col_red
+
+    mov rsi, arg1_buf
+    mov rdi, str_col_lred
+    call str_eq
+    cmp al, 1
+    je .col_red
+
+    mov rsi, arg1_buf
+    mov rdi, str_col_dmagenta
+    call str_eq
+    cmp al, 1
+    je .col_dmagenta
+
+    mov rsi, arg1_buf
+    mov rdi, str_col_magenta
+    call str_eq
+    cmp al, 1
+    je .col_magenta
+
+    mov rsi, arg1_buf
+    mov rdi, str_col_lmagenta
+    call str_eq
+    cmp al, 1
+    je .col_magenta
+
+    mov rsi, arg1_buf
+    mov rdi, str_col_purple
+    call str_eq
+    cmp al, 1
+    je .col_magenta
+
+    mov rsi, arg1_buf
+    mov rdi, str_col_brown
+    call str_eq
+    cmp al, 1
+    je .col_brown
+
+    mov rsi, arg1_buf
+    mov rdi, str_col_orange
+    call str_eq
+    cmp al, 1
+    je .col_brown
+
+    mov rsi, arg1_buf
+    mov rdi, str_col_gray
+    call str_eq
+    cmp al, 1
+    je .col_gray
+
+    mov rsi, arg1_buf
+    mov rdi, str_col_grey
+    call str_eq
+    cmp al, 1
+    je .col_gray
+
+    mov rsi, arg1_buf
+    mov rdi, str_col_dgray
+    call str_eq
+    cmp al, 1
+    je .col_dgray
+
+    mov rsi, arg1_buf
+    mov rdi, str_col_dgrey
+    call str_eq
+    cmp al, 1
+    je .col_dgray
+
+    mov rsi, arg1_buf
+    mov rdi, str_col_yellow
+    call str_eq
+    cmp al, 1
+    je .col_yellow
+
+    mov rsi, arg1_buf
+    mov rdi, str_col_white
+    call str_eq
+    cmp al, 1
+    je .col_white
+
+    ; not recognized
+    mov rsi, msg_color_unknown
+    mov al, ATTR_ERROR
+    call print_string_attr
+    mov rsi, arg1_buf
+    call print_string
+    mov rsi, newline_str
+    call print_string
+    ret
+
+.col_black:    mov dl, 0x00
+               jmp .col_apply
+.col_dblue:    mov dl, 0x01
+               jmp .col_apply
+.col_dgreen:   mov dl, 0x02
+               jmp .col_apply
+.col_dcyan:    mov dl, 0x03
+               jmp .col_apply
+.col_dred:     mov dl, 0x04
+               jmp .col_apply
+.col_dmagenta: mov dl, 0x05
+               jmp .col_apply
+.col_brown:    mov dl, 0x06
+               jmp .col_apply
+.col_gray:     mov dl, 0x07
+               jmp .col_apply
+.col_dgray:    mov dl, 0x08
+               jmp .col_apply
+.col_blue:     mov dl, 0x09
+               jmp .col_apply
+.col_green:    mov dl, 0x0A
+               jmp .col_apply
+.col_cyan:     mov dl, 0x0B
+               jmp .col_apply
+.col_red:      mov dl, 0x0C
+               jmp .col_apply
+.col_magenta:  mov dl, 0x0D
+               jmp .col_apply
+.col_yellow:   mov dl, 0x0E
+               jmp .col_apply
+.col_white:    mov dl, 0x0F
+               jmp .col_apply
+.col_do_reset:
+    mov dl, ATTR_NORMAL
+
+.col_apply:
+    mov [cur_normal_attr], dl
+    mov rsi, msg_color_set1
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    mov rsi, arg1_buf
+    call print_string
+    mov rsi, msg_color_set2
+    call print_string
+    ret
+
+.col_list:
+    call color_print_list
+    ret
+
+; color_print_list: print the current color and every available name
+color_print_list:
+    mov rsi, msg_color_current
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    mov rsi, newline_str
+    call print_string
+    mov rsi, color_list_text
+    mov al, ATTR_NORMAL
+    call print_string_attr
+    ret
+
 ; ============================================================
 fs_init:
     mov rdi, node_type
@@ -5890,7 +6889,7 @@ update_cursor:
 ; print_string: rsi = null terminated string, default attribute
 print_string:
     push rax
-    mov al, ATTR_NORMAL
+    mov al, [cur_normal_attr]
     call print_string_attr
     pop rax
     ret
@@ -5965,7 +6964,10 @@ putchar:
     mov [rdi], al
     cmp bl, 0
     jne .useattr
-    mov byte [rdi+1], ATTR_NORMAL
+    push rax
+    mov al, [cur_normal_attr]
+    mov [rdi+1], al
+    pop rax
     jmp .advance
 .useattr:
     mov [rdi+1], bl
@@ -6017,6 +7019,47 @@ scroll_screen:
     pop rdi
     pop rsi
     pop rcx
+    pop rax
+    ret
+
+; ============================================================
+;  loading spinner: a tiny |/-\ animation for operations that take a
+;  visible moment (scanning drives, formatting). spinner_step draws one
+;  frame at the current cursor cell and steps the cursor back onto that
+;  same cell, so repeated calls animate in place instead of scrolling
+;  text across the screen; spinner_clear blanks that cell again once
+;  the operation is done, leaving the cursor exactly where it was.
+; ============================================================
+spinner_idx: db 0
+spinner_frames: db '|','/','-','\'
+
+spinner_step:
+    push rax
+    push rbx
+    push rcx
+    movzx rax, byte [spinner_idx]
+    and al, 3
+    movzx rcx, al
+    mov al, [spinner_frames + rcx]
+    mov bl, [cur_normal_attr]
+    call putchar
+    dec byte [cursor_col]
+    call update_cursor
+    inc byte [spinner_idx]
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+spinner_clear:
+    push rax
+    push rbx
+    mov al, ' '
+    mov bl, [cur_normal_attr]
+    call putchar
+    dec byte [cursor_col]
+    call update_cursor
+    pop rbx
     pop rax
     ret
 
@@ -6353,7 +7396,7 @@ read_line:
     jae .loop
     mov [r9 + r8], al
     inc r8
-    mov bl, ATTR_NORMAL
+    mov bl, [cur_normal_attr]
     call putchar
     jmp .loop
 .bksp:
@@ -6446,7 +7489,7 @@ read_line:
     jae .le_echo_done
     mov al, [r9 + rcx]
     push rbx
-    mov bl, ATTR_NORMAL
+    mov bl, [cur_normal_attr]
     call putchar
     pop rbx
     inc rcx
@@ -6528,6 +7571,7 @@ cursor_col:   db 0
 shift_state:  db 0
 cur_dir:      dq 0
 auth_valid:   db 0                   ; set by 'auth' command, checked by dangerous commands
+cur_normal_attr: db ATTR_NORMAL      ; foreground color used for normal output; changed by 'color'
 
 ; --- keyboard/scrollback/history state ---
 ctrl_state:    db 0                  ; 1 while either Ctrl key is held
@@ -6546,7 +7590,7 @@ history_buf:         times HISTORY_MAX*LINE_MAX db 0
 history_saved_line:  times LINE_MAX db 0
 
 banner:
-    db "ShellyForever v0.1 -- 'help' for commands", 10, 0
+    db "ShellyForever v0.1.1 -- 'help' for commands", 10, 0
 
 prompt_head: db "rush>", 0
 prompt_tail: db ": ", 0
@@ -6584,10 +7628,63 @@ str_eq_sign: db "=", 0
 str_home_name: db "home", 0
 str_auth:   db "auth", 0
 str_vars:   db "vars", 0
+str_ali:    db "ali", 0
+str_alis:   db "alis", 0
+str_color:  db "color", 0
+str_col_black:    db "black", 0
+str_col_dblue:    db "dblue", 0
+str_col_blue:     db "blue", 0
+str_col_lblue:    db "lblue", 0
+str_col_dgreen:   db "dgreen", 0
+str_col_green:    db "green", 0
+str_col_lgreen:   db "lgreen", 0
+str_col_dcyan:    db "dcyan", 0
+str_col_cyan:     db "cyan", 0
+str_col_lcyan:    db "lcyan", 0
+str_col_dred:     db "dred", 0
+str_col_red:      db "red", 0
+str_col_lred:     db "lred", 0
+str_col_dmagenta: db "dmagenta", 0
+str_col_magenta:  db "magenta", 0
+str_col_lmagenta: db "lmagenta", 0
+str_col_purple:   db "purple", 0
+str_col_brown:    db "brown", 0
+str_col_orange:   db "orange", 0
+str_col_gray:     db "gray", 0
+str_col_grey:     db "grey", 0
+str_col_dgray:    db "dgray", 0
+str_col_dgrey:    db "dgrey", 0
+str_col_yellow:   db "yellow", 0
+str_col_white:    db "white", 0
+str_col_reset:    db "reset", 0
+str_col_list:     db "list", 0
+
+msg_color_unknown: db "color: unknown color name: ", 0
+msg_color_set1:    db "color: normal text set to ", 0
+msg_color_set2:    db 10, 0
+msg_color_current: db "This is the current color.", 0
+color_list_text:
+    db "Available colors (normal-text only; prompt/error colors are fixed):", 10
+    db "  black", 10
+    db "  dblue    blue    lblue", 10
+    db "  dgreen   green   lgreen", 10
+    db "  dcyan    cyan    lcyan", 10
+    db "  dred     red     lred", 10
+    db "  dmagenta magenta lmagenta  purple", 10
+    db "  brown    orange", 10
+    db "  gray     grey", 10
+    db "  dgray    dgrey", 10
+    db "  yellow", 10
+    db "  white", 10
+    db "  reset             (back to the default green)", 10
+    db "e.g. color cyan | color list | color reset", 10, 0
+
 str_rmv_all: db "all", 0
 str_force:  db "-force", 0
 str_silent: db "-silent", 0
 str_info:   db "-info", 0
+str_test:   db "-test", 0
+empty_str:  db 0
 str_dscan:  db "dscan", 0
 str_format: db "fmt", 0
 str_mount:  db "mount", 0
@@ -6626,6 +7723,7 @@ msg_dscan_found2: db " (", 0
 msg_dscan_found3: db "): SFFS volume '", 0
 msg_dscan_found4: db "'", 0
 msg_dscan_other2: db "): present, not SFFS", 0
+msg_dscan_orig:    db " - fmt target: ", 0
 msg_dscan_none:   db "No SFFS disks found.", 10, 0
 msg_dev_primary:  db "primary ", 0
 msg_dev_secondary: db "secondary ", 0
@@ -6635,10 +7733,14 @@ msg_dev_ahci:     db "ahci port ", 0
 msg_fmt_usage:    db "fmt: use 'fmt <label>' to format a drive", 10, 0
 msg_fmt_none:     db "fmt: no unformatted drive found (use 'fmt <label> -force' to reuse one)", 10, 0
 msg_fmt_long:     db "fmt: label too long (max 31 characters)", 10, 0
+msg_fmt_no_such:  db "fmt: no such drive: ", 0
+msg_fmt_already:  db "fmt: that drive is already formatted - use -force to reformat it", 10, 0
+msg_fmt_boot_drive: db "fmt: that's the boot drive - use -force to reformat it", 10, 0
 msg_fmt_ok1:      db "Formatted ", 0
 msg_fmt_ok2:      db " on ", 0
 msg_fmt_ok3:      db ". Use 'sync' to save, then 'mount <label>'.", 0
 msg_fmt_err:      db "fmt: disk error - failed to write.", 10, 0
+str_disk_prefix:  db "disk", 0
 msg_mount_usage:  db "mount: use 'mount <label>' to mount a formatted drive", 10, 0
 msg_mount_none:   db "mount: no disk labeled '", 0
 msg_mount_none2:  db "' found. Run 'dscan'.", 10, 0
@@ -6688,10 +7790,22 @@ msg_auth_granted:  db "Authentication granted.", 10, 0
 msg_vars_header:   db "Variables:", 10, 0
 msg_vars_sep:     db " = ", 0
 msg_vars_cleared:  db "All variables cleared.", 10, 0
+msg_alias_usage:   db "error: usage: ali <name> <commands>", 10, 0
+msg_alias_full:    db "error: alias table is full", 10, 0
+msg_alias_too_deep: db "error: alias recursion too deep", 10, 0
+msg_no_alias:      db "alis: no such alias: ", 0
+msg_alis_header:   db "Aliases:", 10, 0
+msg_alis_sep:      db ": ", 0
+msg_aliases_cleared: db "All aliases cleared.", 10, 0
 msg_mkfl_overwrite: db "mkfl: overwriting existing file ", 0
 msg_mkfl_info:     db "mkfl: creating '", 0
 msg_mkfl_info2:    db "' (", 0
 msg_mkfl_info3:    db " bytes)", 10, 0
+msg_mkfl_test_create:    db "mkfl: [test] would create '", 0
+msg_mkfl_test_overwrite: db "mkfl: [test] would overwrite '", 0
+msg_mkfl_test_suffix:    db " bytes) - test mode, no changes made", 10, 0
+msg_mkfl_test_blocked1:  db "mkfl: [test] '", 0
+msg_mkfl_test_blocked2:  db "' already exists - would fail (use -force to overwrite)", 10, 0
 
 help_text:
     db "Commands (name args accept paths: docs/notes.txt, ../x, /home/x):", 10
@@ -6710,16 +7824,22 @@ help_text:
     db "  prs [kill <id>]    list processes, or kill by PID/rushrun", 10
     db "  vars               list all variables", 10
     db "  vars rmv all       clear all variables (requires auth)", 10
+    db "  ali <name> <cmds>  create an alias, e.g. ali gs list ~ show", 10
+    db "  alis               list all aliases", 10
+    db "  rmv ali <name>     remove one alias", 10
     db "  auth <cmd> [args]  elevate privileges for one dangerous command", 10
     db "  mkfl -force        overwrite existing file (use -silent to suppress warning)", 10
     db "  mkfl -info         verbose output (filename + content length)", 10
+    db "  mkfl -test         dry run - report what would happen, no changes made", 10
     db "  <name> = <value>   set a variable, e.g. a = 1", 10
     db "  rmv <name>         remove a variable", 10
+    db "  rmv ali all        clear all aliases (requires auth)", 10
     db "  calc <expr>        evaluate math, e.g. calc 1 + 2 * 3", 10
     db "  current            print current path", 10
     db "  wipe               clear the screen", 10
     db "  sync               save the filesystem (and mounted drives) to disk", 10
     db "  fmt <label>        format a drive with the SFFS format (-force reuses one)", 10
+    db "  fmt <target> <lbl> format a SPECIFIC drive (see dscan's 'fmt target:')", 10
     db "  dscan              scan for SFFS drives attached to the ATA bus", 10
     db "  mount <label>      mount a formatted drive at /<label>/", 10
     db "  label <old> <new>  rename a formatted drive without touching its data", 10
@@ -6747,12 +7867,14 @@ help_mkf:
     db "  e.g. mkf docs", 10, 0
 
 help_mkfl:
-    db 'mkfl <path> "text" [-force] [-silent] [-info]', 10
+    db 'mkfl <path> "text" [-force] [-silent] [-info] [-test]', 10
     db "  Make a file here with the given text content.", 10
     db "  -force overwrites an existing file (prints a warning).", 10
     db "  -silent suppresses that overwrite warning.", 10
     db "  -info prints the filename and content length.", 10
-    db '  e.g. mkfl hi.txt "hello" -force -silent', 10, 0
+    db "  -test dry run: reports what would happen, makes no changes.", 10
+    db '  e.g. mkfl hi.txt "hello" -force -silent', 10
+    db '       mkfl hi.txt -test', 10, 0
 
 help_show:
     db 'show "text" | show <name>', 10
@@ -6796,13 +7918,28 @@ help_assign:
     db "  value.  e.g. a = 5", 10, 0
 
 help_rmv:
-    db "rmv <name>", 10
-    db "  Remove a variable.", 10, 0
+    db "rmv <name> | rmv ali <name> | rmv ali all", 10
+    db "  Remove a variable, or (with 'ali') remove one alias by name.", 10
+    db "  Clearing every alias at once requires auth:", 10
+    db "  auth rmv ali all", 10, 0
 
 help_vars:
     db "vars | vars rmv all", 10
     db "  List all variables, or clear all of them. Clearing requires", 10
     db "  auth: auth vars rmv all", 10, 0
+
+help_ali:
+    db "ali <name> <commands>", 10
+    db "  Create (or redefine) an alias: <name> becomes shorthand for", 10
+    db "  <commands>, which is stored verbatim - including any ; chains", 10
+    db "  or ~ pipes - and run fresh each time the alias is invoked.", 10
+    db '  e.g. ali testmath calc 5 + 5 ~ = a ; show a', 10
+    db "       testmath            (running the alias prints 10)", 10, 0
+
+help_alis:
+    db "alis", 10
+    db "  List all aliases and their bodies. To remove one, use", 10
+    db "  'rmv ali <name>'; to clear all of them, use 'auth rmv ali all'.", 10, 0
 
 help_calc:
     db "calc <expr>", 10
@@ -6825,7 +7962,7 @@ help_auth:
     db "auth <command> [args]", 10
     db "  Elevate privileges for the one command that immediately", 10
     db "  follows (like sudo). Required for: sdown, rboot, del,", 10
-    db "  and vars rmv all.  e.g. auth sdown", 10, 0
+    db "  vars rmv all, and rmv ali all.  e.g. auth sdown", 10, 0
 
 help_pwd:
     db "current", 10
@@ -6846,9 +7983,11 @@ help_dscan:
     db "  which ones are formatted.", 10, 0
 
 help_fmt:
-    db "fmt <label> [-force]", 10
-    db "  Format the first unformatted drive with an SFFS label.", 10
-    db "  -force lets you reuse an already-formatted, non-boot drive.", 10, 0
+    db "fmt <label> [-force] | fmt <target> <label> [-force]", 10
+    db "  fmt <label>            formats the first unformatted drive.", 10
+    db "  fmt <target> <label>   formats a SPECIFIC drive: <target> is the", 10
+    db "  'disk0'/'disk1'/... shown by dscan (or an existing SFFS", 10
+    db "  label, with -force, to reformat that drive in place).", 10, 0
 
 help_mount:
     db "mount <label>", 10
@@ -6929,6 +8068,9 @@ kbd_shift:
 ; as a black screen after 'mount' corrupted the node table).
 ALIGN 8
 fs_super_buf:   times 512 db 0        ; scratch for reading/building superblocks
+fmt_new_label:      times 40 db 0     ; label being applied by the current 'fmt'
+orig_label_buf:      times 40 db 0    ; scratch: a device's generated "diskN" label
+orig_label_num_tmp:  times 12 db 0    ; scratch: decimal digits for gen_orig_label
 fs_parent_scratch: times 512 db 0     ; staging for one full parent sector (512B)
 mount_label:   times MAX_MOUNTS*32 db 0     ; label of each mounted volume
 mount_device:  times MAX_MOUNTS db 0        ; device id each volume came from
@@ -6944,6 +8086,10 @@ node_content: times MAX_NODES*CONTENT_LEN db 0
 fs_loaded_from_disk: db 0
 fs_disk_available:   db 1     ; optimistic default; cleared on first ATA failure
 fs_name_too_long:    db 0     ; set by fs_create_node when a name won't fit
+
+mkfl_test_flag:      db 0     ; set by cmd_mkfl when -test appears in arg2/3/4
+ALIGN 8
+mkfl_content_ptr:     dq 0     ; points at the effective content string for -test reporting
 
 ALIGN 8
 ata_port_base: dw 0x1F0        ; 0x1F0 primary channel, 0x170 secondary
@@ -7011,6 +8157,14 @@ ALIGN 8
 var_name:  times MAX_VARS*VAR_NAME_LEN db 0
 var_value: times MAX_VARS dq 0
 var_used:  times MAX_VARS db 0
+
+alias_names:  times MAX_ALIASES*ALIAS_NAME_LEN db 0
+alias_bodies: times MAX_ALIASES*ALIAS_BODY_LEN db 0
+alias_used:   times MAX_ALIASES db 0
+ali_name_tmp: times ALIAS_NAME_LEN db 0   ; scratch: name parsed by try_handle_ali_line
+ali_body_tmp: times ALIAS_BODY_LEN db 0   ; scratch: body parsed by try_handle_ali_line
+alias_match_idx: db 0                     ; set by dispatch before jmp cmd_alias_invoke
+alias_depth:     db 0                     ; nested alias-invocation depth (recursion guard)
 
 ; --- calc evaluator scratch ---
 ALIGN 8
