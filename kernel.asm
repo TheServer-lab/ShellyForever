@@ -15,6 +15,7 @@ VGA_ROWS        equ 25
 ATTR_NORMAL     equ 0x0A          ; bright green on black
 ATTR_PROMPT     equ 0x0E          ; yellow
 ATTR_ERROR      equ 0x0C          ; red
+ATTR_WIG        equ 0x0B          ; light cyan - used by the wig clock widget
 
 OS_NODES        equ 64              ; nodes per volume (each drive holds its own 64-node table)
 MAX_MOUNTS      equ 2               ; how many extra drives can be mounted at once
@@ -811,6 +812,12 @@ dispatch:
     je cmd_mount
 
     mov rsi, cmd_buf
+    mov rdi, str_unmount
+    call str_eq
+    cmp al, 1
+    je cmd_unmount
+
+    mov rsi, cmd_buf
     mov rdi, str_label
     call str_eq
     cmp al, 1
@@ -827,6 +834,36 @@ dispatch:
     call str_eq
     cmp al, 1
     je cmd_color
+
+    mov rsi, cmd_buf
+    mov rdi, str_date
+    call str_eq
+    cmp al, 1
+    je cmd_date
+
+    mov rsi, cmd_buf
+    mov rdi, str_time
+    call str_eq
+    cmp al, 1
+    je cmd_time
+
+    mov rsi, cmd_buf
+    mov rdi, str_write
+    call str_eq
+    cmp al, 1
+    je cmd_write
+
+    mov rsi, cmd_buf
+    mov rdi, str_wig
+    call str_eq
+    cmp al, 1
+    je cmd_wig
+
+    mov rsi, cmd_buf
+    mov rdi, str_shelly
+    call str_eq
+    cmp al, 1
+    je cmd_shelly
 
     ; --- user-defined alias? (see "ali <name> <commands>") ---
     mov rsi, cmd_buf
@@ -1721,6 +1758,12 @@ help_lookup:
     je .h_mount
 
     mov rsi, arg1_buf
+    mov rdi, str_unmount
+    call str_eq
+    cmp al, 1
+    je .h_unmount
+
+    mov rsi, arg1_buf
     mov rdi, str_label
     call str_eq
     cmp al, 1
@@ -1761,6 +1804,36 @@ help_lookup:
     call str_eq
     cmp al, 1
     je .h_dollar
+
+    mov rsi, arg1_buf
+    mov rdi, str_date
+    call str_eq
+    cmp al, 1
+    je .h_date
+
+    mov rsi, arg1_buf
+    mov rdi, str_time
+    call str_eq
+    cmp al, 1
+    je .h_time
+
+    mov rsi, arg1_buf
+    mov rdi, str_write
+    call str_eq
+    cmp al, 1
+    je .h_write
+
+    mov rsi, arg1_buf
+    mov rdi, str_wig
+    call str_eq
+    cmp al, 1
+    je .h_wig
+
+    mov rsi, arg1_buf
+    mov rdi, str_shelly
+    call str_eq
+    cmp al, 1
+    je .h_shelly
 
     ; unknown command name
     mov rsi, msg_help_unknown1
@@ -1852,6 +1925,9 @@ help_lookup:
 .h_mount:
     mov rsi, help_mount
     jmp .h_print
+.h_unmount:
+    mov rsi, help_unmount
+    jmp .h_print
 .h_label:
     mov rsi, help_label
     jmp .h_print
@@ -1873,6 +1949,23 @@ help_lookup:
 .h_dollar:
     mov rsi, help_dollar
 
+.h_date:
+    mov rsi, help_date
+    jmp .h_print
+.h_time:
+    mov rsi, help_time
+    jmp .h_print
+.h_write:
+    mov rsi, help_write
+    jmp .h_print
+.h_wig:
+    mov rsi, help_wig
+    jmp .h_print
+
+.h_shelly:
+    mov rsi, help_shelly
+    jmp .h_print
+
 .h_print:
     mov al, [cur_normal_attr]
     call print_string_attr
@@ -1882,11 +1975,13 @@ help_lookup:
 cmd_sync:
     call fs_save
     jc .fail
+    call spinner_clear
     mov rsi, msg_synced
     mov al, [cur_normal_attr]
     call print_string_attr
     ret
 .fail:
+    call spinner_clear
     mov rsi, msg_sync_failed
     mov al, ATTR_ERROR
     call print_string_attr
@@ -2385,6 +2480,7 @@ cmd_mount:
 .scan:
     cmp r13, TOTAL_DEVICES
     jae .not_found
+    call spinner_step
     mov al, r13b
     call disk_select_device
     mov rax, SUPER_LBA
@@ -2421,6 +2517,7 @@ cmd_mount:
     jmp .slot_loop
 .slot_ok:
     ; base node = VOL_NODES * (slot + 1)
+    call spinner_step
     mov rdi, r12
     inc rdi
     imul rdi, VOL_NODES
@@ -2428,6 +2525,7 @@ cmd_mount:
     call vol_read
     cmp rax, -1
     je .load_fail
+    call spinner_clear
     ; record the mount
     mov byte [mount_used + r12], 1
     mov byte [mount_device + r12], r13b
@@ -2474,6 +2572,7 @@ cmd_mount:
     call print_string
     ret
 .not_found:
+    call spinner_clear
     mov rsi, msg_mount_none
     mov al, ATTR_ERROR
     call print_string_attr
@@ -2483,14 +2582,116 @@ cmd_mount:
     call print_string
     ret
 .too_many:
+    call spinner_clear
     mov rsi, msg_mount_full
     mov al, ATTR_ERROR
     call print_string_attr
     ret
 .load_fail:
+    call spinner_clear
     mov rsi, msg_mount_fail
     mov al, ATTR_ERROR
     call print_string_attr
+    ret
+
+; ------------------------------------------------------------
+; cmd_unmount: detach a mounted drive's volume from the filesystem.
+;   unmount <label>
+; Drops the mount slot (so 'sync' stops writing that volume back) and
+; frees the volume's whole node slice in memory, making /<label>/ vanish
+; from the tree. The data stays untouched on the drive - 'dscan' +
+; 'mount' re-attach it. Refuses while the current directory is inside
+; the volume, since that would strand the shell inside a freed tree.
+cmd_unmount:
+    cmp byte [arg1_buf], 0
+    jne .have_arg
+    mov rsi, msg_unmount_usage
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+.have_arg:
+    ; find the mount slot whose label matches
+    xor r12, r12
+.find_loop:
+    cmp r12, MAX_MOUNTS
+    jae .not_mounted
+    cmp byte [mount_used + r12], 0
+    je .find_next
+    mov rax, r12
+    imul rax, 32
+    lea rsi, [mount_label + rax]
+    mov rdi, arg1_buf
+    call str_eq
+    cmp al, 1
+    je .found
+.find_next:
+    inc r12
+    jmp .find_loop
+.found:
+    ; base node index of this mount's slice
+    mov rax, r12
+    inc rax
+    imul rax, VOL_NODES
+    ; refuse if the current directory lives inside this volume
+    mov rbx, [cur_dir]
+    mov rcx, rax
+    add rcx, VOL_NODES
+    cmp rbx, rax
+    jb .ok
+    cmp rbx, rcx
+    jb .busy
+.ok:
+    ; clear the mount slot
+    mov byte [mount_used + r12], 0
+    mov byte [mount_device + r12], 0
+    mov rdi, r12
+    imul rdi, 32
+    lea rdi, [mount_label + rdi]
+    mov rcx, 32
+    xor al, al
+    rep stosb
+    ; free the whole slice so the volume disappears from the tree
+    lea rdi, [node_type + rax]
+    mov rcx, VOL_NODES
+    xor al, al
+    rep stosb
+    ; clear the root node's name too
+    mov rax, r12
+    inc rax
+    imul rax, VOL_NODES
+    imul rax, NAME_LEN
+    lea rdi, [node_name + rax]
+    mov rcx, NAME_LEN
+    xor al, al
+    rep stosb
+    ; report
+    mov rsi, msg_unmount_ok1
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    mov rsi, arg1_buf
+    call print_string
+    mov rsi, msg_unmount_ok2
+    call print_string
+    mov rsi, newline_str
+    call print_string
+    ret
+.busy:
+    mov rsi, msg_unmount_busy1
+    mov al, ATTR_ERROR
+    call print_string_attr
+    mov rsi, arg1_buf
+    call print_string
+    mov rsi, msg_unmount_busy2
+    call print_string
+    ret
+.not_mounted:
+    mov rsi, msg_unmount_none1
+    mov al, ATTR_ERROR
+    call print_string_attr
+    mov rsi, arg1_buf
+    call print_string
+    mov rsi, msg_unmount_none2
+    call print_string
     ret
 
 ; ------------------------------------------------------------
@@ -6047,6 +6248,7 @@ vol_write:
     push rax
     push rcx
     push rsi
+    call spinner_step
     call disk_write_sector
     pop rsi
     pop rcx
@@ -6066,6 +6268,7 @@ vol_write:
     push rax
     push rcx
     push rsi
+    call spinner_step
     call disk_write_sector
     pop rsi
     pop rcx
@@ -6664,8 +6867,499 @@ eval_expr:
     ret
 
 ; ============================================================
-;  SHELL / STRING HELPERS
+;  RTC / CMOS CLOCK  (date, time, wig time)
 ; ============================================================
+; The MC146818 real-time clock chip is addressed through port 0x70
+; (register index, bit 7 disables NMIs while set) and 0x71 (data).
+; All values come back BCD-encoded unless status register B's binary
+; bit is set, and hours may be 12-hour mode - rtc_update normalizes
+; everything to plain 24-hour binary before storing it.
+
+; cmos_read: al = register index (0..0x3F) -> al = that register's value.
+cmos_read:
+    push rdx
+    or al, 0x80                 ; set NMI-disable bit while selecting
+    mov dx, 0x70
+    out dx, al
+    ; tiny I/O delay so the RTC latches the address before the data read
+    push rax
+    mov al, 0
+    out 0x80, al                ; write to the unused POST port = short pause
+    pop rax
+    mov dx, 0x71
+    in al, dx
+    pop rdx
+    ret
+
+; rtc_wait_uip: waits until the RTC's Update-In-Progress flag (status A,
+; bit 7) clears, so the registers read below are internally consistent.
+rtc_wait_uip:
+    push rax
+.uip_wait:
+    mov al, 0x0A
+    call cmos_read
+    test al, 0x80
+    jnz .uip_wait
+    pop rax
+    ret
+
+; bcd_to_bin: al = BCD byte -> al = binary value. Preserves other regs.
+bcd_to_bin:
+    push rbx
+    push rcx
+    push rdx
+    movzx rbx, al
+    mov al, bl
+    shr al, 4
+    movzx rcx, al
+    imul rcx, 10
+    mov al, bl
+    and al, 0x0F
+    movzx rdx, al
+    add rcx, rdx
+    mov rax, rcx
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; rtc_update: reads seconds/minutes/hours/day/month/year (+ century, if the
+; chip provides one) into the rtc_* variables, normalized to 24-hour binary.
+rtc_update:
+    push rax
+    push rbx
+    call rtc_wait_uip
+    mov al, 0x00
+    call cmos_read
+    mov [rtc_sec], al
+    mov al, 0x02
+    call cmos_read
+    mov [rtc_min], al
+    mov al, 0x04
+    call cmos_read
+    mov [rtc_hour], al
+    mov al, 0x07
+    call cmos_read
+    mov [rtc_day], al
+    mov al, 0x08
+    call cmos_read
+    mov [rtc_month], al
+    mov al, 0x09
+    call cmos_read
+    mov [rtc_year], al
+    mov al, 0x32
+    call cmos_read
+    mov [rtc_century], al
+    mov al, 0x0B
+    call cmos_read
+    mov bl, al                     ; status register B
+    ; BCD? (status B bit 2). If clear, values are already binary.
+    test bl, 0x04
+    jz .rtc_no_bcd
+    mov al, [rtc_sec]
+    call bcd_to_bin
+    mov [rtc_sec], al
+    mov al, [rtc_min]
+    call bcd_to_bin
+    mov [rtc_min], al
+    mov al, [rtc_hour]
+    call bcd_to_bin
+    mov [rtc_hour], al
+    mov al, [rtc_day]
+    call bcd_to_bin
+    mov [rtc_day], al
+    mov al, [rtc_month]
+    call bcd_to_bin
+    mov [rtc_month], al
+    mov al, [rtc_year]
+    call bcd_to_bin
+    mov [rtc_year], al
+    mov al, [rtc_century]
+    call bcd_to_bin
+    mov [rtc_century], al
+.rtc_no_bcd:
+    ; 12-hour mode? (status B bit 1). If set, hour's bit 7 = PM.
+    test bl, 0x02
+    jz .rtc_done
+    mov al, [rtc_hour]
+    mov ah, al
+    and al, 0x7F                  ; hour value 1..12
+    test ah, 0x80                 ; PM?
+    jz .rtc_am
+    cmp al, 12
+    jae .rtc_h12                  ; 12 PM stays 12
+    add al, 12
+    jmp .rtc_h12
+.rtc_am:
+    cmp al, 12
+    jne .rtc_h12
+    xor al, al                    ; 12 AM = 00
+.rtc_h12:
+    mov [rtc_hour], al
+.rtc_done:
+    pop rbx
+    pop rax
+    ret
+
+; format_num2: rax = 0..99 -> two zero-padded digits written to [rdi], rdi
+; advances by 2. Preserves rax/rbx/rcx/rdx.
+format_num2:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    xor rdx, rdx
+    mov rbx, 10
+    div rbx                       ; rax = tens, rdx = ones
+    add al, '0'
+    mov [rdi], al
+    inc rdi
+    mov al, dl
+    add al, '0'
+    mov [rdi], al
+    inc rdi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; format_num4: rax = 0..9999 -> four zero-padded digits written to [rdi],
+; rdi advances by 4. Preserves rax/rbx/rcx/rdx.
+format_num4:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    xor rdx, rdx
+    mov rbx, 1000
+    div rbx                       ; rax = thousands, rdx = remainder
+    push rdx
+    add al, '0'
+    mov [rdi], al
+    inc rdi
+    pop rax
+    xor rdx, rdx
+    mov rbx, 100
+    div rbx                       ; rax = hundreds, rdx = remainder
+    push rdx
+    add al, '0'
+    mov [rdi], al
+    inc rdi
+    pop rax
+    xor rdx, rdx
+    mov rbx, 10
+    div rbx                       ; rax = tens, rdx = ones
+    add al, '0'
+    mov [rdi], al
+    inc rdi
+    mov al, dl
+    add al, '0'
+    mov [rdi], al
+    inc rdi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; format_time: writes "HH:MM:SS\0" to [rdi], rdi advances to the terminator.
+; Preserves everything except rdi.
+format_time:
+    push rax
+    call rtc_update
+    movzx rax, byte [rtc_hour]
+    call format_num2
+    mov byte [rdi], ':'
+    inc rdi
+    movzx rax, byte [rtc_min]
+    call format_num2
+    mov byte [rdi], ':'
+    inc rdi
+    movzx rax, byte [rtc_sec]
+    call format_num2
+    mov byte [rdi], 0
+    pop rax
+    ret
+
+; format_date: writes "YYYY-MM-DD\0" to [rdi], rdi advances to the
+; terminator. Preserves everything except rdi.
+format_date:
+    push rax
+    push rbx
+    call rtc_update
+    ; full year = century*100 + year; fall back to the 2000s when the
+    ; chip has no century register (or it reports something unusable).
+    movzx rax, byte [rtc_century]
+    cmp al, 20
+    je .fd_cent_ok
+    cmp al, 21
+    je .fd_cent_ok
+    mov al, 20
+.fd_cent_ok:
+    imul rax, 100
+    movzx rbx, byte [rtc_year]
+    add rax, rbx
+    call format_num4
+    mov byte [rdi], '-'
+    inc rdi
+    movzx rax, byte [rtc_month]
+    call format_num2
+    mov byte [rdi], '-'
+    inc rdi
+    movzx rax, byte [rtc_day]
+    call format_num2
+    mov byte [rdi], 0
+    pop rbx
+    pop rax
+    ret
+
+; ------------------------------------------------------------
+; cmd_date / cmd_time: print the current date / time from the RTC.
+; ------------------------------------------------------------
+cmd_date:
+    lea rdi, [date_str_buf]
+    call format_date
+    mov rsi, date_str_buf
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    mov rsi, newline_str
+    call print_string
+    ret
+
+cmd_time:
+    lea rdi, [time_str_buf]
+    call format_time
+    mov rsi, time_str_buf
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    mov rsi, newline_str
+    call print_string
+    ret
+
+; ------------------------------------------------------------
+; cmd_write: write <path> <content> creates the file (or overwrites an
+; existing file's content). It's meant to be used through a "~" pipe -
+; "show hi ~ write file.txt" writes "hi" to file.txt - but also works
+; standalone: write file.txt "some text".
+; ------------------------------------------------------------
+cmd_write:
+    cmp byte [arg1_buf], 0
+    jne .cw_have_arg
+    mov rsi, msg_write_usage
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+.cw_have_arg:
+    mov rax, [cur_dir]
+    mov rsi, arg1_buf
+    mov rdi, leaf1_buf
+    call fs_resolve_path
+    cmp rax, -1
+    je .cw_bad_path
+    mov r11, rax                  ; parent dir the file goes in
+    ; an existing FILE by that name gets its content overwritten
+    mov rax, r11
+    mov rsi, leaf1_buf
+    mov r10, 2
+    call fs_find_child
+    cmp rax, -1
+    jne .cw_overwrite
+    ; no file - make sure a folder with that name isn't in the way
+    mov rax, r11
+    mov rsi, leaf1_buf
+    mov r10, -1
+    call fs_find_child
+    cmp rax, -1
+    jne .cw_exists
+    mov rax, r11
+    mov rsi, leaf1_buf
+    mov r10, 2                    ; type file
+    call fs_create_node
+    cmp rax, -1
+    je .cw_full
+    mov rdi, rax
+    imul rdi, CONTENT_LEN
+    lea rdi, [node_content + rdi]
+    mov rsi, arg2_buf
+    call str_copy
+    ret
+.cw_overwrite:
+    ; rax = existing file node index, replace its content
+    mov rdi, rax
+    imul rdi, CONTENT_LEN
+    lea rdi, [node_content + rdi]
+    mov rsi, arg2_buf
+    call str_copy
+    ret
+.cw_exists:
+    mov rsi, msg_exists
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+.cw_full:
+    cmp byte [fs_name_too_long], 1
+    je .cw_toolong
+    mov rsi, msg_full
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+.cw_toolong:
+    mov rsi, msg_name_too_long
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+.cw_bad_path:
+    mov rsi, msg_bad_path
+    mov al, ATTR_ERROR
+    call print_string_attr
+    mov rsi, arg1_buf
+    call print_string
+    mov rsi, newline_str
+    call print_string
+    ret
+
+; ------------------------------------------------------------
+; wig time: the "widget" command. Draws a live clock in the top-right
+; corner of the screen that updates every second, until Esc is pressed.
+; ------------------------------------------------------------
+
+; wig_draw_clock: right-aligns "HH:MM:SS" at row 0 of the screen, writing
+; straight to VGA memory so the shell's cursor and scrollback stay put.
+wig_draw_clock:
+    push rax
+    push rbx
+    push rcx
+    push rsi
+    push rdi
+    lea rdi, [wig_str_buf]
+    call format_time
+    lea rsi, [wig_str_buf]
+    call str_len                  ; rax = 8 (always, for HH:MM:SS)
+    mov rbx, 80
+    sub rbx, rax                  ; rbx = starting column
+    imul rbx, rbx, 2              ; column -> byte offset
+    lea rdi, [VGA_BASE + rbx]
+    lea rsi, [wig_str_buf]
+    mov bl, ATTR_WIG
+.wig_write:
+    mov al, [rsi]
+    cmp al, 0
+    je .wig_written
+    mov [rdi], al
+    mov [rdi+1], bl
+    add rdi, 2
+    inc rsi
+    jmp .wig_write
+.wig_written:
+    pop rdi
+    pop rsi
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; wig_clear: blanks the 8-column corner slot the widget draws in.
+wig_clear:
+    push rax
+    push rcx
+    push rdi
+    lea rdi, [VGA_BASE + (0*80 + 72)*2]
+    mov rcx, 8
+    mov ax, 0x0720                ; space, light grey on black
+.wig_clr:
+    mov [rdi], ax
+    add rdi, 2
+    loop .wig_clr
+    pop rdi
+    pop rcx
+    pop rax
+    ret
+
+; cmd_wig: usage "wig time". Runs the live clock widget until Esc.
+cmd_wig:
+    cmp byte [arg1_buf], 0
+    je .wig_usage
+    mov rsi, arg1_buf
+    mov rdi, str_time
+    call str_eq
+    cmp al, 1
+    jne .wig_usage
+    mov byte [kill_flag], 0
+    call wig_draw_clock
+    call rtc_update
+    mov al, [rtc_sec]
+    mov [wig_last_sec], al
+.wig_loop:
+    call kbd_poll
+    cmp byte [kill_flag], 0
+    jne .wig_done
+    call rtc_update
+    mov al, [rtc_sec]
+    cmp al, [wig_last_sec]
+    je .wig_loop
+    mov [wig_last_sec], al
+    call wig_draw_clock
+    jmp .wig_loop
+.wig_done:
+    mov byte [kill_flag], 0
+    call wig_clear
+    ret
+.wig_usage:
+    mov rsi, msg_wig_usage
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+
+; cmd_shelly: prints a splash banner. The title cycles through the rainbow
+; palette one character at a time.
+cmd_shelly:
+    mov rsi, shelly_rule
+    mov al, ATTR_WIG
+    call print_string_attr
+    lea rsi, [shelly_title]
+    call cmd_shelly_rainbow
+    mov al, 0x0A
+    mov bl, [cur_normal_attr]
+    call putchar
+    mov rsi, shelly_by
+    mov al, 0x0D
+    call print_string_attr
+    mov rsi, shelly_cr
+    mov al, ATTR_PROMPT
+    call print_string_attr
+    mov rsi, shelly_rule
+    mov al, ATTR_WIG
+    call print_string_attr
+    ret
+
+; cmd_shelly_rainbow: prints the null-terminated string in rsi, cycling the
+; attribute through the rainbow palette per character.
+cmd_shelly_rainbow:
+    push rax
+    push rbx
+    push rcx
+    push rsi
+    xor rcx, rcx
+.rs_loop:
+    mov al, [rsi]
+    cmp al, 0
+    je .rs_done
+    lea rbx, [shelly_palette]
+    mov bl, [rbx + rcx]
+    call putchar
+    inc rsi
+    inc rcx
+    cmp rcx, SHELLY_PAL_LEN
+    jb .rs_loop
+    xor rcx, rcx
+    jmp .rs_loop
+.rs_done:
+    pop rsi
+    pop rcx
+    pop rbx
+    pop rax
+    ret
 
 ; print_prompt: prints "rush>" + current path + ": "
 print_prompt:
@@ -7388,6 +8082,8 @@ read_line:
     je .enter
     cmp al, 0x08
     je .bksp
+    cmp al, 0x09
+    je .tab
     cmp al, KEY_UP
     je .hist_up
     cmp al, KEY_DOWN
@@ -7404,6 +8100,10 @@ read_line:
     je .loop
     dec r8
     call do_backspace
+    jmp .loop
+
+.tab:
+    call complete_line
     jmp .loop
 
 .hist_up:
@@ -7527,6 +8227,296 @@ read_line:
     pop rax
     ret
 
+; ============================================================
+;  complete_line: Tab completion for the rush prompt. Called from
+;  read_line when the user presses Tab.
+;  - first token on the line: completes against the built-in command
+;    table (completion_cmds)
+;  - any later token: completes against the names of files/folders
+;    directly inside cur_dir
+;  A single unique match is completed in place (commands get a trailing
+;  space, folders a trailing '/'); an ambiguous prefix is extended as
+;  far as all candidates agree, and if the prefix is already as long as
+;  the shared portion, the candidates are listed and the prompt and
+;  line are reprinted.
+;  Preserves r9/r10; r8 (current line length) may grow as characters
+;  are completed, which is exactly what read_line expects.
+; ============================================================
+complete_line:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+
+    ; ---- locate the token being typed: token_start in r13 ----
+    mov r12, r8                  ; scan backward from the cursor
+    xor r13, r13                 ; token_start
+.tk_loop:
+    cmp r12, 0
+    je .tk_done
+    dec r12
+    cmp byte [r9 + r12], ' '
+    jne .tk_loop
+    lea r13, [r12 + 1]
+.tk_done:
+    mov rbx, r8                  ; rbx = token length = r8 - r13
+    sub rbx, r13
+
+    ; ---- mode: r11 = 1 if this is not the first token ----
+    xor r11, r11
+    xor rcx, rcx
+.mode_loop:
+    cmp rcx, r13
+    jae .mode_done
+    cmp byte [r9 + rcx], ' '
+    jne .mode_fs
+    inc rcx
+    jmp .mode_loop
+.mode_fs:
+    mov r11, 1
+.mode_done:
+
+    ; ---- gather matches into comp_matches[], count in r15 ----
+    xor r15, r15
+    cmp r11, 0
+    jne .g_fs
+.g_cmd:
+    xor rdi, rdi                 ; table index
+.g_cmd_loop:
+    lea rax, [completion_cmds + rdi*8]
+    mov rax, [rax]
+    test rax, rax
+    jz .g_done
+    mov rsi, rax
+    call .is_prefix
+    cmp al, 1
+    jne .g_cmd_next
+    mov [comp_matches + r15*2], di
+    inc r15
+.g_cmd_next:
+    inc rdi
+    jmp .g_cmd_loop
+.g_fs:
+    xor rdi, rdi                 ; node index
+.g_fs_loop:
+    cmp rdi, MAX_NODES
+    jae .g_done
+    cmp byte [node_type + rdi], 0
+    je .g_fs_next
+    movzx rax, word [node_parent + rdi*2]
+    cmp rax, [cur_dir]
+    jne .g_fs_next
+    imul rax, rdi, NAME_LEN
+    lea rsi, [node_name + rax]
+    call .is_prefix
+    cmp al, 1
+    jne .g_fs_next
+    mov [comp_matches + r15*2], di
+    inc r15
+.g_fs_next:
+    inc rdi
+    jmp .g_fs_loop
+.g_done:
+    cmp r15, 0
+    je .out
+
+    ; ---- common prefix length over all matches (starts at rbx) ----
+    mov rcx, rbx                 ; pos
+.cc_loop:
+    cmp rcx, r10
+    jae .cc_end
+    mov rdx, rcx
+    xor r14, r14
+    call .char_at                ; al = char of first match at pos
+    mov r12, rax
+    test r12, r12
+    jz .cc_end
+    mov r14, 1
+.cc_inner:
+    cmp r14, r15
+    jae .cc_agree
+    mov rdx, rcx
+    call .char_at
+    cmp rax, r12
+    jne .cc_end
+    inc r14
+    jmp .cc_inner
+.cc_agree:
+    inc rcx
+    jmp .cc_loop
+.cc_end:
+    ; rcx = common prefix length
+    ; ---- append the unambiguous tail, chars rbx..rcx-1 ----
+    mov rsi, rbx                 ; pos
+.ap_loop:
+    cmp rsi, rcx
+    jae .ap_done
+    cmp r8, r10
+    jae .ap_done
+    mov rdx, rsi
+    xor r14, r14
+    call .char_at
+    mov [r9 + r8], al
+    inc r8
+    push rbx
+    mov bl, [cur_normal_attr]
+    call putchar
+    pop rbx
+    inc rsi
+    jmp .ap_loop
+.ap_done:
+    cmp r15, 1
+    jne .multi
+    ; ---- single match: finish it off ----
+    cmp r11, 0
+    jne .uniq_fs
+    cmp r8, r10
+    jae .out
+    mov al, ' '
+    mov [r9 + r8], al
+    inc r8
+    push rbx
+    mov bl, [cur_normal_attr]
+    call putchar
+    pop rbx
+    jmp .out
+.uniq_fs:
+    movzx rax, word [comp_matches]
+    cmp byte [node_type + rax], 1
+    jne .out
+    cmp r8, r10
+    jae .out
+    mov al, '/'
+    mov [r9 + r8], al
+    inc r8
+    push rbx
+    mov bl, [cur_normal_attr]
+    call putchar
+    pop rbx
+    jmp .out
+.multi:
+    ; multiple matches: only list if the common prefix advanced nothing
+    cmp rcx, rbx
+    jne .out
+    mov al, 0x0A
+    call putchar
+    xor r14, r14
+.ls_loop:
+    cmp r14, r15
+    jae .ls_done
+    call .match_ptr              ; rsi = candidate string
+    call print_string
+    mov al, ' '
+    call putchar
+    inc r14
+    jmp .ls_loop
+.ls_done:
+    mov al, 0x0A
+    call putchar
+    call print_prompt
+    xor rcx, rcx
+.echo:
+    cmp rcx, r8
+    jae .out
+    mov al, [r9 + rcx]
+    push rbx
+    mov bl, [cur_normal_attr]
+    call putchar
+    pop rbx
+    inc rcx
+    jmp .echo
+.out:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; .is_prefix: is the typed token (r9+r13, length rbx) a prefix of the
+; null-terminated string in rsi? Returns al = 1/0. Clobbers only al.
+.is_prefix:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    mov rdi, rsi
+    mov rsi, r9
+    add rsi, r13
+    mov rcx, rbx
+.ip_loop:
+    cmp rcx, 0
+    je .ip_yes
+    mov al, [rsi]
+    mov dl, [rdi]
+    cmp al, dl
+    jne .ip_no
+    inc rsi
+    inc rdi
+    dec rcx
+    jmp .ip_loop
+.ip_yes:
+    mov al, 1
+    jmp .ip_out
+.ip_no:
+    xor al, al
+.ip_out:
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; .match_ptr: r14 = match slot -> rsi = candidate string. Clobbers rax.
+.match_ptr:
+    movzx rax, word [comp_matches + r14*2]
+    cmp r11, 0
+    jne .mp_fs
+    imul rax, 8
+    lea rax, [completion_cmds + rax]
+    mov rsi, [rax]
+    ret
+.mp_fs:
+    imul rax, NAME_LEN
+    lea rsi, [node_name + rax]
+    ret
+
+; .char_at: r14 = match slot, rdx = position -> al = char at that position.
+; Clobbers rax only; returns the character zero-extended in rax so callers
+; can compare/test the full register (the char in al alone would leave
+; pointer bits in rax's upper bytes and break null checks).
+.char_at:
+    movzx rax, word [comp_matches + r14*2]
+    cmp r11, 0
+    jne .ca_fs
+    imul rax, 8
+    lea rax, [completion_cmds + rax]
+    mov rax, [rax]
+    add rax, rdx
+    movzx rax, byte [rax]
+    ret
+.ca_fs:
+    imul rax, NAME_LEN
+    lea rax, [node_name + rax]
+    add rax, rdx
+    movzx rax, byte [rax]
+    ret
+
 ; erase one character visually (move cursor back, blank it)
 do_backspace:
     push rax
@@ -7589,8 +8579,21 @@ live_snapshot:       times VGA_ROWS*VGA_COLS*2 db 0
 history_buf:         times HISTORY_MAX*LINE_MAX db 0
 history_saved_line:  times LINE_MAX db 0
 
+; --- RTC (CMOS) clock state and scratch ---
+rtc_sec:     db 0
+rtc_min:     db 0
+rtc_hour:    db 0
+rtc_day:     db 0
+rtc_month:   db 0
+rtc_year:    db 0
+rtc_century: db 0
+time_str_buf:  times 16 db 0    ; "HH:MM:SS"
+date_str_buf:  times 16 db 0    ; "YYYY-MM-DD"
+wig_str_buf:   times 16 db 0    ; scratch for the wig clock widget
+wig_last_sec:  db 0             ; last second the widget drew (redraw gate)
+
 banner:
-    db "ShellyForever v0.1.1 -- 'help' for commands", 10, 0
+    db "ShellyForever v0.1.2 -- 'help' for commands", 10, 0
 
 prompt_head: db "rush>", 0
 prompt_tail: db ": ", 0
@@ -7631,6 +8634,19 @@ str_vars:   db "vars", 0
 str_ali:    db "ali", 0
 str_alis:   db "alis", 0
 str_color:  db "color", 0
+str_date:   db "date", 0
+str_time:   db "time", 0
+str_write:  db "write", 0
+str_wig:    db "wig", 0
+str_shelly: db "shelly", 0
+
+; shelly splash banner pieces
+SHELLY_PAL_LEN equ 6
+shelly_palette: db 0x0E, 0x0B, 0x0A, 0x0D, 0x09, 0x0F   ; yel, cyan, grn, mag, lblu, wht
+shelly_rule:  db "  ============================================================", 10, 0
+shelly_title: db "         ShellyForever OS", 0
+shelly_by:    db "         Developed by Sourasish Das", 10, 0
+shelly_cr:    db "         Copyright 2026. All rights reserved.", 10, 0
 str_col_black:    db "black", 0
 str_col_dblue:    db "dblue", 0
 str_col_blue:     db "blue", 0
@@ -7688,10 +8704,52 @@ empty_str:  db 0
 str_dscan:  db "dscan", 0
 str_format: db "fmt", 0
 str_mount:  db "mount", 0
+str_unmount: db "unmount", 0
 str_label:  db "label", 0
 str_semicolon: db ";", 0
 str_tilde:     db "~", 0
 str_dollar:    db "$", 0
+
+; --- Tab-completion tables (see complete_line) ---
+completion_cmds:
+    dq str_calc
+    dq str_edit
+    dq str_cf
+    dq str_mkf
+    dq str_mkfl
+    dq str_show
+    dq str_ls
+    dq str_cat
+    dq str_pwd
+    dq str_clear
+    dq str_help
+    dq str_reboot
+    dq str_sync
+    dq str_del
+    dq str_rmv
+    dq str_sdown
+    dq str_rname
+    dq str_cpy
+    dq str_mov
+    dq str_rr
+    dq str_prs
+    dq str_auth
+    dq str_vars
+    dq str_dscan
+    dq str_format
+    dq str_mount
+    dq str_unmount
+    dq str_label
+    dq str_ali
+    dq str_alis
+    dq str_color
+    dq str_date
+    dq str_time
+    dq str_write
+    dq str_wig
+    dq str_shelly
+    dq 0
+comp_matches: times 96 dw 0
 
 tag_folder: db "/", 10, 0
 tag_file:   db "", 10, 0
@@ -7751,6 +8809,13 @@ msg_mount_ok1:    db "Mounted ", 0
 msg_mount_ok2:    db " at /", 0
 msg_mount_ok3:    db "/. Use 'cf ", 0
 msg_mount_ok4:    db "' to enter it.", 0
+msg_unmount_usage:  db "unmount: use 'unmount <label>' to detach a mounted drive", 10, 0
+msg_unmount_ok1:    db "Unmounted ", 0
+msg_unmount_ok2:    db " - drive is still on disk; 'dscan' + 'mount' re-attach it.", 0
+msg_unmount_none1:  db "unmount: no drive mounted as '", 0
+msg_unmount_none2:  db "'. Use 'mount' to attach one.", 10, 0
+msg_unmount_busy1:  db "unmount: cannot detach ", 0
+msg_unmount_busy2:  db " while inside it - 'cf /home' first", 10, 0
 msg_label_usage:  db "label: use 'label <old> <new>' to rename a drive", 10, 0
 msg_label_long:   db "label: new label too long (max 31 characters)", 10, 0
 msg_label_none1:  db "label: no drive labeled '", 0
@@ -7764,6 +8829,8 @@ msg_label_ok3:    db "'.", 10, 0
 msg_bad_value:   db "error: invalid value", 10, 0
 msg_calc_err:      db "calc: invalid expression", 10, 0
 msg_calc_need_expr: db "calc: need an expression, e.g. calc 1 + 2 * 3", 10, 0
+msg_write_usage: db "write: use 'write <file> <content>' - e.g. show hi ~ write file.txt", 10, 0
+msg_wig_usage:   db "wig: use 'wig time' for the live clock widget (Esc to exit)", 10, 0
 msg_edit_header1: db "-- editing ", 0
 msg_edit_header2: db "  (ESC when done, then y/n to save) --", 10, 10, 0
 msg_save_prompt:  db 10, "Save changes? (y/n): ", 0
@@ -7836,12 +8903,18 @@ help_text:
     db "  rmv ali all        clear all aliases (requires auth)", 10
     db "  calc <expr>        evaluate math, e.g. calc 1 + 2 * 3", 10
     db "  current            print current path", 10
+    db "  date               print the current date", 10
+    db "  time               print the current time", 10
+    db "  wig time           live clock widget in the top-right corner (Esc to exit)", 10
+    db "  shelly             splash banner - ShellyForever OS credits", 10
+    db "  write <path>       write text to a file, e.g. show hi ~ write file.txt", 10
     db "  wipe               clear the screen", 10
     db "  sync               save the filesystem (and mounted drives) to disk", 10
     db "  fmt <label>        format a drive with the SFFS format (-force reuses one)", 10
     db "  fmt <target> <lbl> format a SPECIFIC drive (see dscan's 'fmt target:')", 10
     db "  dscan              scan for SFFS drives attached to the ATA bus", 10
     db "  mount <label>      mount a formatted drive at /<label>/", 10
+    db "  unmount <label>    detach a mounted drive (data stays on disk)", 10
     db "  label <old> <new>  rename a formatted drive without touching its data", 10
     db "  rboot              save to disk, then restart (requires auth)", 10
     db "  sdown              shut down (requires auth)", 10
@@ -7972,6 +9045,36 @@ help_clear:
     db "wipe", 10
     db "  Clear the screen.", 10, 0
 
+help_date:
+    db "date", 10
+    db "  Print the current date, read from the RTC clock chip.", 10
+    db "  Format: YYYY-MM-DD (e.g. 2026-08-03).", 10, 0
+
+help_time:
+    db "time | wig time", 10
+    db "  'time' prints the current time, read from the RTC clock chip.", 10
+    db "  Format: HH:MM:SS, 24-hour clock (e.g. 14:30:05).", 10
+    db "  'wig time' instead shows a live clock in the top-right corner", 10
+    db "  of the screen that updates every second; press Esc to stop it.", 10, 0
+
+help_write:
+    db 'write <path> "<text>"', 10
+    db "  Write text to a file, creating it if needed or overwriting an", 10
+    db "  existing file's content. Usually used with a ~ pipe:", 10
+    db "  show hi ~ write file.txt        (writes 'hi' to file.txt)", 10
+    db "  calc 2 + 2 ~ write sum.txt      (writes '4' to sum.txt)", 10, 0
+
+help_wig:
+    db "wig time", 10
+    db "  Show a live clock widget in the top-right corner of the", 10
+    db "  screen. The time updates every second while it runs.", 10
+    db "  Press Esc to stop the widget and return to the prompt.", 10, 0
+
+help_shelly:
+    db "shelly", 10
+    db "  Print the ShellyForever OS splash banner: a rainbow", 10
+    db "  title, the developer credit, and the copyright line.", 10, 0
+
 help_help:
     db "help | help <command>", 10
     db "  List every command, or show detailed help for just one.", 10
@@ -7993,6 +9096,12 @@ help_mount:
     db "mount <label>", 10
     db "  Mount a formatted drive's volume under /<label>/, next to", 10
     db "  /home. Up to 2 drives can be mounted at once.", 10, 0
+
+help_unmount:
+    db "unmount <label>", 10
+    db "  Detach a mounted drive's volume. The drive's data stays on", 10
+    db "  disk untouched; 'dscan' + 'mount <label>' re-attach it later.", 10
+    db "  Won't unmount while you're inside the volume.", 10, 0
 
 help_label:
     db "label <old> <new>", 10

@@ -1,6 +1,6 @@
 # ShellyForever
 
-**Version:** 0.1.1
+**Version:** 0.1.2
 
 A 64-bit shell-based OS written entirely in x86-64 NASM assembly, from scratch —
 no C, no BIOS libraries beyond boot-time disk/keyboard calls, no existing kernel.
@@ -45,6 +45,11 @@ no C, no BIOS libraries beyond boot-time disk/keyboard calls, no existing kernel
 | `vars` | `vars` | list all variables |
 | `vars rmv all` | `auth vars rmv all` | clear all variables (requires auth) |
 | `calc` | `calc 1 + 2 * 3` | evaluate a math expression |
+| `date` | `date` | print the current date (from the RTC clock chip) |
+| `time` | `time` | print the current time, HH:MM:SS 24-hour (from the RTC) |
+| `wig` | `wig time` | live clock widget in the top-right corner, updates every second (Esc to stop) |
+| `shelly` | `shelly` | print the splash banner: a rainbow ShellyForever OS title, the developer credit, and the copyright line |
+| `write` | `show hi ~ write file.txt` | write text to a file (creates it, or overwrites); handy as a `~` pipe target |
 | `rr` | `rr script.rsh` | run a rush script file (`$` = comment line) |
 | `prs` | `prs`, `prs kill 1`, `prs kill rushrun` | list processes, or kill by PID or name |
 | `auth` | `auth sdown`, `auth vars rmv all` | elevate privileges for one dangerous command |
@@ -55,6 +60,7 @@ no C, no BIOS libraries beyond boot-time disk/keyboard calls, no existing kernel
 | `fmt` | `fmt data` | format the first unformatted drive with an SFFS label (`-force` to reuse one) |
 | `fmt` | `fmt disk1 data` | format a SPECIFIC drive by the `disk<N>` label `dscan` shows for it |
 | `mount` | `mount data` | mount a formatted drive's volume under `/<label>/` |
+| `unmount` | `unmount data` | detach a mounted drive's volume (data stays on disk; `mount` re-attaches it) |
 | `label` | `label old new` | rename a formatted drive's label in place, without touching its files |
 | `ali` | `ali gs list ~ show` | create an alias: shorthand for a stored command (or chain of commands) |
 | `alis` | `alis` | list all aliases and their bodies |
@@ -64,8 +70,9 @@ no C, no BIOS libraries beyond boot-time disk/keyboard calls, no existing kernel
 | `rboot` | `rboot` | save to disk, then restart (requires auth) |
 | `sdown` | `sdown` | save to disk, then shut down (requires auth) |
 
-### Line editing: history and scrollback
+### Line editing: history, tab completion, and scrollback
 
+- **Tab** — command / filename completion (see below).
 - **Up / Down** — recall previous commands (like bash). Your in-progress
   line is preserved if you arrow up through history and then back down past
   the most recent entry. History holds the last 20 non-empty lines entered
@@ -75,6 +82,28 @@ no C, no BIOS libraries beyond boot-time disk/keyboard calls, no existing kernel
   whatever you're mid-typing at the prompt. Typing a character, pressing
   Enter, or recalling history all snap the view back to live automatically.
   Works at the shell prompt and inside the `edit` command's editor.
+
+### Tab completion
+
+Pressing **Tab** at the prompt completes what you're typing:
+
+- **First token on the line** — completes a built-in command name.
+  `vi` + Tab becomes `view ` (a unique match gets a trailing space).
+- **Any later token** — completes a file or folder name directly inside the
+  current directory. `view aa` + Tab becomes `view aaa.txt`; a folder match
+  gets a trailing `/` (`cf doc` + Tab → `cf docs/`).
+- **Ambiguous prefix** — completes as far as all candidates agree; if that's
+  already the whole shared prefix, the candidates are listed on their own
+  line and the prompt and line are redrawn, so you can keep typing and Tab
+  again (`d` + Tab lists `del dscan date`).
+
+```text
+rush>/home: ca<Tab>                      ->  rush>/home: calc
+rush>/home: view a<Tab>                  ->  rush>/home: view aaa.txt
+rush>/home: view b<Tab>
+bbb.txt bcd.txt
+rush>/home: view b
+```
 
 ### Command chaining with `;`
 
@@ -218,6 +247,43 @@ Hello, there.
 Unlike `mkfl -force`, `owrite` requires the file to already exist (it errors
 with `owrite: no such file: <path>` otherwise) and never creates one.
 
+### The RTC clock: `date`, `time`, and `wig time`
+
+The kernel reads the MC146818 RTC/CMOS clock chip (ports `0x70`/`0x71`,
+waiting out the update-in-progress flag, decoding BCD, and normalizing 12-hour
+to 24-hour) to back three commands:
+
+- **`date`** — prints the current date as `YYYY-MM-DD`.
+- **`time`** — prints the current time as `HH:MM:SS` (24-hour).
+- **`wig time`** — the "widget" command: draws a live clock in the top-right
+  corner of the screen that updates every second, until you press **Esc**.
+  It writes straight to VGA memory, so your prompt and cursor aren't disturbed
+  while it runs.
+
+Both `date` and `time` are normal commands, so their output flows through the
+`~` pipe just like anything else — `date ~ write today.txt` saves the date
+into a file.
+
+### Writing piped output to a file: `write`
+
+`write <path> <content>` creates a file with that content, or overwrites an
+existing file's content in place. It's designed to be the target of a `~`
+pipe, which appends the captured output as the content argument:
+
+```
+rush>/home: show hi ~ write file.txt
+rush>/home: view file.txt
+hi
+rush>/home: date ~ write today.txt ; view today.txt
+2038-08-03
+rush>/home: calc 2 + 2 ~ write sum.txt ; view sum.txt
+4
+```
+
+It also works standalone (`write notes.txt "some text"`). It refuses if a
+*folder* already has the name (use `del`/`rname` to resolve), but happily
+overwrites an existing file — like a shell `>` redirect.
+
 ### Searching: `find` and `lookfor`
 
 `find <name>` looks for a file or folder by exact name across every drive —
@@ -330,6 +396,11 @@ clear of the boot sector and the kernel's own sectors (1..199):
 - `mount <label>` finds the drive whose label matches, loads it into memory
   under `/<label>/` next to `/home`, and you can `cf /<label>` into it like
   any folder.
+- `unmount <label>` detaches a mounted volume: the mount slot is dropped
+  (so `sync` stops writing that drive) and `/<label>/` disappears from the
+  filesystem, but the drive's data is left untouched — `dscan` + `mount`
+  re-attach it later. It refuses while your current directory is inside the
+  volume.
 - `label <old> <new>` renames a drive's label in place by rewriting just its
   superblock — the drive's files are left untouched. Refuses if `<new>` is
   already used by another drive. If that drive happens to be mounted at the
@@ -407,6 +478,19 @@ message and then nothing, which is your cue to power off manually.
 
 ## What's new
 
+- **`unmount <label>` (v0.1.2)** — detach a mounted drive's volume. The mount
+  slot is dropped (so `sync` stops writing that drive back) and `/<label>/`
+  disappears from the filesystem, but the data on the drive is left untouched.
+  It refuses while your current directory is inside the volume. See "One boot
+  drive, up to two mounted drives" above.
+- **RTC clock: `date`, `time`, and `wig time`** — a new CMOS/RTC driver (ports
+  `0x70`/`0x71`, BCD decode, 12→24-hour conversion) backs a `date` command
+  (`YYYY-MM-DD`), a `time` command (`HH:MM:SS`), and `wig time`, a live clock
+  widget drawn in the top-right corner of the screen that updates every second
+  until you press Esc. See "The RTC clock" above.
+- **`write`** — `show hi ~ write file.txt` pipes a command's output into a
+  file, creating it or overwriting an existing file's content (like a `>`
+  redirect). See "Writing piped output to a file" above.
 - **`-test` flag for `mkfl`** — dry run: reports whether a file would be
   created, overwritten, or rejected (already exists, no `-force`), and the
   content length that would be written, without touching the filesystem.
@@ -444,9 +528,14 @@ message and then nothing, which is your cue to power off manually.
   only one drive to format. Reformatting a drive that already has an SFFS
   volume - whether targeted by its `disk<N>` label or its current label -
   requires `-force`, same as before.
-- **Loading spinner** — `dscan` and `fmt` animate a small `|/-\` spinner
-  in place while they scan or write sectors, so a multi-drive scan or a
-  format doesn't look like the shell has frozen.
+- **Loading spinner** — `dscan`, `fmt`, `mount`, and `sync` animate a small
+  `|/-\` spinner in place while they scan, load, or write sectors, so a
+  multi-drive scan, a format, a mount, or a filesystem save doesn't look
+  like the shell has frozen.
+- **`shelly`** — a splash banner command: prints the `ShellyForever OS`
+  title one rainbow-colored character at a time, followed by the developer
+  credit (`Developed by Sourasish Das`) and the copyright line
+  (`Copyright 2026. All rights reserved.`).
 - **`find` and `lookfor`** — `find <name>` searches every drive for a file
   or folder by exact name and prints its full path; `lookfor <text> <file>
   [limit <n>]` greps a file's content line by line, optionally restricted
@@ -459,7 +548,10 @@ message and then nothing, which is your cue to power off manually.
   `calc 3 * 3 ~ show` pipes the result into `show`. See "Piping output with
   `~`" above.
 - **Command history (Up/Down)** and **scrollback (Ctrl+Up/Ctrl+Down)** — see
-  "Line editing: history and scrollback" above.
+  "Line editing: history, tab completion, and scrollback" above.
+- **Tab completion** — Tab completes command names on the first token and
+  file/folder names in the current directory on later tokens, listing
+  ambiguous candidates. See "Tab completion" above.
 - **`;` command chaining** — run multiple commands on one line:
   `show hello ; show world`. Semicolons inside double quotes are literal.
   Works in both the interactive shell and `rr` script files.
