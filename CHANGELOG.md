@@ -4,6 +4,60 @@ All notable changes to ShellyForever are documented here. The format is
 loosely based on [Keep a Changelog](https://keepachangelog.com/); the
 project does not yet follow strict SemVer.
 
+## [0.1.4] - 2026-08-05
+
+### Added
+
+- **`tcp <host> <port> [payload]`** — a minimal polled TCP engine
+  (`tcp.asm`): 3-way handshake (SYN → SYN-ACK → ACK), sequence/ack
+  tracking, checksums, a 1024-byte receive buffer, a polled
+  retransmit-on-no-ACK, and a read-until-FIN response accumulator that
+  prints what came back. Esc-cancelable while waiting.
+- **`tcp` help text** — the command list and `help <command>` both cover
+  `tcp` now.
+
+### Fixed
+
+- **RTL8139 RX starvation / "infinite receive loop"** — `nic_fetch_rx`
+  never cleared a descriptor's ROK bit after consuming it, so once
+  inbound traffic stopped, a wrapped ring re-delivered the same frames
+  forever. The driver now zeroes the descriptor status word after both
+  advance and skip (`kernel.asm`).
+- **TCP FIN never ACKed** — payload-0 segments were being skipped, so
+  the peer fast-retransmitted FIN forever and flooded the RX ring. Every
+  accepted segment carrying payload or FIN is now ACKed.
+- **TCP ACK echo loop** — pure ACKs were being ACKed in return, echoing
+  an empty-ACK loop with a stale sequence. Only payload/FIN segments are
+  now ACKed, never a peer's pure ACK.
+- **NASM `label changed during code generation` build failure** — a
+  leftover reference to a removed `netpoll.np_drained` label made NASM
+  mis-guess branch sizes between passes. Fixed the reference; the kernel
+  reassembles cleanly with the larger network buffers.
+
+### Changed
+
+- Banner bumped to `v0.1.4`.
+- `TCP_PAYLOAD_MAX` raised to 1024; `tcp_rx_buf`/`tcp_tx_buf` sized from
+  it, and `net_build_buf` grown to 4096 bytes to fit the build area.
+- **RTL8168 RxMaxSize fixed for real hardware** — the bring-up wrote
+  `0x1FFF` (8191 bytes) to the RxMaxSize register, which is larger than
+  the 2048-byte RX buffers; a jumbo frame would have DMA-truncated into
+  the buffer while the descriptor still reported the full length, so the
+  RX copy would overrun the buffer. Now `0x0640` (1600, the value Linux's
+  r8169 driver uses for MTU 1500), comfortably above any 1518-byte
+  Ethernet frame and safely within the buffers.
+- `netpoll` debug instrumentation (per-frame hex dump, `nic_rx_seen`
+  counter, seq/flags prints) removed from the source; the final kernel
+  is clean. (The instrumented build is what confirmed the ROK/FIN/ACK
+  root causes above.)
+
+### Verified
+
+- End-to-end QEMU test (WHPX, slirp user networking): `tcp 10.0.2.2 8000`
+  against Python's `http.server` — full 870-byte directory listing
+  captured and printed, clean close, shell returned. Both the 256-byte
+  and 1024-byte receive-buffer builds pass.
+
 ## [0.1.3] - 2026-08-05
 
 ### Added

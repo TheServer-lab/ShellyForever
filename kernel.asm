@@ -74,11 +74,12 @@ PIPE_CAP_MAX    equ 192       ; max bytes captured from a "~" pipe's left side
 ;  dscan probes all four ATA device slots for the magic, format writes
 ;  a fresh empty volume + label, and mount loads a volume's node table
 ;  into memory (remapping its parent indices) rooted at /<label>/.
-;  The kernel occupies LBA 1..390 (KERNEL_SECTORS in boot.asm) - the
-;  NIC/network stack (Milestone B) grew the image well past 300 - so the
-;  filesystem region starts at LBA 400 to stay clear of it.
+;  The kernel occupies LBA 1..440 (KERNEL_SECTORS in boot.asm) - the
+;  NIC/network stack (Milestone B) and TCP engine (Milestone C) grew the
+;  image well past 400 - so the filesystem region starts at LBA 460 to
+;  stay clear of it.
 ; ------------------------------------------------------------------
-FS_LBA_START    equ 400
+FS_LBA_START    equ 460
 SFFS_VERSION    equ 3
 SFFS_VERSION_V2 equ 2               ; old format, still readable
 SUPER_LABEL_OFF equ 8               ; label lives at superblock offset 8..39
@@ -943,6 +944,12 @@ dispatch:
     call str_eq
     cmp al, 1
     je cmd_dhcp
+
+    mov rsi, cmd_buf
+    mov rdi, str_tcp
+    call str_eq
+    cmp al, 1
+    je cmd_tcp
 
     ; --- user-defined alias? (see "ali <name> <commands>") ---
     mov rsi, cmd_buf
@@ -2374,6 +2381,19 @@ netdiag_dump_tx:
     push r8
     push r10
 
+    ; which frame actually failed - ARP broadcast vs. a real data/segment
+    ; send are two very different failure stories (e.g. an ARP TX failure
+    ; means the handshake/segment never even got a chance to go out).
+    cmp byte [nic_last_tx_ctx], 0
+    je .ndt_ctx_seg
+    mov rsi, msg_diag_txctx_arp
+    jmp .ndt_ctx_print
+.ndt_ctx_seg:
+    mov rsi, msg_diag_txctx_seg
+.ndt_ctx_print:
+    mov al, [cur_normal_attr]
+    call print_string_attr
+
     ; PCI Status register: dword at cfg offset 0x04 covers Command (low 16)
     ; + Status (high 16); shift down to isolate Status.
     movzx ebx, byte [nic_pci_bus]
@@ -2381,6 +2401,8 @@ netdiag_dump_tx:
     movzx edx, byte [nic_pci_func]
     mov r8b, NIC_PCI_CMD
     call pci_read32
+    push rax                         ; keep the raw dword safe across the prints below
+                                      ; (r10 isn't guaranteed to survive print calls)
     shr eax, 16
     mov rsi, msg_diag_pcists
     push rax
@@ -2390,6 +2412,18 @@ netdiag_dump_tx:
     call print_hex32
     mov rsi, msg_nl
     call print_string
+
+    ; Status bits (8/11/12/13/14/15) are write-1-to-clear; Command (low 16)
+    ; is plain RW. Writing back exactly what we just read clears any latched
+    ; error bits without touching Command, so the NEXT dump reflects fresh
+    ; state instead of re-showing the same abort forever after the first
+    ; time it was ever set.
+    pop r10                          ; the raw dword saved above
+    movzx ebx, byte [nic_pci_bus]
+    movzx ecx, byte [nic_pci_dev]
+    movzx edx, byte [nic_pci_func]
+    mov r8b, NIC_PCI_CMD
+    call pci_write32
 
     ; raw command dword of the descriptor slot that just failed (rtl_tx_idx
     ; was already advanced on send, so back it up one slot, wrapping).
@@ -2422,6 +2456,17 @@ netdiag_dump_tx:
     call print_string_attr
     pop rax
     call print_hex32
+    mov rsi, msg_nl
+    call print_string
+
+    ; real wall-clock seconds actually spent waiting before this failure was
+    ; declared - printed in decimal so it reads at a glance against the
+    ; ~5-6s budget, instead of inferring timing from how a failure "felt".
+    mov rsi, msg_diag_waitsecs
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    movzx eax, byte [nic_tx_wait_elapsed]
+    call tcp_print_dec
     mov rsi, msg_nl
     call print_string
 
@@ -3255,8 +3300,9 @@ cmd_format:
     mov r14b, 1
     jmp .fu_next
 .fu_unformatted:
-    ; skip the boot drive (device 0) unless -force; it holds the OS
-    cmp r13, 0
+    ; skip the boot drive ([boot_device]) unless -force; it holds the OS
+    movzx eax, byte [boot_device]
+    cmp r13, rax
     je .fu_next
     jmp .format_target
 .fu_next:
@@ -3325,8 +3371,9 @@ cmd_format:
     ret
 .tg_found_orig:
     ; matched by the original diskN label - still don't touch the boot
-    ; drive (device 0) unless -force
-    cmp r13, 0
+    ; drive ([boot_device]) unless -force
+    movzx eax, byte [boot_device]
+    cmp r13, rax
     jne .format_target
     cmp r15b, 1
     je .format_target
@@ -7601,6 +7648,7 @@ NIC_TX_BUF_SIZE  equ 0x800         ; 2KB frame build/DMA buffer
 ETH_TYPE_ARP_W   equ 0x0608        ; "08 06" as a little-endian memory word
 ETH_TYPE_IP_W    equ 0x0008        ; "08 00" as a little-endian memory word
 IP_PROTO_ICMP    equ 0x01
+IP_PROTO_TCP     equ 0x06
 IP_PROTO_UDP     equ 0x11
 
 ; ---- Intel e1000 (82540/82541/82545/82546/8257x "PRO/1000") support -----
@@ -7758,11 +7806,22 @@ nic_io_read_block:
 ; rtc_sec_now: eax = current RTC seconds (0..59), zero-extended. Used for
 ; coarse 1s-granularity timeouts in the ARP / ICMP / DNS wait loops.
 rtc_sec_now:
+    push rbx
     push rdx
+.rsn_retry:
+    call rtc_wait_uip            ; don't read while the RTC is mid-update
     mov al, 0x00
     call cmos_read
+    mov bl, al                   ; first reading
+    call rtc_wait_uip            ; guard again in case an update started
+                                  ; between our address-select and data read
+    mov al, 0x00
+    call cmos_read
+    cmp al, bl
+    jne .rsn_retry                ; two reads disagree - torn/transient, retry
     movzx eax, al
     pop rdx
+    pop rbx
     ret
 
 ; ---- PCI ---------------------------------------------------------
@@ -8408,6 +8467,17 @@ nic_init:
     and eax, 0xFFFFFFF0
     mov [nic_mmio_base], eax
 
+    ; Same issue AHCI's ABAR had (see ahci_mark_uncached above): polling an
+    ; MMIO register through a cacheable identity-map entry can read back a
+    ; stale cached value on real hardware instead of what the device just
+    ; wrote - e.g. CTRL.RST below could look permanently set and the reset
+    ; loop would spin out and abandon the NIC even though the device reset
+    ; fine. ahci_mark_uncached is generic (just sets PCD on whichever 2MB
+    ; identity-map page contains the physical address in edi), so reuse it
+    ; here for the e1000's BAR0 window too.
+    mov edi, eax
+    call ahci_mark_uncached
+
     ; full device reset: CTRL.RST, then poll for it to self-clear
     mov edi, E1000_CTRL
     mov eax, E1000_CTRL_RST
@@ -8602,35 +8672,71 @@ nic_init:
     and eax, 0xFFFFFFFC
     mov [nic_io_base], eax
 
-    ; --- EXPERIMENTAL for RTL8168E-and-later: do NOT soft-reset the chip,
-    ; and do NOT overwrite TCR/RCR/CPCMD with generic values. netinfo/dhcp
-    ; diagnostics on this hardware confirmed this chip doesn't match any of
-    ; the older, well-documented RTL8168B/C/CP/D/DP revisions - meaning it's
-    ; 8168E or newer, a generation where Realtek's own driver depends on
-    ; uploading real firmware microcode into the chip as part of bring-up,
-    ; something this driver has no way to do. If your board's own firmware/
-    ; option ROM already touched this NIC at boot (very common for onboard
-    ; LAN even with PXE boot disabled), it likely already ran that correct
-    ; vendor init before our OS took over. RST + full TCR/RCR/CPCMD rewrite
-    ; below would throw all of that away and replace it with generic values
-    ; that this generation may not actually accept. So: skip RST, skip the
-    ; TCR/RCR/CPCMD writes, and only touch what we must - interrupts and our
-    ; own descriptor rings - so whatever good state exists is preserved.
+    ; --- REWRITE: do a real, standard RTL8168-style bring-up instead of
+    ; the earlier "skip reset, hope the board firmware already configured
+    ; it" workaround. That workaround was based on the theory that this
+    ; 8168E+ chip needs vendor microcode this driver can't upload, so
+    ; touching config registers would only break whatever good state
+    ; existed. In practice it got RX/DHCP working but TX never got out of
+    ; a confirmed, repeatable PCI Signaled Target-Abort on every send -
+    ; i.e. TX was never actually in a known-good state to begin with, so
+    ; there was nothing worth preserving on that side. A proper reset +
+    ; full descriptor/TCR/RCR/CPCMD programming (the same sequence real
+    ; r8169-family drivers do) is more likely to leave the TX DMA engine
+    ; in a state this driver's simple descriptor ring can actually drive,
+    ; even without the full microcode upload.
+    ;
+    ; unlock config registers (9346CR) before touching CMD/TCR/etc.
     mov edi, [nic_io_base]
-    add edi, RTL_IO_TCR
-    call nic_io_read32
-    mov [nic_hwver_raw], eax
+    add edi, RTL_IO_9346CR
+    mov al, RTL_9346_UNLOCK
+    call nic_io_write8
 
-    ; read the MAC from IDR0..IDR5 (works whether or not we reset - IDR is
-    ; always readable)
+    ; soft reset: CMD.RST (bit4). The chip clears this bit itself once
+    ; the reset completes; poll with a bounded timeout rather than trust
+    ; a fixed delay - real hardware resets can take a variable amount of
+    ; time. MAC address (IDR0-5) survives this reset (EEPROM-backed).
+    mov edi, [nic_io_base]
+    add edi, RTL_IO_CMD
+    mov al, RTL_CMD_RST
+    call nic_io_write8
+    mov r9d, 0x100000            ; generous bounded spin, real reset is fast
+.rtl_reset_wait:
+    mov edi, [nic_io_base]
+    add edi, RTL_IO_CMD
+    call nic_io_read8
+    test al, RTL_CMD_RST
+    jz .rtl_reset_done
+    dec r9d
+    jnz .rtl_reset_wait
+.rtl_reset_done:
+
+    ; read the MAC from IDR0..IDR5 (EEPROM-backed, survives soft reset)
     mov edi, [nic_io_base]
     add edi, RTL_IO_IDR0
     lea rsi, [nic_mac]
     mov rcx, 6
     call nic_io_read_block
+    mov edi, [nic_io_base]
+    add edi, RTL_IO_TCR
+    call nic_io_read32
+    mov [nic_hwver_raw], eax
 
-    ; interrupts off (polled driver, same discipline as the other two
-    ; backends), clear any latched status
+    ; Kick the PHY: on some real boards it comes up in (or gets left in,
+    ; by firmware) a powered-down/not-negotiating state that the MAC-side
+    ; soft reset above never touches, since RST only resets the MAC, not
+    ; the PHY. Without this, RTL_IO_PHYSTATUS's link bit can simply never
+    ; assert - .rtl_link_wait below then always burns its whole ~5s budget
+    ; and falls through with no link, which is silent (nic_present still
+    ; gets set) but means every frame this driver sends from here on is
+    ; just dropped, and every "tcp"/ping/dhcp call ends up hanging until
+    ; its own retry budget in turn expires. Do this now, before the link
+    ; wait, so autonegotiation has the whole ring-setup sequence below to
+    ; run concurrently with it instead of starting cold right before we
+    ; start polling.
+    call rtl_phy_power_up_and_renegotiate
+
+    ; interrupts off (polled driver), clear any latched status
     mov edi, [nic_io_base]
     add edi, RTL_IO_IMR
     xor ax, ax
@@ -8640,42 +8746,48 @@ nic_init:
     mov ax, 0xFFFF
     call nic_io_write16
 
-    ; RxConfig only - unlike TCR/CPCMD (left alone above, since touching
-    ; those is what broke TX on this chip generation) RCR doesn't affect
-    ; the TX path at all. It's specifically what decides which incoming
-    ; packet types get let into the RX ring - if the board's firmware left
-    ; it in some narrow PXE-only unicast filter, a broadcast DHCP offer
-    ; would be silently dropped before ever reaching our ring, which is
-    ; exactly consistent with "raw frames seen: 0" despite link being up
-    ; and TX now working. Accept broadcast/multicast/matching-unicast/all.
+    ; TxConfig: interframe gap = normal (bits 25:24 = 3), max DMA burst
+    ; = unlimited (bits 10:8 = 7). 0x03000700 is the standard generic
+    ; value used across the RTL8139C+/8169/8168 family - this is the
+    ; register the earlier workaround specifically avoided touching, and
+    ; is the most likely reason TX DMA was never actually functional.
+    mov edi, [nic_io_base]
+    add edi, RTL_IO_TCR
+    mov eax, 0x03000700
+    call nic_io_write32
+
+    ; RxConfig: accept broadcast/multicast/matching-unicast/all-phys,
+    ; RX FIFO threshold = none (whole packet), max DMA burst = unlimited.
     mov edi, [nic_io_base]
     add edi, RTL_IO_RCR
     mov eax, 0x0000E70F
     call nic_io_write32
 
     ; RxMaxSize (0xDA): hardware length filter applied to every incoming
-    ; frame BEFORE it reaches the descriptor ring - this is separate from
-    ; RCR's type filtering (broadcast/multicast/unicast) above. This was
-    ; never being written anywhere, which on power-on-reset defaults leaves
-    ; it at 0 - "accept 0-byte frames only" - so the chip was silently
-    ; discarding every real frame at the MAC filter stage regardless of
-    ; what RCR said. That's the actual explanation for "raw frames seen: 0"
-    ; despite link up, TX working, and RCR set to accept everything. Set it
-    ; well above any real frame size (1536) and safely within RTL_RX_BUF_SIZE.
+    ; frame before it reaches the descriptor ring. Just above MTU-1500
+    ; (1518 + slack) and within RTL_RX_BUF_SIZE (2048).
     mov edi, [nic_io_base]
     add edi, RTL_IO_RMS
-    mov ax, 0x1FFF
+    mov ax, 0x0640
     call nic_io_write16
 
-    ; MaxTxPacketSize (0xEC, 128-byte units): the TX-side analog of RMS.
-    ; Also never written/left at 0 - hasn't caused a visible failure yet
-    ; because DHCP discover is small, but leaving it at 0 is the same class
-    ; of bug and will bite on any larger outbound packet. 0x3B * 128 = 7552
-    ; bytes, comfortably above anything this driver sends.
+    ; MaxTxPacketSize (0xEC, 128-byte units). 0x3B * 128 = 7552 bytes,
+    ; comfortably above anything this driver sends.
     mov edi, [nic_io_base]
     add edi, RTL_IO_MTPS
     mov al, 0x3B
     call nic_io_write8
+
+    ; CPlusCmd: now that we've done a real reset, there's no vendor state
+    ; left to preserve here - explicitly zero it (no VLAN de-tagging, no
+    ; RX checksum offload, no PCI DAC) for the plainest, most predictable
+    ; descriptor-mode behavior while we're establishing that TX works at
+    ; all. Offload features can be layered back on once basic TX/RX is
+    ; confirmed solid.
+    mov edi, [nic_io_base]
+    add edi, RTL_IO_CPCMD
+    xor ax, ax
+    call nic_io_write16
 
     ; RX ring: RTL_RX_DESC_COUNT descriptors {command dword, vlan dword
     ; (unused), buf_lo dword, buf_hi dword}, each pointing at its own
@@ -9017,6 +9129,7 @@ nic_send_raw_rtl8168:
     push r8
     push r9
     push r10
+    push r11
 
     mov r8d, [rtl_tx_idx]
     mov eax, r8d
@@ -9046,15 +9159,99 @@ nic_send_raw_rtl8168:
     mov al, RTL_TPPOLL_NPQ
     call nic_io_write8
 
-    mov r9, 0x1000000
+    ; Wait for the chip to clear OWN on this slot. QEMU clears it almost
+    ; immediately, so a raw loop count worked there; on real hardware the
+    ; first TX DMA after link bring-up can take far longer than a cached-
+    ; RAM spin allows (the loop reads the descriptor from the CPU cache,
+    ; which outruns the NIC's write-back by orders of magnitude). So wait
+    ; on wall-clock RTC seconds instead: up to ~2s, re-kicking TPPoll each
+    ; second in case the chip needed another poll to notice the slot.
+    ; NOTE: budget is in whole-second ticks, but the tick boundary itself
+    ; consumes no polling time - see the js/jz fix below. With r11d=N we
+    ; get the remainder of the current second plus N full subsequent
+    ; seconds of continuous OWN polling before giving up. Bumped from 2 to
+    ; 5: field reports on real hardware still showed OWN clearing (and
+    ; NPQ already down) moments after a "failure" even with the earlier
+    ; 2-3s budget, especially around ring wraparound (EOR slot) - so the
+    ; occasional real-world completion is simply slower than that.
+    call rtc_sec_now
+    mov r9d, eax
+    mov [nic_tx_wait_start], al   ; true start second, kept separate from r9d
+                                  ; (which gets overwritten every tick below) -
+                                  ; so netdiag_dump_tx can report real elapsed
+                                  ; wall-clock time on failure, not just a tick
+                                  ; count that's always the same constant.
+    mov r11d, 5                 ; ~5-6s budget
 .rtks_wait:
+    ; Force-flush any posted DMA write the NIC has queued upstream before
+    ; trusting the in-RAM copy of the descriptor. Two separate runs of this
+    ; exact failure now show the identical, deterministic pattern: OWN and
+    ; the length field both read back cleared, TOK never observed set
+    ; during the whole polling window, and yet no PCI abort/parity fault -
+    ; and critically, the descriptor only ever shows the "completed" state
+    ; *after* netdiag_dump_tx's own PCI config-space read runs, never while
+    ; this loop is plain-RAM-polling. PCI/PCIe ordering only guarantees a
+    ; posted write has landed once a read that traverses the same path
+    ; completes ("reads push writes") - a legacy CF8/CFC config cycle is a
+    ; much stronger/slower completion barrier on real chipsets than an I/O
+    ; BAR register read, and is exactly what netdiag_dump_tx was doing
+    ; right before the "already done" readback. So issue that same kind of
+    ; read ourselves, every iteration, instead of only reading raw system
+    ; RAM and hoping the write has already arrived.
+    movzx ebx, byte [nic_pci_bus]
+    movzx ecx, byte [nic_pci_dev]
+    movzx edx, byte [nic_pci_func]
+    mov r8b, NIC_PCI_CMD
+    call pci_read32
     mov eax, [r10]
     test eax, RTL_DESC_OWN
     jz .rtks_ok
-    dec r9
-    jnz .rtks_wait
-    jmp .rtks_err
+    ; Cross-check against ISR TOK (bit2, Transmit OK) as a second, independent
+    ; completion signal. Field diagnostics (netdiag_dump_tx) have shown this
+    ; chip family occasionally leaving the polled descriptor's OWN bit (and
+    ; even its length field) in a state this driver's simple C+-descriptor
+    ; model doesn't expect, while the PCI bus itself reports no abort/parity
+    ; fault at all - i.e. the frame most likely did go out, but the
+    ; descriptor-bit poll alone can't always see it. TOK is the standard,
+    ; documented r8169 completion indicator and is independent of that
+    ; descriptor race, so treat it as an equally valid "sent" signal.
+    mov edi, [nic_io_base]
+    add edi, RTL_IO_ISR
+    call nic_io_read16
+    test eax, 0x0004
+    jz .rtks_no_tok
+    ; write-1-to-clear just the TOK bit so a stale flag can't falsely
+    ; short-circuit the next send's wait loop
+    mov edi, [nic_io_base]
+    add edi, RTL_IO_ISR
+    mov ax, 0x0004
+    call nic_io_write16
+    jmp .rtks_ok
+.rtks_no_tok:
+    call rtc_sec_now
+    cmp eax, r9d
+    jne .rtks_tick
+    jmp .rtks_wait
+.rtks_tick:
+    mov r9d, eax
+    dec r11d
+    ; BUGFIX: this used to be `jz .rtks_err`, which bails the instant the
+    ; clock ticks into the budget's last second - without ever actually
+    ; polling OWN during that second. On real hardware the chip can clear
+    ; OWN right around that boundary (confirmed by netdiag_dump_tx showing
+    ; OWN already clear moments after a reported failure), so the old code
+    ; was declaring failure on transfers that were, in fact, completing.
+    ; `js` lets r11d reach 0 and still poll through one more full second
+    ; before truly giving up.
+    js .rtks_err
+    ; re-kick the normal-priority queue: harmless if already acknowledged
+    mov edi, [nic_io_base]
+    add edi, RTL_IO_TPPOLL
+    mov al, RTL_TPPOLL_NPQ
+    call nic_io_write8
+    jmp .rtks_wait
 .rtks_ok:
+    pop r11
     pop r10
     pop r9
     pop r8
@@ -9065,6 +9262,13 @@ nic_send_raw_rtl8168:
     clc
     ret
 .rtks_err:
+    call rtc_sec_now
+    sub al, [nic_tx_wait_start]
+    jns .rtks_err_nowrap
+    add al, 60                   ; CMOS seconds wrapped past 59 mid-wait
+.rtks_err_nowrap:
+    mov [nic_tx_wait_elapsed], al
+    pop r11
     pop r10
     pop r9
     pop r8
@@ -9102,6 +9306,7 @@ nic_fetch_rx:
     push rdx
     push rdi
     push rsi
+    push r8
     push r9
     cmp byte [nic_present], 0
     je .frx_none
@@ -9111,6 +9316,7 @@ nic_fetch_rx:
     je .frx_rtl8168
     mov eax, [nic_capr]
     and eax, NIC_RX_RING_MASK
+    mov r8d, eax                  ; descriptor offset (for clearing ROK below)
     lea rsi, [nic_rx_ring + rax]
     mov ax, [rsi]
     test ax, 0x0001               ; ROK set? (QEMU always sets it; empty = 0)
@@ -9146,6 +9352,11 @@ nic_fetch_rx:
     and eax, NIC_RX_RING_MASK
     mov [nic_capr], eax
     call nic_write_capr
+    ; clear ROK on the descriptor we just consumed. QEMU never resets the
+    ; OWN bit on CAPR write, so without this a wrapped ring re-delivers the
+    ; same frames forever once inbound traffic stops.
+    lea rdi, [nic_rx_ring + r8]
+    mov word [rdi], 0
     mov al, 1
     jmp .frx_out
 .frx_skip:
@@ -9154,6 +9365,8 @@ nic_fetch_rx:
     and eax, NIC_RX_RING_MASK
     mov [nic_capr], eax
     call nic_write_capr
+    lea rdi, [nic_rx_ring + r8]
+    mov word [rdi], 0
     jmp .frx_none
 
 ; e1000 RX path: descriptor-ring equivalent of the ring-buffer walk above.
@@ -9279,6 +9492,7 @@ nic_fetch_rx:
     xor al, al
 .frx_out:
     pop r9
+    pop r8
     pop rsi
     pop rdi
     pop rdx
@@ -9483,6 +9697,7 @@ nic_arp_request:
     call netdiag_dump_tx_frame
     pop rcx
 .areq_nodump:
+    mov byte [nic_last_tx_ctx], 1
     call nic_send_raw
     pop r9
     pop rsi
@@ -9577,13 +9792,28 @@ nic_arp_resolve:
     push r15
     mov r12, rax
     mov byte [nic_arp_tried], 0
+    xor r15d, r15d           ; ARP-broadcast raw-TX retry counter - separate from
+                              ; the reply-wait retry below. This covers the NIC
+                              ; itself failing to get the broadcast frame out
+                              ; (nic_send_raw_rtl8168 timeout/race), not the peer
+                              ; failing to answer it. Previously a single failed
+                              ; TX here killed the whole resolve/connect attempt
+                              ; instantly, even though the same class of failure
+                              ; is known to be a transient completion-detection
+                              ; race on this chip (see nic_send_raw_rtl8168).
 .ares:
     mov eax, r12d
     call nic_arp_lookup
     jnc .ares_have
+.ares_send:
     mov eax, r12d
     call nic_arp_request
-    jc .ares_fail
+    jnc .ares_sent
+    cmp r15d, 3
+    jae .ares_fail
+    inc r15d
+    jmp .ares_send
+.ares_sent:
     call rtc_sec_now
     mov r13, rax
 .ares_wait:
@@ -9808,6 +10038,7 @@ nic_send_ip:
     call netdiag_dump_tx_frame
     pop rcx
 .sip_nodump:
+    mov byte [nic_last_tx_ctx], 0
     call nic_send_raw
     jc .sip_fail
     clc
@@ -9869,6 +10100,8 @@ handle_ipv4:
     mov al, [rsi+9]
     cmp al, IP_PROTO_ICMP
     je .ip_icmp
+    cmp al, IP_PROTO_TCP
+    je .ip_tcp
     cmp al, IP_PROTO_UDP
     je .ip_udp
     jmp .ip_done
@@ -9922,6 +10155,12 @@ handle_ipv4:
     jmp .ip_done
 .ip_udp_dhcp:
     call dhcp_handle_packet
+    jmp .ip_done
+.ip_tcp:
+    ; TCP header at rsi + ihl; hand it to the minimal TCP engine.
+    movzx eax, byte [nic_ihl]
+    add rsi, rax
+    call tcp_handle_segment
     jmp .ip_done
 .ip_done:
     pop r15
@@ -10861,10 +11100,11 @@ print_ip4:
     pop rsi
     ret
 
-; fs_save: writes the OS volume (device 0, nodes 0..OS_NODES) then every
-; mounted volume back to its own device. Returns CF=0 on success, CF=1 if
-; the OS volume's disk isn't there/isn't responding. A mounted volume that
-; fails to write is left mounted (best effort; sync still reports success).
+; fs_save: writes the OS volume ([boot_device], nodes 0..OS_NODES) then
+; every mounted volume back to its own device. Returns CF=0 on success,
+; CF=1 if the OS volume's disk isn't there/isn't responding. A mounted
+; volume that fails to write is left mounted (best effort; sync still
+; reports success).
 fs_save:
     push rax
     push rbx
@@ -10874,12 +11114,13 @@ fs_save:
     push r14
     xor r14b, r14b                ; r14b = 1 once anything has actually been saved
     cmp byte [fs_disk_available], 0
-    je .skip_os_volume            ; no legacy-ATA OS disk this session - don't retry
+    je .skip_os_volume            ; no OS disk responded this session - don't retry
                                    ; it, but still try any mounted AHCI volumes below
-    ; OS volume: device 0, base 0, label = root node's name
+    ; OS volume: [boot_device] (0 = legacy ATA boot drive, 4+ = an AHCI slot
+    ; fs_load fell back to), base 0, label = root node's name
     lea rsi, [node_name]
     xor rdi, rdi
-    xor al, al
+    movzx eax, byte [boot_device]
     call vol_write
     jc .disk_gone
     mov r14b, 1
@@ -10928,29 +11169,88 @@ fs_save:
     stc
     ret
 
-; fs_load: reads the OS volume (device 0) into nodes 0..OS_NODES. If the
-; magic/version don't check out (blank disk, older format, etc.) or there's
-; simply no disk responding at the legacy ATA ports (common on real hardware
-; without a PATA/IDE controller, or booting off USB), falls back to fs_init
-; for a fresh in-memory-only filesystem. Mounted volumes are never loaded
-; here - you re-attach them after boot with 'dscan' + 'mount'.
-; sets fs_loaded_from_disk and fs_disk_available accordingly.
+; fs_load: reads the OS volume into nodes 0..OS_NODES. Tries device 0
+; (legacy ATA primary master) first, exactly as always. If that device
+; never responds at all - common on real hardware that has no PATA/IDE
+; controller and only exposes its disk(s) over SATA - it then looks
+; through whatever AHCI port slots (4..4+ahci_port_count-1) ahci_init
+; found at boot, preferring one that already holds a valid SFFS volume,
+; falling back to the first one that simply responds (a blank/new SATA
+; SSD) so a fresh filesystem still has somewhere to persist to. Whichever
+; device actually ends up holding the OS volume is remembered in
+; [boot_device] for fs_save (and cmd_format's "don't touch the boot
+; drive" check) to use afterwards. If nothing responds anywhere, falls
+; back to fs_init for a fresh in-memory-only filesystem.
+; Mounted volumes are never loaded here - you re-attach them after boot
+; with 'dscan' + 'mount'.
+; sets fs_loaded_from_disk, fs_disk_available and boot_device accordingly.
 fs_load:
     push rax
+    push rbx
+    push rcx
     push rdi
     push rsi
-    xor al, al                  ; device 0 (boot drive)
+    mov byte [boot_device], 0
+    xor al, al                  ; device 0 (boot drive) - legacy ATA, tried first
     xor rdi, rdi                ; base 0 = OS volume
     call vol_read
     cmp rax, -1
     jne .loaded
-    ; failed: either no disk, or a disk that isn't SFFS yet
+    ; device 0 gave us nothing. If it's present but just not SFFS (blank
+    ; disk, older format, ...) keep it as the boot device exactly like
+    ; before - only chase AHCI slots when device 0 wasn't there at all.
     cmp byte [fs_disk_available], 0
-    je .no_disk
+    je .try_ahci
     call fs_init
     mov byte [fs_loaded_from_disk], 0
     jmp .done
+.try_ahci:
+    movzx ecx, byte [ahci_port_count]
+    test ecx, ecx
+    jz .no_disk                 ; no AHCI controller/ports either - genuinely nothing
+    ; pass 1: any AHCI slot that already has a valid SFFS volume on it
+    xor ebx, ebx
+.ahci_sffs_scan:
+    cmp ebx, ecx
+    jae .ahci_blank_scan
+    lea eax, [ebx + 4]           ; device id 4+slot
+    mov byte [boot_device], al
+    xor rdi, rdi
+    call vol_read
+    cmp rax, -1
+    jne .ahci_found
+    inc ebx
+    jmp .ahci_sffs_scan
+    ; pass 2: no AHCI slot had a ready SFFS volume yet - use the first one
+    ; that at least responds (freshly flashed/blank SATA SSD) as the boot
+    ; device, so a fresh in-memory filesystem has somewhere to save to.
+.ahci_blank_scan:
+    xor ebx, ebx
+.ahci_blank_loop:
+    cmp ebx, ecx
+    jae .no_disk
+    lea eax, [ebx + 4]
+    mov byte [boot_device], al
+    call disk_select_device
+    mov rax, SUPER_LBA
+    lea rdi, [fs_super_buf]
+    call disk_read_sector
+    jnc .ahci_blank_present
+    inc ebx
+    jmp .ahci_blank_loop
+.ahci_blank_present:
+    mov byte [fs_disk_available], 1
+    call fs_init
+    mov byte [fs_loaded_from_disk], 0
+    jmp .done
+.ahci_found:
+    mov byte [fs_disk_available], 1
+    mov qword [cur_dir], 0
+    mov byte [fs_loaded_from_disk], 1
+    jmp .done
 .no_disk:
+    mov byte [fs_disk_available], 0
+    mov byte [boot_device], 0
     call fs_init
     mov byte [fs_loaded_from_disk], 0
     jmp .done
@@ -10960,6 +11260,8 @@ fs_load:
 .done:
     pop rsi
     pop rdi
+    pop rcx
+    pop rbx
     pop rax
     ret
 
@@ -11925,6 +12227,7 @@ cmd_shelly_rainbow:
     ret
 
 %include "party.asm"
+%include "tcp.asm"
 
 ; print_prompt: prints "rush>" + current path + ": "
 print_prompt:
@@ -13203,9 +13506,9 @@ wig_str_buf:   times 16 db 0    ; scratch for the wig clock widget
 wig_last_sec:  db 0             ; last second the widget drew (redraw gate)
 
 banner:
-    db "ShellyForever v0.1.3 -- 'help' for commands", 10, 0
+    db "ShellyForever v0.1.4 -- 'help' for commands", 10, 0
 build_stamp:
-    db "build 20260805c -- dhcp/dns parser hardening", 10, 0
+    db "build 20260806c -- rtc_sec_now torn-read fix", 10, 0
 
 prompt_head: db "rush>", 0
 prompt_tail: db ": ", 0
@@ -13257,6 +13560,7 @@ str_monitor: db "monitor", 0
 str_dns:     db "dns", 0
 str_net:     db "net", 0
 str_dhcp:    db "dhcp", 0
+str_tcp:     db "tcp", 0
 str_net_ip:  db "ip", 0
 str_net_gw:  db "gw", 0
 str_net_dns: db "dns", 0
@@ -13416,9 +13720,12 @@ msg_diag_dport:    db " dport=0x", 0
 msg_diag_arp_op:   db " op=0x", 0
 msg_diag_arp_spa:  db " spa=", 0
 msg_diag_tx:       db 10, "  tx: ", 0
+msg_diag_txctx_arp: db "diag: failed frame was an ARP broadcast (42 bytes)", 10, 0
+msg_diag_txctx_seg: db "diag: failed frame was a data/segment frame", 10, 0
 msg_diag_pcists:   db "diag: PCI status reg (bits 8/11/12/13/14/15=parity/abort): ", 0
 msg_diag_txdesc:   db "diag: failed TX descriptor raw command dword: ", 0
 msg_diag_tppoll:   db "diag: TPPoll readback (bit6=NPQ still pending): ", 0
+msg_diag_waitsecs: db "diag: TX wait - real seconds elapsed before giving up: ", 0
 msg_diag_chipraw:  db "diag: TxConfig HW-ID raw (captured right after reset): ", 0
 msg_diag_chipname: db "diag: chip family match: ", 0
 msg_chip_8168b:    db "RTL8168B/8111B", 0
@@ -13453,6 +13760,18 @@ msg_bounce_timeout: db "Request timed out.", 10, 0
 msg_monitor_usage: db "monitor: usage: monitor <host>", 10, 0
 msg_monitor_timeout: db "timeout", 10, 0
 msg_monitor_stopped: db 10, "monitor stopped.", 10, 0
+msg_tcp_usage:      db "tcp: usage: tcp <host> <port> [payload]", 10, 0
+msg_tcp_badport:    db "tcp: bad port number.", 10, 0
+msg_tcp_connecting: db "tcp: connecting to ", 0
+msg_tcp_colon:      db ":", 0
+msg_tcp_connected:  db 10, "tcp: connected.", 10, 0
+msg_tcp_sent:       db "tcp: sent ", 0
+msg_tcp_recv:       db "tcp: received ", 0
+msg_tcp_bytes:      db " bytes.", 10, 0
+msg_tcp_timeout:    db "tcp: timed out waiting for a reply.", 10, 0
+msg_tcp_sendfail:   db "tcp: failed to transmit (TX error - link/chip problem).", 10, 0
+msg_tcp_cancelled:  db 10, "tcp: cancelled.", 10, 0
+msg_tcp_reset:      db "tcp: connection reset by peer.", 10, 0
 icmp_data_pad:     db "ShellyForever ping payload 0123456789abcdef", 0
 
 ; --- SFFS disk / mount messages ---
@@ -13608,6 +13927,7 @@ help_text:
     db "  dns <host>         resolve a hostname via DNS", 10
     db "  bounce <host>      send a single ICMP echo (ping)", 10
     db "  monitor <host>     ping repeatedly until Esc", 10
+    db "  tcp <host> <port>  open a TCP connection and exchange data", 10
     db "  help <command>     show detailed help for one command", 10, 10, 0
 
 ; --- per-command detail text for "help <command>" (see help_lookup) ---
@@ -13882,6 +14202,10 @@ node_next:    times MAX_NODES dw 0xFFFF   ; 0xFFFF = end of chain (or no chain)
 
 fs_loaded_from_disk: db 0
 fs_disk_available:   db 1     ; optimistic default; cleared on first ATA failure
+boot_device:         db 0     ; device id holding the OS volume - normally 0
+                               ; (legacy ATA primary master), but fs_load moves
+                               ; this to an AHCI slot (4+) when device 0 never
+                               ; responds and a SATA disk was found instead
 fs_name_too_long:    db 0     ; set by fs_create_node when a name won't fit
 fs_layout_v3:        db 0     ; set by vol_read: 1 = on-disk v3 (has node_next sector)
 
@@ -13933,6 +14257,9 @@ NIC_ARP_CACHE_ENTRIES equ 4
 nic_arp_cache:   times NIC_ARP_CACHE_ENTRIES*10 db 0   ; per entry: 6B MAC + 4B IP
 nic_arp_next:    db 0
 nic_arp_tried:   db 0             ; ARP resolve retry flag
+nic_last_tx_ctx: db 0             ; 0 = data/segment frame, 1 = ARP broadcast -
+                                   ; set right before every nic_send_raw call so
+                                   ; a failure dump can say which frame it was
 nic_tx_desc:     db 0             ; C-mode TX descriptor currently in use (0..3)
 nic_bounce_target: dd 0           ; IP the bounce/monitor loop is pinging
 nic_echo_id:     dw 0x1234
@@ -13973,7 +14300,7 @@ ALIGN 16
 nic_rx_ring:     times NIC_RX_RING_SIZE db 0    ; 8KB DMA RX ring
 ALIGN 16
 nic_tx_buf:      times NIC_TX_BUF_SIZE db 0     ; 2KB frame build/DMA buffer
-net_build_buf:   times 2048 db 0                ; dns query / udp / icmp build area
+net_build_buf:   times 4096 db 0                ; dns query / udp / icmp / tcp build area
 
 ; --- e1000 descriptor rings + RX buffers (identity-mapped; the linked
 ; address doubles as the physical address the chip DMAs into/out of, same
@@ -14012,6 +14339,14 @@ rtl_tx_idx:      dd 0             ; next TX descriptor slot to use
 nic_hwver_raw:   dd 0             ; raw TxConfig value captured right after
                                    ; reset, before our own TCR write - used
                                    ; to identify the exact chip revision
+nic_tx_wait_start:   db 0         ; CMOS seconds value when the current TX
+                                   ; wait began (nic_send_raw_rtl8168)
+nic_tx_wait_elapsed: db 0         ; real wall-clock seconds actually spent
+                                   ; waiting before the last TX failure was
+                                   ; declared - objective proof of whether the
+                                   ; wait budget genuinely ran out or something
+                                   ; failed fast, instead of guessing from
+                                   ; how long a failure "felt" on screen
 
 ; rtl_dev_ids: PCI device ids (vendor 0x10EC) pci_find_rtl8168 matches
 ; against - the RTL8169-compatible C+ descriptor interface shared by the
@@ -14025,6 +14360,28 @@ nic_rx_frame:    times 1536 db 0                ; wrap-reassembly staging
 nic_rx_len:      dd 0                           ; bytes in nic_rx_frame
 dec_tmp_buf:     times 8 db 0
 net_ip_str:      times 20 db 0
+
+; --- minimal polled TCP engine state (Milestone C) ---
+tcp_state:     db 0          ; 0 idle, 1 syn_sent, 2 established, 3 closed
+tcp_retry:     db 0          ; 1 = already retransmitted in the current phase
+tcp_rx_got:    db 0          ; 1 = peer payload landed in tcp_rx_buf
+tcp_fin_got:   db 0          ; 1 = peer sent FIN
+tcp_rst_got:   db 0          ; 1 = peer sent RST
+ALIGN 4
+tcp_isn:       dd 0          ; our initial sequence number (SYN)
+tcp_cur_seq:   dd 0          ; seq field used by the next outgoing segment
+tcp_cur_ack:   dd 0          ; ack field used by the next outgoing segment
+tcp_peer_seq:  dd 0          ; peer's ISN from the SYN-ACK
+tcp_last_ack:  dd 0          ; ack number from the most recent peer segment
+tcp_peer_ip:   dd 0
+tcp_peer_port: dw 0
+tcp_my_port:   dw 0
+tcp_rx_len:    dd 0
+tcp_tx_len:    dd 0
+tcp_rx_prev:   dd 0          ; rx length at the previous idle-check tick
+tcp_dec_buf:   times 10 db 0
+tcp_rx_buf:    times TCP_PAYLOAD_MAX db 0
+tcp_tx_buf:    times TCP_PAYLOAD_MAX db 0
 
 ; Command list (1KB/port, must be 1KB-aligned), FIS receive area (256B/port,
 ; must be 256B-aligned), and command table (256B/port, must be 128B-aligned,

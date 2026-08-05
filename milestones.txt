@@ -27,21 +27,98 @@ Milestone B - NIC + base stack (netinfo/bounce/monitor/dns/net) -> DONE
   monitor/dns/net - the commands work, `help` just doesn't mention
   them yet. Worth a one-line fix whenever kernel.asm is next touched.
 
-Milestone C - Minimal TCP engine                    -> NOT STARTED
+Milestone C - Minimal TCP engine                    -> DONE
+  tcp <host> <port> [payload] does a full client TCP exchange against
+  any reachable host: 3-way handshake (SYN -> SYN-ACK -> ACK), seq/ack
+  tracking, checksums, an advertised window, a polled retransmit on no
+  ACK (RTC 1s tick, Esc-cancelable), and a read-until-FIN accumulation
+  of the response (up to TCP_PAYLOAD_MAX = 1024 bytes). Verified
+  end-to-end in QEMU against Python's http.server: full 870-byte
+  directory listing captured and printed, then clean close and back to
+  the shell. (Retransmit is one-shot — enough for slirp, which ACKs the
+  guest itself; a real RTO tick is still the honest long-term answer,
+  but was dropped once the immediate correctness bugs were fixed.)
+  Bug-fix history during bring-up: peer FIN was never ACKed (payload-0
+  segments were skipped, so the server fast-retransmitted FIN forever
+  and filled the RX ring); pure ACKs were being ACKed in return, echoing
+  an empty ACK loop with a stale sequence; and nic_fetch_rx never cleared
+  the RTL8139 descriptor's ROK bit, so once inbound traffic stopped a
+  wrapped ring re-delivered the same frames forever (the guest's "infinite
+  receive loop" — qemu itself never clears ROK for the driver).
+  REAL HARDWARE: the RTL8168 backend (nic_driver_type 2) is the one that
+  matters on desktop motherboards — it's the path DHCP/netinfo/dhcp
+  diagnostics were exercised on. TCP rides the same driver-agnostic
+  nic_send_ip/netpoll entry points, so it uses the RTL8168 descriptor
+  ring unchanged. One real-hardware bug found in an audit: RxMaxSize was
+  set to 0x1FFF (8191) while the RX buffers are 2048 bytes — a jumbo
+  frame would DMA-truncate into the buffer but the descriptor length
+  field reports the full size, so the RX copy would overrun. Fixed to
+  0x0640 (1600, Linux r8169's MTU-1500 value). QEMU can't emulate the
+  RTL8168, so the descriptor-ring RX/TX paths are validated by audit,
+  not boot test.
+
+Milestone C.1 - Real-hardware bring-up fixes          -> DONE, VERIFIED ON REAL HW
+  Three real-hardware-only bugs found after C shipped (none of these show
+  up under QEMU, which is exactly why they survived boot-testing there):
+
+  1. Boot filesystem was pinned to device 0 (legacy ATA primary master).
+     On real hardware with no PATA/IDE controller - a SATA-only board,
+     which is most of them - device 0 never answers, so fs_load always
+     fell through to "No disk detected - filesystem will not persist",
+     even when ahci_init had already found and brought up the SATA disk
+     as an AHCI port slot. Fixed: fs_load now falls back to scanning the
+     AHCI slots ahci_init claimed at boot when device 0 doesn't respond
+     (first pass for an existing SFFS volume, second pass for a blank
+     disk to init fresh onto), and remembers which device actually holds
+     the OS volume in a new boot_device variable. fs_save and cmd_format's
+     "don't touch the boot drive" guard both use boot_device now instead
+     of a hardcoded 0.
+  2. e1000 NIC bring-up talks to its registers over MMIO (nic_mmio_base)
+     through the kernel's cacheable identity map - AHCI's ABAR got the
+     same treatment fixed early on (ahci_mark_uncached), but the e1000
+     backend never got the equivalent call, so CTRL.RST and friends could
+     read back stale cached values on real silicon instead of what the
+     device just wrote. Fixed by reusing ahci_mark_uncached (it's generic
+     - just clears caching on whichever identity-map page contains the
+     physical address you hand it) on the e1000 BAR0 window right after
+     it's read from PCI config space.
+  3. RTL8168: a PHY bring-up routine (rtl_phy_power_up_and_renegotiate -
+     select register page 0, clear the power-down bit, force BMCR
+     reset+enable+restart-autonegotiation) was written but never actually
+     called anywhere. The MAC-side soft reset only resets the MAC, not the
+     PHY, so a PHY firmware left powered-down/not-negotiating meant
+     RTL_IO_PHYSTATUS's link bit never asserted - .rtl_link_wait burned
+     its ~5s budget and gave up, but nic_present still got set to 1
+     regardless, so this failed silently: netinfo/dscan/etc. all looked
+     fine, but every frame sent from then on was just dropped, and tcp
+     (or anything else needing the network) hung until its own timeout.
+     Fixed by wiring the call in right after the MAC reset completes, so
+     autonegotiation runs concurrently with the rest of ring setup instead
+     of starting cold right before the link-wait loop begins polling.
+     (A fourth, earlier real-hardware RTL8168 bug - a posted-write-
+     ordering issue where TX completion could be invisible to a plain RAM
+     poll on this chip family - was already fixed before this pass, via a
+     PCI-config-space read used as a completion barrier inside the TX wait
+     loop. netdiag_dump_tx's diagnostics, still in the driver, were what
+     surfaced it.)
+
+  VERIFIED: tcp now works end-to-end on real hardware (RTL8168 chip,
+  no legacy ATA - SATA SSD picked up via the AHCI fallback above).
+  dhcp/netinfo were already confirmed working pre-fix; tcp was the one
+  still failing (silent link-down, bug 3) until this pass.
+
 Milestone D - HTTP take / give                       -> NOT STARTED
 
 Budget, actual vs planned:
   Planned: KERNEL_SECTORS 260 -> 290, FS_LBA_START stays 300.
-  Actual: KERNEL_SECTORS is at 390 (Milestone B's NIC/stack code ran
-  well past the 290 estimate) and FS_LBA_START moved to 400 to stay
-  clear of it. Both still comfortably fit a 2 MB image; if C/D also
-  overrun their budget the same way, expect another FS_LBA_START bump
+  Actual: KERNEL_SECTORS is at 404 (Milestone B's NIC/stack code ran
+  well past the 290 estimate and C grew it further) and FS_LBA_START
+  moved to 400 to stay clear of it. Still comfortably inside a 2 MB
+  image; if D overruns the same way, expect another FS_LBA_START bump
   rather than reusing 400 as gospel.
 
-README.md has been updated to document Milestones A and B (SFFS v3 /
-multi-block files, and the networking commands) as shipped. C and D
-stay out of the README until they're real, and take/give naming is
-carried forward for whenever Milestone D lands.
+README.md has been updated to document Milestones A, B, and C as
+shipped. D (take/give) stays out of the README until it's real.
 =====================================================================
 
 Final Plan: Multi-block files + networking + HTTP get/put (v0.2.0)

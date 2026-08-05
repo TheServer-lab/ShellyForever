@@ -1,6 +1,6 @@
 # ShellyForever
 
-**Version:** 0.1.3
+**Version:** 0.1.4
 
 A 64-bit shell-based OS written entirely in x86-64 NASM assembly, from scratch —
 no C, no BIOS libraries beyond boot-time disk/keyboard calls, no existing kernel.
@@ -82,6 +82,7 @@ no C, no BIOS libraries beyond boot-time disk/keyboard calls, no existing kernel
 | `dns` | `dns google.com` | resolve a hostname via the configured DNS server |
 | `bounce` | `bounce 10.0.2.2` | send one ICMP echo (ping) with a ~2-3s timeout |
 | `monitor` | `monitor google.com` | ping repeatedly, one line per reply, until Esc |
+| `tcp` | `tcp 10.0.2.2 8000` | open a TCP connection, send a payload, and print the reply |
 
 ### Line editing: history, tab completion, and scrollback
 
@@ -426,6 +427,14 @@ that don't expose legacy IDE at all. `dscan`/`fmt`/`mount`/`sync` treat both
 transports as one unified list of device slots — ids `0..3` are the legacy
 ATA slots, ids `4..4+AHCI_MAX_PORTS-1` are AHCI ports discovered at boot.
 
+The boot volume itself isn't pinned to device 0 anymore, either: on boot,
+the kernel tries device 0 (legacy ATA) first, and if nothing answers there —
+the normal case on a real, SATA-only board with no PATA/IDE controller — it
+falls back to whichever AHCI port slot actually has a disk, remembering
+which device the OS volume lives on for `sync`/`rboot`/`sdown` to write back
+to. Without this, a real machine whose only disk is SATA would report "No
+disk detected" forever even though `dscan` could see the drive just fine.
+
 ### SFFS v3 on-disk format
 
 Each disk volume is self-contained and starts at sector (LBA) 400 — well
@@ -515,9 +524,22 @@ If none of the three is present, every networking command reports there's
 no NIC and the rest of the OS behaves exactly as it always did — networking
 is entirely additive.
 
+All three drivers, including the RTL8168 path most real desktop boards will
+actually use, are now verified working end-to-end on real hardware (`dhcp`,
+`netinfo`, and `tcp` all confirmed), not just QEMU. Getting there took a few
+real-hardware-only fixes that QEMU's virtual devices never exercise: the
+e1000 backend's MMIO registers needed the same uncached identity-map
+treatment the AHCI driver already had (a cacheable mapping could read back
+a stale value instead of what the device just wrote), and the RTL8168 PHY
+needed an explicit power-up/renegotiate poke — without it, a PHY left
+powered-down by firmware meant the link never came up even though the MAC
+reset succeeded and the driver reported the NIC as present. See
+`milestones.txt` for the full writeup.
+
 On top of whichever driver is active: Ethernet II framing, ARP (with a
 small resolve cache), IPv4 with checksums, ICMP echo (ping), UDP, a DNS client,
-and a DHCP client. IP/mask/gateway/DNS default to QEMU's `slirp` user-networking
+a DHCP client, and a minimal polled **TCP** engine. IP/mask/gateway/DNS default
+to QEMU's `slirp` user-networking
 values (`10.0.2.15` / `255.255.255.0` / gw `10.0.2.2` / dns `10.0.2.3`), and can be
 configured automatically via **`dhcp`** (recommended for real hardware) or manually with `net`.
 
@@ -529,6 +551,7 @@ configured automatically via **`dhcp`** (recommended for real hardware) or manua
 | `dns` | `dns google.com` | resolve a hostname to an IPv4 address via the configured DNS server |
 | `bounce` | `bounce 10.0.2.2` | send a single ICMP echo request; prints the reply or times out (~2-3s) |
 | `monitor` | `monitor google.com` | ping repeatedly, one line per reply, until you press **Esc** |
+| `tcp` | `tcp 10.0.2.2 8000` | open a TCP connection to a host/port, optionally send a payload, print the reply |
 
 ```
 rush>/home: netinfo
@@ -549,9 +572,36 @@ rush>/home:
 ```
 
 Everything is polled (no interrupts), matching the keyboard and disk
-drivers — `bounce`/`monitor`/`dns` block the shell while they wait, and
-`monitor` checks for **Esc** on every poll so it can be interrupted like
-`wig time` or a running `rr` script.
+drivers — `bounce`/`monitor`/`dns`/`tcp` block the shell while they wait, and
+`monitor` and `tcp` check for **Esc** on every poll so they can be interrupted
+like `wig time` or a running `rr` script.
+
+### TCP: the `tcp` command
+
+`tcp <host> <port> [payload]` runs a minimal client TCP exchange: it resolves
+the host (raw IPv4 address directly, or a hostname via the configured DNS
+server), does a 3-way handshake (SYN → SYN-ACK → ACK) with sequence/ack
+tracking, sends the payload if one was given, advertises a small receive
+window, and accumulates the peer's reply until the connection closes (FIN),
+printing what came back. It reads up to 1024 bytes of response. It is
+Esc-cancelable while it waits.
+
+```
+rush>/home: tcp 10.0.2.2 8000
+tcp: connecting to 10.0.2.2:8000
+tcp: connected.
+tcp: sent 0 bytes.
+tcp: received 870 bytes.
+HTTP/1.0 200 OK
+Content-type: text/html; charset=utf-8
+...
+rush>/home:
+```
+
+Because it reads until FIN (no content-length handling yet), the peer should
+close the connection when it's done — plain HTTP/1.0 servers like Python's
+`http.server` do. Retransmission is polled with a 1s RTC tick and is bounded;
+a full RTO with exponential backoff is still future work.
 
 **Testing in QEMU:** add a NIC to your invocation, e.g.
 ```bash
@@ -560,12 +610,14 @@ qemu-system-x86_64 -drive format=raw,file=shellyforever.img \
 ```
 (swap `rtl8139` for `e1000` or a modern Realtek gigabit model to exercise
 the other two drivers). `slirp` user networking answers ARP/ICMP/DNS itself
-and doesn't require any host firewall changes.
+and doesn't require any host firewall changes. To test `tcp` end-to-end, run
+`python -m http.server 8000 --bind 127.0.0.1` on the host — `slirp`'s gateway
+(10.0.2.2) is the host's loopback, so `tcp 10.0.2.2 8000` reaches it.
 
-**Not yet implemented:** there's no TCP, so no way to actually fetch a web
-page yet — `bounce`/`monitor`/`dns` are as far as it goes today. A minimal
-TCP engine and `take`/`give` (HTTP get/put, renamed for the naming theme)
-commands are planned next; see `milestones.txt` for the in-progress plan.
+**Not yet implemented:** there's no HTTP `take`/`give` (get/put) yet — the
+`tcp` command is a raw byte exchange. Turning it into
+`take http://host/path <file>` and `give http://host/upload <file>` (HTTP/1.0
+GET/POST with content-length) is planned next; see `milestones.txt`.
 
 ## Shutdown (`sdown`)
 
@@ -609,8 +661,8 @@ message and then nothing, which is your cue to power off manually.
 - Persistence is whole-table snapshotting (like a save file), not an
   incremental/journaled on-disk format — simple and robust for this scale,
   but a `sync` rewrites the whole reserved region every time.
-- `kernel.bin` occupies LBA 1..390 — `KERNEL_SECTORS` in `boot.asm` has
-  already been bumped once, from its original 199, to make room for the
+- `kernel.bin` occupies LBA 1..404 — `KERNEL_SECTORS` in `boot.asm` has
+  already been bumped twice, from its original 199, to make room for the
   filesystem chaining and networking code. If you add enough new code to
   cross that budget again, bump `KERNEL_SECTORS` once more — it's a
   one-line change, but the bootloader will silently load a truncated kernel
@@ -620,11 +672,11 @@ message and then nothing, which is your cue to power off manually.
 
 ## Natural next steps, in order of payoff
 
-1. **A minimal TCP engine, then `take`/`give` (HTTP get/put)** — the
-   networking stack currently stops at ICMP/UDP/DNS; a polled TCP
-   handshake/send/recv plus HTTP/1.0 request-response would let `take
-   <url> <file>` and `give <url> <file>` actually move files over the
-   network. See `milestones.txt` for the in-progress plan.
+1. **`take`/`give` (HTTP get/put)** — the raw `tcp` command already does a
+   real client exchange end-to-end; wrapping it in `take http://host/path
+   <file>` and `give http://host/upload <file>` (HTTP/1.0 GET/POST with
+   content-length and response-header parsing) would let you actually move
+   files over the network. See `milestones.txt` for the in-progress plan.
 2. **Path arguments** for `cf`/`cpy`/`mov`/`rname` (e.g. `cpy docs/notes.txt ..`)
    instead of current-folder-only operations.
 3. **Autosave on mutation** instead of requiring explicit `sync`/`rboot`/`sdown`,
@@ -636,6 +688,25 @@ message and then nothing, which is your cue to power off manually.
 
 ## What's new
 
+- **Real-hardware bring-up fixes (v0.1.4)** — three bugs that only show up
+  on real hardware (invisible to QEMU's virtual devices), found and fixed
+  after `tcp` reached a real RTL8168 board and initially failed:
+  - The boot filesystem was pinned to device 0 (legacy ATA); a SATA-only
+    board with no PATA/IDE controller always reported "No disk detected"
+    even though the AHCI driver had found the drive. `fs_load` now falls
+    back to the AHCI slots `ahci_init` found when device 0 doesn't answer.
+  - The e1000 driver's MMIO registers weren't marked uncached (AHCI's ABAR
+    already was) — could read back stale values on real silicon.
+  - The RTL8168 PHY power-up/renegotiate routine existed but was never
+    called, so a PHY left powered-down by firmware meant the link never
+    came up — silently, since `nic_present` still got set regardless.
+  `tcp` (and `dhcp`/`netinfo`) are now confirmed working end-to-end on real
+  hardware. See `milestones.txt` for the full writeup.
+- **`tcp` command (v0.1.4)** — a minimal polled TCP engine: handshake,
+  send, and read-until-FIN against any reachable host. Also fixed three
+  real bugs that surfaced while bringing it up (RTL8139 RX starvation
+  from uncleared ROK bits, never-ACKed FINs, and an ACK echo loop). See
+  "TCP: the `tcp` command" above.
 - **Networking (v0.1.3)** — a polled Ethernet/ARP/IPv4/ICMP/UDP/DNS stack,
   with drivers for the RTL8139, Intel e1000, and Realtek RTL8168 NICs.
   New commands: `netinfo`, `net ip|gw|dns <a.b.c.d>`, `dns <host>`,
