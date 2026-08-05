@@ -1,6 +1,6 @@
 # ShellyForever
 
-**Version:** 0.1.2
+**Version:** 0.1.3
 
 A 64-bit shell-based OS written entirely in x86-64 NASM assembly, from scratch —
 no C, no BIOS libraries beyond boot-time disk/keyboard calls, no existing kernel.
@@ -21,6 +21,13 @@ no C, no BIOS libraries beyond boot-time disk/keyboard calls, no existing kernel
     recursive copy/move/delete of whole subtrees.
   - A simple `name = value` variable table (int64), reused by `calc`.
   - A built-in line editor for file content (`edit`).
+  - Multi-block (chained) files — a single file can span multiple
+    filesystem nodes, so it's no longer capped at one node's content size.
+    See "Multi-block files (SFFS v3)" below.
+  - A polled networking stack: hand-written drivers for the RTL8139
+    (legacy), Intel e1000, and Realtek RTL8168/8169/8161 ("PCIe GBE
+    Family Controller") NICs, plus Ethernet II + ARP + IPv4 + ICMP echo +
+    UDP + a DNS client. See "Networking" below.
 
 ## Commands implemented
 
@@ -51,6 +58,7 @@ no C, no BIOS libraries beyond boot-time disk/keyboard calls, no existing kernel
 | `shelly` | `shelly` | print the splash banner: a rainbow ShellyForever OS title, the developer credit, and the copyright line |
 | `write` | `show hi ~ write file.txt` | write text to a file (creates it, or overwrites); handy as a `~` pipe target |
 | `rr` | `rr script.rsh` | run a rush script file (`$` = comment line) |
+| `party` | `party hello.pa` | run a program in **Party** (`.pa`), a small built-in scripting language — own variables, expressions, `if`/`else`, `while`, `func`/`return`, and `display` output. See "Party" below and `PARTY_SPEC.md` |
 | `prs` | `prs`, `prs kill 1`, `prs kill rushrun` | list processes, or kill by PID or name |
 | `auth` | `auth sdown`, `auth vars rmv all` | elevate privileges for one dangerous command |
 | `current` | `current` | print current path |
@@ -69,6 +77,11 @@ no C, no BIOS libraries beyond boot-time disk/keyboard calls, no existing kernel
 | `sync` | `sync` | save the filesystem (and mounted volumes) to disk |
 | `rboot` | `rboot` | save to disk, then restart (requires auth) |
 | `sdown` | `sdown` | save to disk, then shut down (requires auth) |
+| `netinfo` | `netinfo` | show the NIC's MAC address and static IP/mask/gateway/DNS config |
+| `net` | `net ip 10.0.2.20`, `net gw 10.0.2.2`, `net dns 8.8.8.8` | change the static IP, gateway, or DNS config |
+| `dns` | `dns google.com` | resolve a hostname via the configured DNS server |
+| `bounce` | `bounce 10.0.2.2` | send one ICMP echo (ping) with a ~2-3s timeout |
+| `monitor` | `monitor google.com` | ping repeatedly, one line per reply, until Esc |
 
 ### Line editing: history, tab completion, and scrollback
 
@@ -247,6 +260,46 @@ Hello, there.
 Unlike `mkfl -force`, `owrite` requires the file to already exist (it errors
 with `owrite: no such file: <path>` otherwise) and never creates one.
 
+### Party: the built-in scripting language
+
+`party <file.pa>` runs a program in **Party**, a small scripting language
+with its own variables, expression evaluator, and control flow — no shell
+command access from inside a script. The full spec is in `PARTY_SPEC.md`.
+
+```
+vars a = "hi"
+vars n = 5
+
+func double(x) {
+    return x * 2
+}
+
+if (a == "hi") {
+    display "Hello world"
+    display double(n)
+}
+```
+
+What's in there:
+
+- **Types:** `int`, `float`, `bool`, `string` (quoted text; a bare word is
+  always a variable reference, never a string).
+- **Variables:** declare with `vars name = value` (value required), reassign
+  with `name = value`; using an undeclared variable is an error.
+- **Operators:** `()`, `* /`, `+ -`, comparisons `< <= > >=`, equality
+  `== !=`, and statement-level `=`.
+- **Control flow:** `if` / `else if` / `else` and `while`, with mandatory
+  `{ }` braces on every block.
+- **Functions:** `func name(a, b) { return ... }` — fixed arity, recursion
+  allowed (depth-limited call stack), callable before their `func` block
+  appears. No mandatory `main()`: top-level statements run top-to-bottom.
+- **Output:** `display <expr>` prints the value followed by a newline.
+- **Not in v0.1:** no user input, `%`, `&&`/`||`, or arrays (see
+  `PARTY_SPEC.md`).
+
+`party foo.pa -tokens` dumps the raw token stream instead of executing, and
+**Esc** interrupts a running script.
+
 ### The RTC clock: `date`, `time`, and `wig time`
 
 The kernel reads the MC146818 RTC/CMOS clock chip (ports `0x70`/`0x71`,
@@ -373,17 +426,44 @@ that don't expose legacy IDE at all. `dscan`/`fmt`/`mount`/`sync` treat both
 transports as one unified list of device slots — ids `0..3` are the legacy
 ATA slots, ids `4..4+AHCI_MAX_PORTS-1` are AHCI ports discovered at boot.
 
-### SFFS v2 on-disk format
+### SFFS v3 on-disk format
 
-Each disk volume is self-contained and starts at sector (LBA) 200 — well
-clear of the boot sector and the kernel's own sectors (1..199):
+Each disk volume is self-contained and starts at sector (LBA) 400 — well
+clear of the boot sector and the kernel's own sectors (the kernel has grown
+enough, mostly from the networking stack, that the filesystem region moved
+up from LBA 200 to stay clear of it):
 
 - **Superblock** (1 sector): `SFFS` magic, version byte, then a 32-byte
   label.
-- **Type / parent / name / content** sectors: one node table per volume
-  (`node_type`, `node_parent`, 4 name sectors, 20 content sectors), exactly
-  like the old whole-disk blob but scoped per volume with *relative* parent
-  indices (`0xFFFF` = volume root), so the same layout works on any drive.
+- **Type / parent / next / name / content** sectors: one node table per
+  volume (`node_type`, `node_parent`, `node_next`, 4 name sectors, 20
+  content sectors), scoped per volume with *relative* parent indices
+  (`0xFFFF` = volume root), so the same layout works on any drive.
+- **Older v2 volumes** (no `node_next` sector; content starts one sector
+  earlier) still load and read fine — a `sync` upgrades them to v3 in
+  place.
+
+### Multi-block files (SFFS v3)
+
+A file's content used to be capped at a single node's ~160-byte slot. Now a
+file whose content is longer than that is stored as a chain: its own node
+holds the first ~159 bytes, and `node_next` points at a continuation node
+(a new node type, invisible to path lookup, `list`, and the allocator) that
+holds the next ~159 bytes, and so on until `node_next` is `0xFFFF`. Deleting
+a file frees every node in its chain.
+
+This raises the practical cap on a single file's size from ~160 bytes to
+~10 KB (a lone big file can use the volume's entire 64-node table if
+nothing else needs a node) — plenty for text, notes, and config files.
+`view`, `show`, `lookfor`, `find`, `edit`, `owrite`, and `del` all work
+transparently across chained files; nothing about how you use those
+commands changes.
+
+```
+rush>/home: mkfl big.txt "..." ; view big.txt
+```
+behaves exactly the same whether `big.txt` fits in one node or spans a
+dozen — the chaining is invisible from the shell.
 
 ### One boot drive, up to two mounted drives
 
@@ -417,6 +497,76 @@ you keep using the same image file. The old single-blob-at-LBA-100 format
 was tested end-to-end in QEMU; the SFFS v2 multi-volume format has been
 assembled but not yet boot-tested.
 
+## Networking
+
+The kernel brings up whichever NIC it finds at boot — a hand-written driver
+for each of three chips, tried in this order:
+
+1. **RTL8139** — the classic QEMU default NIC (`-nic model=rtl8139` /
+   the emulator's default), a simple ring-buffer RX/TX design.
+2. **Intel e1000** — QEMU's `-nic model=e1000`, and a common real/virtual
+   gigabit chip, using descriptor rings.
+3. **Realtek RTL8168/8169/8161** ("PCIe GBE Family Controller") — the
+   gigabit Realtek chip found on most real desktop motherboards. Also
+   descriptor-ring based, but reached over port I/O like the RTL8139
+   driver rather than MMIO like the e1000 driver.
+
+If none of the three is present, every networking command reports there's
+no NIC and the rest of the OS behaves exactly as it always did — networking
+is entirely additive.
+
+On top of whichever driver is active: Ethernet II framing, ARP (with a
+small resolve cache), IPv4 with checksums, ICMP echo (ping), UDP, a DNS client,
+and a DHCP client. IP/mask/gateway/DNS default to QEMU's `slirp` user-networking
+values (`10.0.2.15` / `255.255.255.0` / gw `10.0.2.2` / dns `10.0.2.3`), and can be
+configured automatically via **`dhcp`** (recommended for real hardware) or manually with `net`.
+
+| Command | Example | Behavior |
+|---|---|---|
+| `netinfo` | `netinfo` | print the NIC's MAC address and current IP/mask/gateway/DNS |
+| `net` | `net ip 10.0.2.20`, `net gw 10.0.2.2`, `net dns 8.8.8.8` | change the static IP, gateway, or DNS server |
+| `dhcp` | `dhcp` | request IP address, subnet mask, gateway, and DNS server via DHCP |
+| `dns` | `dns google.com` | resolve a hostname to an IPv4 address via the configured DNS server |
+| `bounce` | `bounce 10.0.2.2` | send a single ICMP echo request; prints the reply or times out (~2-3s) |
+| `monitor` | `monitor google.com` | ping repeatedly, one line per reply, until you press **Esc** |
+
+```
+rush>/home: netinfo
+MAC : 52:54:00:12:34:56
+IP  : 10.0.2.15
+MASK: 255.255.255.0
+GW  : 10.0.2.2
+DNS : 10.0.2.3
+rush>/home: dns google.com
+google.com = 142.250.premium.address
+rush>/home: bounce 10.0.2.2
+reply from 10.0.2.2, 32 bytes
+rush>/home: monitor google.com
+reply from 172.217.x.x, 32 bytes
+reply from 172.217.x.x, 32 bytes
+^[
+rush>/home:
+```
+
+Everything is polled (no interrupts), matching the keyboard and disk
+drivers — `bounce`/`monitor`/`dns` block the shell while they wait, and
+`monitor` checks for **Esc** on every poll so it can be interrupted like
+`wig time` or a running `rr` script.
+
+**Testing in QEMU:** add a NIC to your invocation, e.g.
+```bash
+qemu-system-x86_64 -drive format=raw,file=shellyforever.img \
+  -netdev user,id=n0 -device rtl8139,netdev=n0
+```
+(swap `rtl8139` for `e1000` or a modern Realtek gigabit model to exercise
+the other two drivers). `slirp` user networking answers ARP/ICMP/DNS itself
+and doesn't require any host firewall changes.
+
+**Not yet implemented:** there's no TCP, so no way to actually fetch a web
+page yet — `bounce`/`monitor`/`dns` are as far as it goes today. A minimal
+TCP engine and `take`/`give` (HTTP get/put, renamed for the naming theme)
+commands are planned next; see `milestones.txt` for the in-progress plan.
+
 ## Shutdown (`sdown`)
 
 There's no ACPI table parsing in this kernel, so `sdown` doesn't negotiate a
@@ -438,10 +588,11 @@ message and then nothing, which is your cue to power off manually.
   negotiated ACPI shutdown (see above).
 - 64 nodes per volume, with the in-memory node table sized for the boot
   volume plus up to `MAX_MOUNTS` (2) mounted volumes — 192 nodes total in
-  memory. File/folder names capped at 32 bytes, file content capped at ~160
-  bytes, line input capped at ~220 chars — easy to bump, just constants at
-  the top of `kernel.asm` (the on-disk format size adjusts automatically
-  since it's computed from those same constants).
+  memory. File/folder names capped at 32 bytes, a single node still holds
+  ~160 bytes but files now chain across nodes (see "Multi-block files"
+  above) up to ~10 KB, line input capped at ~220 chars — easy to bump, just
+  constants at the top of `kernel.asm` (the on-disk format size adjusts
+  automatically since it's computed from those same constants).
   Worth knowing: `mkfl`/`rname`/`cpy`/`mov` don't currently check that a
   destination name is short enough to fit in that 32-byte slot before
   copying it in.
@@ -458,26 +609,45 @@ message and then nothing, which is your cue to power off manually.
 - Persistence is whole-table snapshotting (like a save file), not an
   incremental/journaled on-disk format — simple and robust for this scale,
   but a `sync` rewrites the whole reserved region every time.
-- `kernel.bin` currently uses ~189 of the 199 sectors (`KERNEL_SECTORS` in
-  `boot.asm`) the bootloader reserves for it. If you add enough new code to
-  cross that budget, bump `KERNEL_SECTORS` again — it's a one-line change,
-  but the bootloader will silently load a truncated kernel if you forget,
-  which looks like an unrelated crash. (The on-disk SFFS region starts at
-  LBA 200, so keep the kernel's reserved region clear of that.)
+- `kernel.bin` occupies LBA 1..390 — `KERNEL_SECTORS` in `boot.asm` has
+  already been bumped once, from its original 199, to make room for the
+  filesystem chaining and networking code. If you add enough new code to
+  cross that budget again, bump `KERNEL_SECTORS` once more — it's a
+  one-line change, but the bootloader will silently load a truncated kernel
+  if you forget, which looks like an unrelated crash. (The on-disk SFFS
+  region now starts at LBA 400 — bumped from 200 for the same reason — so
+  keep the kernel's reserved region clear of that.)
 
 ## Natural next steps, in order of payoff
 
-1. **Path arguments** for `cf`/`cpy`/`mov`/`rname` (e.g. `cpy docs/notes.txt ..`)
+1. **A minimal TCP engine, then `take`/`give` (HTTP get/put)** — the
+   networking stack currently stops at ICMP/UDP/DNS; a polled TCP
+   handshake/send/recv plus HTTP/1.0 request-response would let `take
+   <url> <file>` and `give <url> <file>` actually move files over the
+   network. See `milestones.txt` for the in-progress plan.
+2. **Path arguments** for `cf`/`cpy`/`mov`/`rname` (e.g. `cpy docs/notes.txt ..`)
    instead of current-folder-only operations.
-2. **Autosave on mutation** instead of requiring explicit `sync`/`rboot`/`sdown`,
+3. **Autosave on mutation** instead of requiring explicit `sync`/`rboot`/`sdown`,
    if you'd rather not think about it (tradeoff: more disk writes).
-3. **A real memory allocator** once you want dynamic-sized files/folders
+4. **A real memory allocator** once you want dynamic-sized files/folders
    instead of fixed slot counts.
-4. **Password-based auth** instead of the current one-shot `auth` flag, so
+5. **Password-based auth** instead of the current one-shot `auth` flag, so
    elevated sessions can span multiple commands without re-authenticating.
 
 ## What's new
 
+- **Networking (v0.1.3)** — a polled Ethernet/ARP/IPv4/ICMP/UDP/DNS stack,
+  with drivers for the RTL8139, Intel e1000, and Realtek RTL8168 NICs.
+  New commands: `netinfo`, `net ip|gw|dns <a.b.c.d>`, `dns <host>`,
+  `bounce <host>`, `monitor <host>`, `dhcp`. See "Networking" above.
+- **`party` (v0.1.3)** — a simple built-in scripting language with its own
+  variables, expressions, `if`/`else`/`while`, `func`/`return`, and
+  `display` output. `party foo.pa` runs a program. See "Party" above and
+  `PARTY_SPEC.md`.
+- **Multi-block files / SFFS v3 (v0.1.3)** — files are no longer capped at
+  one node's ~160-byte content slot; they chain across nodes up to ~10 KB.
+  Older v2 volumes still load fine and are upgraded on `sync`. See
+  "Multi-block files (SFFS v3)" above.
 - **`unmount <label>` (v0.1.2)** — detach a mounted drive's volume. The mount
   slot is dropped (so `sync` stops writing that drive back) and `/<label>/`
   disappears from the filesystem, but the data on the drive is left untouched.
@@ -586,3 +756,12 @@ cleanly with no errors and a careful hand trace of the logic, but weren't all
 run interactively — worth exercising yourself in QEMU to catch anything a
 static read-through can't, and happy to help debug from there if something
 misbehaves.
+
+The multi-block-file and networking work described above (v0.1.3) was
+assembled cleanly with `nasm -f bin` and hand-traced, including a fix to
+`nic_fetch_rx` (it was missing its RTL8168 branch entirely — RX for that
+driver silently ran the RTL8139 ring-buffer code instead of walking its own
+descriptor ring). No QEMU was available in the environment used for this
+pass, so none of it has been boot-tested yet — exercise `bounce`/`monitor`/
+`dns`/`net`, and a chained-file round trip (`mkfl` a file bigger than ~160
+bytes, then `view`/`sync`/reboot it), yourself before relying on it.

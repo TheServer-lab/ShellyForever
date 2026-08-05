@@ -24,14 +24,14 @@ jmp start
 
 KERNEL_LOAD_SEG   equ 0x0000
 KERNEL_LOAD_OFF   equ 0x8000
-KERNEL_SECTORS    equ 290         ; how many 512B sectors to load (145KB). Bumped from
-                                  ; 260 to make room for party.asm (the Party language
-                                   ; lexer/interpreter). kernel.bin now needs ~268 sectors,
-                                   ; so this leaves some headroom again. The CHS fallback
-                                   ; reads at most 18 sectors per BIOS call (not limited by
-                                   ; al directly - see the .loop chunking below) and this
-                                   ; total must stay clear of the SFFS region at LBA 300
-                                   ; (see kernel.asm's FS_LBA_START) and <= 2880 (media).
+KERNEL_SECTORS    equ 390         ; how many 512B sectors to load (195KB). Bumped from
+                                  ; 290 to 390 for the NIC + network stack (Milestone B,
+                                  ; kernel.bin now ~308 sectors) and room for TCP/HTTP
+                                  ; (Milestones C/D) to follow. The CHS fallback
+                                  ; reads at most 18 sectors per BIOS call (not limited by
+                                  ; al directly - see the .loop chunking below) and this
+                                  ; total must stay clear of the SFFS region at LBA 400
+                                  ; (see kernel.asm's FS_LBA_START) and <= 2880 (media).
 
 ; ---- on-screen checkpoint markers ----
 ; Each stage of the real->protected->long mode transition writes one

@@ -74,10 +74,11 @@ PIPE_CAP_MAX    equ 192       ; max bytes captured from a "~" pipe's left side
 ;  dscan probes all four ATA device slots for the magic, format writes
 ;  a fresh empty volume + label, and mount loads a volume's node table
 ;  into memory (remapping its parent indices) rooted at /<label>/.
-;  The kernel occupies LBA 1..260 (KERNEL_SECTORS in boot.asm), so the
-;  filesystem region at LBA 300 is well clear of it.
+;  The kernel occupies LBA 1..390 (KERNEL_SECTORS in boot.asm) - the
+;  NIC/network stack (Milestone B) grew the image well past 300 - so the
+;  filesystem region starts at LBA 400 to stay clear of it.
 ; ------------------------------------------------------------------
-FS_LBA_START    equ 300
+FS_LBA_START    equ 400
 SFFS_VERSION    equ 3
 SFFS_VERSION_V2 equ 2               ; old format, still readable
 SUPER_LABEL_OFF equ 8               ; label lives at superblock offset 8..39
@@ -96,6 +97,11 @@ EDIT_MAX        equ VOL_NODES * CONTENT_LEN   ; max bytes one file can hold (64*
 kernel_entry:
     cli
     mov rsp, 0x9F000
+
+    ; bring up COM1 immediately so putchar can mirror every character there,
+    ; letting QEMU capture the whole session to a file via -serial file:.
+    call serial_init
+
 
     ; --- TEMPORARY diagnostic checkpoint A: proves boot.asm's real-mode ->
     ; protected-mode -> long-mode transition landed here at all, before
@@ -126,6 +132,15 @@ kernel_entry:
     ; 0) - the OS behaves exactly as it always did in that case.
     call ahci_init
 
+    ; probe for a PCI RTL8139 NIC and bring up its ring buffers, if any.
+    ; Inert/no-op if there isn't one (nic_present stays 0) - the OS behaves
+    ; exactly as it always did in that case. See nic_init below.
+    call nic_init
+
+    ; bring up COM1 as a serial console; putchar mirrors every char there, so
+    ; QEMU can capture the whole session to a file via -serial file:.
+    call serial_init
+
     ; checkpoint 9: kernel code is executing (proves boot.asm's jump into
     ; 0x8000 landed correctly). Matches the DBG16/32/64 checkpoints in
     ; boot.asm - if you see 1..8 but not this, the kernel wasn't loaded/
@@ -138,6 +153,10 @@ kernel_entry:
     call fs_load                ; loads persisted fs from disk, or fs_init's a fresh one
 
     mov rsi, banner
+    mov al, [cur_normal_attr]
+    call print_string_attr
+
+    mov rsi, build_stamp
     mov al, [cur_normal_attr]
     call print_string_attr
 
@@ -161,6 +180,10 @@ kernel_entry:
 .banner_done:
 
     .shell_loop:
+        ; drain any inbound NIC frames (ARP/ICMP/UDP) that arrived while we
+        ; were idle, so ARP replies / echo replies / DNS answers don't sit in
+        ; the ring until the next command. Cheap no-op without a NIC.
+        call netpoll
         call print_prompt
     
         mov rdi, line_buf
@@ -884,6 +907,42 @@ dispatch:
     call str_eq
     cmp al, 1
     je cmd_party
+
+    mov rsi, cmd_buf
+    mov rdi, str_netinfo
+    call str_eq
+    cmp al, 1
+    je cmd_netinfo
+
+    mov rsi, cmd_buf
+    mov rdi, str_bounce
+    call str_eq
+    cmp al, 1
+    je cmd_bounce
+
+    mov rsi, cmd_buf
+    mov rdi, str_monitor
+    call str_eq
+    cmp al, 1
+    je cmd_monitor
+
+    mov rsi, cmd_buf
+    mov rdi, str_dns
+    call str_eq
+    cmp al, 1
+    je cmd_dns
+
+    mov rsi, cmd_buf
+    mov rdi, str_net
+    call str_eq
+    cmp al, 1
+    je cmd_net
+
+    mov rsi, cmd_buf
+    mov rdi, str_dhcp
+    call str_eq
+    cmp al, 1
+    je cmd_dhcp
 
     ; --- user-defined alias? (see "ali <name> <commands>") ---
     mov rsi, cmd_buf
@@ -1999,8 +2058,965 @@ cmd_sync:
     ret
 
 ; ------------------------------------------------------------
-; cmd_dscan: probe all four ATA device slots (primary/secondary x
-; master/slave) for SFFS volumes and report what's attached.
+; cmd_netinfo: show NIC MAC + static IP config, or a message if no NIC.
+cmd_netinfo:
+    cmp byte [nic_present], 0
+    je .no_nic
+    mov rsi, msg_ni_mac
+    call print_string
+    call print_mac
+    mov rsi, msg_nl
+    call print_string
+    mov rsi, msg_ni_drv
+    call print_string
+    movzx eax, byte [nic_driver_type]
+    cmp al, 0
+    je .drv_8139
+    cmp al, 1
+    je .drv_e1000
+    mov rsi, msg_ni_drv_8168
+    call print_string
+    jmp .drv_done
+.drv_8139:
+    mov rsi, msg_ni_drv_8139
+    call print_string
+    jmp .drv_done
+.drv_e1000:
+    mov rsi, msg_ni_drv_e1000
+    call print_string
+.drv_done:
+    mov rsi, msg_ni_iobase
+    call print_string
+    mov eax, [nic_io_base]
+    call print_hex32
+    mov rsi, msg_nl
+    call print_string
+    mov rsi, msg_ni_link
+    call print_string
+    cmp byte [nic_driver_type], 2
+    jne .link_na
+    mov edi, [nic_io_base]
+    add edi, RTL_IO_PHYSTATUS
+    call nic_io_read8
+    test al, RTL_PHYSTATUS_LINK
+    jz .link_down
+    mov rsi, msg_ni_link_up
+    call print_string
+    jmp .link_done
+.link_down:
+    mov rsi, msg_ni_link_down
+    call print_string
+    jmp .link_done
+.link_na:
+    mov rsi, msg_ni_link_na
+    call print_string
+.link_done:
+    mov rsi, msg_ni_ip
+    call print_string
+    lea rsi, [nic_ip]
+    call print_ip4
+    mov rsi, msg_nl
+    call print_string
+    mov rsi, msg_ni_mask
+    call print_string
+    lea rsi, [nic_mask]
+    call print_ip4
+    mov rsi, msg_nl
+    call print_string
+    mov rsi, msg_ni_gw
+    call print_string
+    lea rsi, [nic_gw]
+    call print_ip4
+    mov rsi, msg_nl
+    call print_string
+    mov rsi, msg_ni_dns
+    call print_string
+    lea rsi, [nic_dns]
+    call print_ip4
+    mov rsi, msg_nl
+    call print_string
+    ret
+.no_nic:
+    mov rsi, msg_net_no_nic
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+
+; ------------------------------------------------------------
+; cmd_net: net ip|gw|dns <a.b.c.d> - change the static IP config.
+cmd_net:
+    cmp byte [arg1_buf], 0
+    je .usage
+    cmp byte [arg2_buf], 0
+    je .usage
+    lea rsi, [arg1_buf]
+    mov rdi, str_net_ip
+    call str_eq
+    cmp al, 1
+    je .set_ip
+    lea rsi, [arg1_buf]
+    mov rdi, str_net_gw
+    call str_eq
+    cmp al, 1
+    je .set_gw
+    lea rsi, [arg1_buf]
+    mov rdi, str_net_dns
+    call str_eq
+    cmp al, 1
+    je .set_dns
+.usage:
+    mov rsi, msg_net_usage
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    ret
+.set_ip:
+    lea rsi, [arg2_buf]
+    lea rdi, [nic_ip]
+    call ip_parse_to
+    jc .bad
+    ret
+.set_gw:
+    lea rsi, [arg2_buf]
+    lea rdi, [nic_gw]
+    call ip_parse_to
+    jc .bad
+    ; routing changed - drop the ARP cache so the nexthop re-resolves
+    xor al, al
+    mov byte [nic_arp_next], 0
+    lea rdi, [nic_arp_cache]
+    mov rcx, NIC_ARP_CACHE_ENTRIES*10
+    rep stosb
+    ret
+.set_dns:
+    lea rsi, [arg2_buf]
+    lea rdi, [nic_dns]
+    call ip_parse_to
+    jc .bad
+    ret
+.bad:
+    mov rsi, msg_net_bad_ip
+    mov al, ATTR_ERROR
+    call print_string_attr
+    mov rsi, arg2_buf
+    call print_string
+    mov rsi, msg_nl
+    call print_string
+    ret
+
+; ------------------------------------------------------------
+; cmd_dns: dns <hostname> - resolve via the configured DNS server.
+cmd_dns:
+    cmp byte [nic_present], 0
+    je .no_nic
+    cmp byte [arg1_buf], 0
+    jne .have
+    mov rsi, msg_dns_usage
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    ret
+.have:
+    lea rsi, [arg1_buf]
+    call dns_query
+    cmp eax, 0xFFFFFFFF
+    je .fail
+    mov r12d, eax
+    mov rsi, msg_dns_res
+    call print_string
+    lea rsi, [arg1_buf]
+    call print_string
+    mov rsi, msg_dns_equals
+    call print_string
+    mov r12d, [nic_dns_result]
+    lea rsi, [nic_dns_result]
+    call print_ip4
+    mov rsi, msg_nl
+    call print_string
+    ret
+.fail:
+    mov rsi, msg_dns_fail
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+.no_nic:
+    mov rsi, msg_net_no_nic
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+
+; ------------------------------------------------------------
+; cmd_dhcp: dhcp - request IP lease via DHCP.
+cmd_dhcp:
+    cmp byte [nic_present], 0
+    je .no_nic
+    mov rsi, msg_dhcp_start
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    mov dword [nic_ip], 0
+    mov byte [dhcp_done], 0
+    mov dword [nic_rx_seen], 0
+    mov byte [nic_diag_verbose], 1
+    mov byte [nic_diag_tx_dumped], 0
+    mov byte [nic_diag_rx_count], 0
+    mov byte [nic_dns_seen], 0
+    call rtc_sec_now
+    add eax, 0x12345678
+    mov [dhcp_xid], eax
+    call dhcp_send_discover
+    jc .send_fail
+    call rtc_sec_now
+    mov r13, rax
+    mov byte [dhcp_retries], 0
+.dhcp_wait:
+    call netpoll
+    cmp byte [dhcp_done], 1
+    je .success
+    call rtc_sec_now
+    sub rax, r13
+    cmp rax, 6                    ; ~6s per attempt (real switches/NICs are
+    jb .dhcp_wait                 ; much slower to settle than QEMU's link)
+    cmp byte [dhcp_retries], 3    ; up to 3 retries = 4 attempts, ~24s total
+    jae .fail
+    inc byte [dhcp_retries]
+    call dhcp_send_discover
+    jc .send_fail
+    call rtc_sec_now
+    mov r13, rax
+    jmp .dhcp_wait
+.success:
+    mov byte [nic_diag_verbose], 0
+    cmp byte [nic_dns_seen], 1
+    je .dns_ok
+    mov eax, [nic_gw]
+    mov [nic_dns], eax
+.dns_ok:
+    mov rsi, msg_dhcp_ok
+    call print_string
+    mov rsi, msg_ni_ip
+    call print_string
+    lea rsi, [nic_ip]
+    call print_ip4
+    mov rsi, msg_nl
+    call print_string
+    mov rsi, msg_ni_mask
+    call print_string
+    lea rsi, [nic_mask]
+    call print_ip4
+    mov rsi, msg_nl
+    call print_string
+    mov rsi, msg_ni_gw
+    call print_string
+    lea rsi, [nic_gw]
+    call print_ip4
+    mov rsi, msg_nl
+    call print_string
+    mov rsi, msg_ni_dns
+    call print_string
+    lea rsi, [nic_dns]
+    call print_ip4
+    mov rsi, msg_nl
+    call print_string
+    ret
+.fail:
+    mov byte [nic_diag_verbose], 0
+    mov rsi, msg_dhcp_fail
+    mov al, ATTR_ERROR
+    call print_string_attr
+    mov eax, [nic_rx_seen]
+    test eax, eax
+    jnz .fail_had_frames
+    mov rsi, msg_dhcp_no_frames
+    mov al, ATTR_ERROR
+    call print_string_attr
+    jmp .fail_count
+.fail_had_frames:
+    mov rsi, msg_dhcp_had_frames
+    mov al, ATTR_ERROR
+    call print_string_attr
+.fail_count:
+    mov rsi, msg_dhcp_rx_seen
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    mov eax, [nic_rx_seen]
+    call print_hex32
+    mov rsi, msg_nl
+    call print_string
+    ret
+.send_fail:
+    mov byte [nic_diag_verbose], 0
+    mov rsi, msg_dhcp_send_fail
+    mov al, ATTR_ERROR
+    call print_string_attr
+    cmp byte [nic_driver_type], 2
+    jne .send_fail_done
+    call netdiag_dump_tx
+.send_fail_done:
+    ret
+.no_nic:
+    mov rsi, msg_net_no_nic
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+
+; netdiag_dump_tx: prints, for the RTL8168 path, the PCI Status register
+; (config offset 0x04, upper 16 bits - Master/Target Abort and parity error
+; bits live here) and the raw failed TX descriptor's command dword plus a
+; fresh TPPoll readback. This is diagnostic only - it tells us whether the
+; hardware itself is reporting a bus-level error (abort/parity) versus the
+; descriptor engine silently never touching the slot at all, which are two
+; very different bugs that "TX error" alone can't distinguish.
+netdiag_dump_tx:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r10
+
+    ; PCI Status register: dword at cfg offset 0x04 covers Command (low 16)
+    ; + Status (high 16); shift down to isolate Status.
+    movzx ebx, byte [nic_pci_bus]
+    movzx ecx, byte [nic_pci_dev]
+    movzx edx, byte [nic_pci_func]
+    mov r8b, NIC_PCI_CMD
+    call pci_read32
+    shr eax, 16
+    mov rsi, msg_diag_pcists
+    push rax
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    pop rax
+    call print_hex32
+    mov rsi, msg_nl
+    call print_string
+
+    ; raw command dword of the descriptor slot that just failed (rtl_tx_idx
+    ; was already advanced on send, so back it up one slot, wrapping).
+    mov eax, [rtl_tx_idx]
+    dec eax
+    jns .ndt_noeor
+    mov eax, RTL_TX_DESC_COUNT - 1
+.ndt_noeor:
+    shl eax, 4
+    lea rdi, [rtl_tx_desc + rax]
+    mov eax, [rdi]
+    mov rsi, msg_diag_txdesc
+    push rax
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    pop rax
+    call print_hex32
+    mov rsi, msg_nl
+    call print_string
+
+    ; fresh TPPoll readback - if NPQ (bit6) is still set, the chip never
+    ; even acknowledged the poll kick.
+    mov edi, [nic_io_base]
+    add edi, RTL_IO_TPPOLL
+    call nic_io_read8
+    movzx eax, al
+    mov rsi, msg_diag_tppoll
+    push rax
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    pop rax
+    call print_hex32
+    mov rsi, msg_nl
+    call print_string
+
+    pop r10
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    call netdiag_print_chip_id
+    ret
+
+; netdiag_print_chip_id: decodes nic_hwver_raw (captured right after reset)
+; into a chip revision family using the same reg/ICVerID bit split real
+; Realtek driver source uses (reg = val & 0x7C800000, ICVerID = val &
+; 0x00700000). This only covers the older, well-documented 8168B/C/CP/D/DP
+; generations - if none of those match, that itself is useful information:
+; it means this is an 8168E-or-later chip, which needs additional
+; MAC-OCP/PHY init pokes that aren't part of any register-level datasheet.
+netdiag_print_chip_id:
+    push rax
+    push rcx
+    push rsi
+
+    mov eax, [nic_hwver_raw]
+    mov rsi, msg_diag_chipraw
+    push rax
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    pop rax
+    call print_hex32
+    mov rsi, msg_nl
+    call print_string
+
+    mov eax, [nic_hwver_raw]
+    mov ecx, eax
+    and eax, 0x7C800000       ; reg
+    and ecx, 0x00700000       ; ICVerID (unused for the coarse match below,
+                               ; kept here for future finer-grained lookup)
+
+    mov rsi, msg_diag_chipname
+    mov al, [cur_normal_attr]
+    call print_string_attr
+
+    cmp eax, 0x30000000
+    je .m_8168b
+    cmp eax, 0x38000000
+    je .m_8168b
+    cmp eax, 0x3C000000
+    je .m_8168c
+    cmp eax, 0x3C800000
+    je .m_8168cp
+    cmp eax, 0x28000000
+    je .m_8168d
+    cmp eax, 0x28800000
+    je .m_8168dp
+    jmp .m_unknown
+.m_8168b:
+    mov rsi, msg_chip_8168b
+    jmp .m_print
+.m_8168c:
+    mov rsi, msg_chip_8168c
+    jmp .m_print
+.m_8168cp:
+    mov rsi, msg_chip_8168cp
+    jmp .m_print
+.m_8168d:
+    mov rsi, msg_chip_8168d
+    jmp .m_print
+.m_8168dp:
+    mov rsi, msg_chip_8168dp
+    jmp .m_print
+.m_unknown:
+    mov rsi, msg_chip_unknown
+.m_print:
+    call print_string
+    mov rsi, msg_nl
+    call print_string
+
+    pop rsi
+    pop rcx
+    pop rax
+    ret
+
+dhcp_send_discover:
+    push rax
+    push rbx
+    push rcx
+    push rdi
+    push rsi
+    push r8
+    push r9
+    push r10
+    lea rdi, [net_build_buf]
+    mov byte [rdi], 1
+    mov byte [rdi+1], 1
+    mov byte [rdi+2], 6
+    mov byte [rdi+3], 0
+    mov eax, [dhcp_xid]
+    mov [rdi+4], eax
+    mov word [rdi+8], 0
+    ; flags field (offset 10): bit15 = broadcast flag, requests the server
+    ; reply via L2 broadcast since we have no IP yet. `mov word ..., 0x8000`
+    ; would store this little-endian (byte 0x00 then 0x80), landing as
+    ; 0x0080 on the wire - broadcast bit never actually set, and a reserved
+    ; bit (must be zero per RFC 2131) set instead. Write the bytes directly
+    ; in wire order instead.
+    mov byte [rdi+10], 0x80
+    mov byte [rdi+11], 0x00
+    mov dword [rdi+12], 0
+    mov dword [rdi+16], 0
+    mov dword [rdi+20], 0
+    mov dword [rdi+24], 0
+    ; chaddr lives at offset 28. rbx was computed to point there, but
+    ; rep movsb reads/writes through rsi/rdi implicitly - it doesn't care
+    ; about rbx at all. Without moving rdi to rbx first, this copy landed
+    ; at rdi's current value (offset 0), stomping op/htype/hlen/hops and
+    ; the low two bytes of xid with the MAC address, while chaddr itself
+    ; was left to be zeroed by the padding step below - so every discover
+    ; went out with op=0 (not 1/BOOTREQUEST) and a mangled xid, and the
+    ; server had every reason to silently drop it.
+    lea rsi, [nic_mac]
+    add rdi, 28
+    mov rcx, 6
+    rep movsb
+    ; zero the rest of chaddr (10 bytes) plus all of sname (64) and file
+    ; (128) - previously only the first 10 zero-padding bytes after
+    ; chaddr were touched at all; the remaining ~198 bytes were never
+    ; initialized and carried over whatever net_build_buf last held,
+    ; which is the "random numbers, mostly 0s" seen on the wire dump.
+    xor al, al
+    mov rcx, 202
+    rep stosb
+    lea rdi, [net_build_buf + 236]
+    mov byte [rdi], 99
+    mov byte [rdi+1], 130
+    mov byte [rdi+2], 83
+    mov byte [rdi+3], 99
+    add rdi, 4
+    mov byte [rdi], 53
+    mov byte [rdi+1], 1
+    mov byte [rdi+2], 1
+    add rdi, 3
+    ; option 61 (client identifier: hwtype + mac, 7 bytes of value) was
+    ; tagged with code 6 instead of 61 - 6 is "domain name server", which
+    ; a server receiving it from a client has no defined use for. Servers
+    ; tolerate/ignore unrecognized options so this wasn't what was
+    ; blocking the lease, but it's still wrong and worth fixing.
+    mov byte [rdi], 61
+    mov byte [rdi+1], 7
+    mov byte [rdi+2], 1
+    push rdi
+    add rdi, 3
+    lea rsi, [nic_mac]
+    mov rcx, 6
+    rep movsb
+    pop rdi
+    ; option 61 is tag+len+value = 1+1+7 = 9 bytes total, not 7. The old
+    ; +7 landed 2 bytes short of the option's real end, so the next
+    ; option's tag+len bytes got written over what should have been the
+    ; MAC's last 2 bytes - and since option 61's length byte still
+    ; (truthfully) claims 7 value bytes, a compliant parser reads 2 bytes
+    ; too far into the next option, then finds garbage instead of a tag
+    ; byte where option 55 should start, and everything after is
+    ; misaligned nonsense to the server.
+    add rdi, 9
+    mov byte [rdi], 55
+    mov byte [rdi+1], 4
+    mov byte [rdi+2], 1
+    mov byte [rdi+3], 3
+    mov byte [rdi+4], 6
+    mov byte [rdi+5], 15
+    add rdi, 6
+    mov byte [rdi], 57
+    mov byte [rdi+1], 2
+    mov byte [rdi+2], 2
+    mov byte [rdi+3], 0x40
+    add rdi, 4
+    mov byte [rdi], 255
+    inc rdi
+    lea rcx, [net_build_buf]
+    sub rdi, rcx
+    mov rsi, net_build_buf
+    mov ecx, edi
+    mov r8d, 0xFFFFFFFF
+    mov r9w, 67
+    mov r10w, 68
+    call nic_send_udp
+    pop r10
+    pop r9
+    pop r8
+    pop rsi
+    pop rdi
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+dhcp_send_request:
+    push rax
+    push rbx
+    push rcx
+    push rdi
+    push rsi
+    push r8
+    push r9
+    push r10
+    lea rdi, [net_build_buf]
+    mov byte [rdi], 1
+    mov byte [rdi+1], 1
+    mov byte [rdi+2], 6
+    mov byte [rdi+3], 0
+    mov eax, [dhcp_xid]
+    mov [rdi+4], eax
+    mov word [rdi+8], 0
+    ; same flags-field byte-order bug as dhcp_send_discover - see comment
+    ; there. Write the broadcast-flag bytes directly in wire order.
+    mov byte [rdi+10], 0x80
+    mov byte [rdi+11], 0x00
+    mov dword [rdi+12], 0
+    mov eax, [dhcp_offered_ip]
+    mov [rdi+16], eax
+    ; same chaddr-offset bug as dhcp_send_discover - see comment there.
+    ; rdi is still at the buffer base here, so point it at chaddr (offset
+    ; 28) directly instead of leaving it at offset 0.
+    lea rsi, [nic_mac]
+    add rdi, 28
+    mov rcx, 6
+    rep movsb
+    ; zero the rest of chaddr + all of sname/file, same as discover.
+    xor al, al
+    mov rcx, 202
+    rep stosb
+    lea rdi, [net_build_buf + 236]
+    mov byte [rdi], 99
+    mov byte [rdi+1], 130
+    mov byte [rdi+2], 83
+    mov byte [rdi+3], 99
+    add rdi, 4
+    mov byte [rdi], 53
+    mov byte [rdi+1], 1
+    mov byte [rdi+2], 3
+    add rdi, 3
+    mov byte [rdi], 50
+    mov byte [rdi+1], 4
+    mov eax, [dhcp_offered_ip]
+    mov [rdi+2], eax
+    add rdi, 6
+    ; same option-61-mislabeled-as-6 bug as dhcp_send_discover - see
+    ; comment there.
+    mov byte [rdi], 61
+    mov byte [rdi+1], 7
+    mov byte [rdi+2], 1
+    push rdi
+    add rdi, 3
+    lea rsi, [nic_mac]
+    mov rcx, 6
+    rep movsb
+    pop rdi
+    ; same off-by-2 as dhcp_send_discover - option 61 is 9 bytes total
+    ; (tag+len+7 value), not 7, so the END marker was landing 2 bytes
+    ; into where the MAC's last 2 bytes should be, and option 61's
+    ; length byte still claimed a 7-byte value that ran past the real
+    ; end of the packet.
+    add rdi, 9
+    mov byte [rdi], 255
+    inc rdi
+    lea rcx, [net_build_buf]
+    sub rdi, rcx
+    mov rsi, net_build_buf
+    mov ecx, edi
+    mov r8d, 0xFFFFFFFF
+    mov r9w, 67
+    mov r10w, 68
+    call nic_send_udp
+    pop r10
+    pop r9
+    pop r8
+    pop rsi
+    pop rdi
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+    inc rdi
+    lea rcx, [net_build_buf]
+    sub rdi, rcx
+    mov rsi, net_build_buf
+    mov ecx, edi
+    mov r8d, 0xFFFFFFFF
+    mov r9w, 67
+    mov r10w, 68
+    call nic_send_udp
+    pop r10
+    pop r9
+    pop r8
+    pop rsi
+    pop rdi
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+dhcp_handle_packet:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rdi
+    push rsi
+    push r8
+    push r9
+    push r10
+    push r12
+    push r13
+    push r14
+    push r15
+    movzx eax, byte [nic_rx_frame+14]
+    and al, 0x0F
+    imul eax, 4
+    lea r14, [nic_rx_frame + 14 + rax + 8]
+    ; r14-8 is the UDP header. Its length field (offset +4/+5, big-endian)
+    ; tells us exactly where the DHCP message ends. The option scan below
+    ; MUST be bounded by this: some servers do not put a 255 end marker in
+    ; their reply, and the old parser only worked because it dispatched as
+    ; soon as it saw option 53. The rewrite moved dispatch to the 255
+    ; marker, so on such a server the OFFER was never answered and lease
+    ; acquisition failed. Stop scanning at the real message end instead.
+    lea rsi, [r14 - 8]
+    movzx eax, byte [rsi+4]
+    shl eax, 8
+    movzx edx, byte [rsi+5]
+    or eax, edx
+    sub eax, 8
+    lea r15, [r14 + rax]
+    ; Some embedded routers report a UDP length shorter than the real
+    ; message. Never let the scan floor stop before it can at least read
+    ; the first options (option 53 is almost always first), or such a
+    ; server's OFFER would be skipped entirely and DHCP would time out.
+    lea rdx, [r14 + 272]
+    cmp r15, rdx
+    jae .dh_bound_floor
+    mov r15, rdx
+.dh_bound_floor:
+    ; clamp to a standard 300-byte DHCP message so a bad length field can't
+    ; walk the scan outside the frame.
+    lea rdx, [r14 + 300]
+    cmp r15, rdx
+    jbe .dh_bound_ok
+    mov r15, rdx
+.dh_bound_ok:
+    mov eax, [r14+4]
+    cmp eax, [dhcp_xid]
+    jne .dh_ret
+    mov eax, [r14+16]
+    test eax, eax
+    jz .dh_ret
+    mov [dhcp_offered_ip], eax
+    lea rsi, [r14 + 240]
+    mov byte [dhcp_msg_type], 0
+.dh_opt_loop:
+    cmp rsi, r15
+    jae .dh_opts_end
+    mov al, [rsi]
+    cmp al, 255
+    je .dh_opts_end
+    test al, al
+    jz .dh_opt_pad
+    movzx ecx, byte [rsi+1]
+    cmp al, 53
+    jne .dh_check_mask
+    mov bl, [rsi+2]
+    mov [dhcp_msg_type], bl
+    jmp .dh_opt_next
+.dh_check_mask:
+    cmp al, 1
+    jne .dh_check_router
+    mov eax, [rsi+2]
+    mov [nic_mask], eax
+    jmp .dh_opt_next
+.dh_check_router:
+    cmp al, 3
+    jne .dh_check_dns
+    mov eax, [rsi+2]
+    mov [nic_gw], eax
+    jmp .dh_opt_next
+.dh_check_dns:
+    cmp al, 6
+    jne .dh_opt_next
+    mov eax, [rsi+2]
+    mov [nic_dns], eax
+    mov byte [nic_dns_seen], 1
+.dh_opt_next:
+    add rsi, 2
+    add rsi, rcx
+    jmp .dh_opt_loop
+.dh_opt_pad:
+    inc rsi
+    jmp .dh_opt_loop
+.dh_opts_end:
+    cmp byte [dhcp_msg_type], 2
+    je .dh_offer
+    cmp byte [dhcp_msg_type], 5
+    je .dh_ack
+    jmp .dh_ret
+.dh_offer:
+    call dhcp_send_request
+    jmp .dh_ret
+.dh_ack:
+    mov eax, [dhcp_offered_ip]
+    mov [nic_ip], eax
+    mov byte [dhcp_done], 1
+    jmp .dh_ret
+.dh_ret:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r10
+    pop r9
+    pop r8
+    pop rsi
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; ------------------------------------------------------------
+; cmd_bounce: bounce <host> - ICMP echo with a ~2s (retry: ~3s) timeout.
+cmd_bounce:
+    cmp byte [nic_present], 0
+    je .no_nic
+    cmp byte [arg1_buf], 0
+    jne .have
+    mov rsi, msg_bounce_usage
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    ret
+.have:
+    lea rsi, [arg1_buf]
+    call dns_query
+    cmp eax, 0xFFFFFFFF
+    je .unresolved
+    mov [nic_bounce_target], eax
+    mov byte [nic_echo_retry], 0
+    mov byte [nic_diag_verbose], 1
+    mov byte [nic_diag_tx_dumped], 0
+    mov byte [nic_diag_rx_count], 0
+    call bounce_send
+    jc .sendfail
+    mov byte [nic_echo_got], 0
+    call rtc_sec_now
+    mov r13, rax
+.cb_wait:
+    call netpoll
+    cmp byte [nic_echo_got], 0
+    jne .cb_reply
+    call rtc_sec_now
+    cmp eax, r13d
+    jne .cb_tick
+    jmp .cb_wait
+.cb_tick:
+    cmp byte [nic_echo_retry], 0
+    jne .cb_timeout
+    mov byte [nic_echo_retry], 1
+    call bounce_send
+    jc .sendfail
+    call rtc_sec_now
+    mov r13, rax
+    jmp .cb_wait
+.cb_reply:
+    mov byte [nic_diag_verbose], 0
+    mov rsi, msg_bounce_reply
+    call print_string
+    lea rsi, [nic_echo_src_ip]
+    call print_ip4
+    mov rsi, msg_bounce_bytes
+    call print_string
+    ret
+.cb_timeout:
+    mov byte [nic_diag_verbose], 0
+    mov rsi, msg_bounce_timeout
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+.sendfail:
+    mov byte [nic_diag_verbose], 0
+    mov rsi, msg_bounce_timeout
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+.unresolved:
+    mov rsi, msg_net_unresolved
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+.no_nic:
+    mov rsi, msg_net_no_nic
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+
+; ------------------------------------------------------------
+; cmd_monitor: monitor <host> - ping every ~2s, one line per reply,
+; Esc stops. Pressing Esc also cancels a stuck wait.
+cmd_monitor:
+    cmp byte [nic_present], 0
+    je .no_nic
+    cmp byte [arg1_buf], 0
+    jne .have
+    mov rsi, msg_monitor_usage
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    ret
+.have:
+    lea rsi, [arg1_buf]
+    call dns_query
+    cmp eax, 0xFFFFFFFF
+    je .unresolved
+    mov [nic_bounce_target], eax
+    mov byte [kill_flag], 0
+    mov byte [nic_diag_verbose], 1
+    mov byte [nic_diag_tx_dumped], 0
+    mov byte [nic_diag_rx_count], 0
+.cm_loop:
+    mov byte [nic_echo_got], 0
+    mov byte [nic_echo_retry], 0
+    call bounce_send
+    jc .cm_sendfail
+    call rtc_sec_now
+    mov r13, rax
+.cm_wait:
+    call kbd_poll
+    cmp byte [kill_flag], 0
+    jne .cm_stop
+    call netpoll
+    cmp byte [nic_echo_got], 0
+    jne .cm_reply
+    call rtc_sec_now
+    cmp eax, r13d
+    jne .cm_tick
+    jmp .cm_wait
+.cm_tick:
+    cmp byte [nic_echo_retry], 0
+    jne .cm_timedout
+    mov byte [nic_echo_retry], 1
+    call bounce_send
+    jc .cm_sendfail
+    call rtc_sec_now
+    mov r13, rax
+    jmp .cm_wait
+.cm_reply:
+    mov byte [nic_diag_verbose], 0
+    mov rsi, msg_bounce_reply
+    call print_string
+    lea rsi, [nic_echo_src_ip]
+    call print_ip4
+    mov rsi, msg_bounce_bytes
+    call print_string
+    jmp .cm_loop
+.cm_timedout:
+    mov byte [nic_diag_verbose], 0
+    mov rsi, msg_monitor_timeout
+    mov al, ATTR_ERROR
+    call print_string_attr
+    jmp .cm_loop
+.cm_sendfail:
+    mov byte [nic_diag_verbose], 0
+    mov rsi, msg_monitor_timeout
+    mov al, ATTR_ERROR
+    call print_string_attr
+    jmp .cm_loop
+.cm_stop:
+    mov byte [nic_diag_verbose], 0
+    mov byte [kill_flag], 0
+    mov rsi, msg_monitor_stopped
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    ret
+.unresolved:
+    mov rsi, msg_net_unresolved
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+.no_nic:
+    mov rsi, msg_net_no_nic
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+
+; ------------------------------------------------------------
 cmd_dscan:
     push r13
     push r15
@@ -5184,24 +6200,18 @@ fs_write_file:
 ; it (not the node itself) and unlinks them. Never used on a folder.
 fs_free_chain:
     push rax
-    push rbx
     push rcx
+    movzx rax, word [node_next + rax*2]   ; rax = first continuation node
 .free_loop:
-    movzx rbx, word [node_next + rax*2]
-    cmp rbx, 0xFFFF
+    cmp rax, 0xFFFF
     je .done
-    movzx rcx, word [node_next + rbx*2]   ; remember what follows the freed node
-    mov [node_next + rax*2], word 0xFFFF  ; unlink it first
-    push rax
-    mov rax, rbx
-    call fs_delete_node
-    pop rax
-    mov rbx, rcx
-    cmp rbx, 0xFFFF
-    jne .free_loop
+    movzx rcx, word [node_next + rax*2]   ; remember what follows this node
+    mov [node_next + rax*2], word 0xFFFF  ; unlink it
+    call fs_delete_node                   ; frees rax; rax & rcx are preserved
+    mov rax, rcx                          ; walk to the next continuation node
+    jmp .free_loop
 .done:
     pop rcx
-    pop rbx
     pop rax
     ret
 
@@ -6556,6 +7566,3301 @@ vol_write:
     pop rax
     ret
 
+; ==================================================================
+;  RTL8139 NIC driver + base network stack (Milestone B)
+;  Polled, no IRQs. Inbound frames land in a DMA RX ring; the shell
+;  loop calls netpoll to drain and dispatch them (ARP / IPv4 / ICMP /
+;  UDP-DNS). Outbound frames are built in nic_tx_buf and pushed out
+;  TSAD0/TSD0 by nic_send_raw. Static IP config lives in nic_ip /
+;  nic_mask / nic_gw / nic_dns (defaults are the QEMU slirp values).
+;  All register discipline: every function in this section saves and
+;  restores every register it uses, so the polling loops (bounce /
+;  monitor / dns) can hold state in r12/r13/r14/r15 across calls.
+; ==================================================================
+NIC_VENDOR_ID   equ 0x10EC
+NIC_DEVICE_ID   equ 0x8139
+NIC_PCI_CMD     equ 0x04
+NIC_PCI_BAR0    equ 0x10
+
+NIC_IO_IDR0     equ 0x00
+NIC_IO_TSD0     equ 0x10
+NIC_IO_TSAD0    equ 0x20
+NIC_IO_RBSTART  equ 0x30
+NIC_IO_CBR      equ 0x34
+NIC_IO_CAPR     equ 0x38
+NIC_IO_CMD      equ 0x37
+NIC_IO_IMR      equ 0x3C
+NIC_IO_ISR      equ 0x3E
+NIC_IO_TCR      equ 0x40
+NIC_IO_RCR      equ 0x44
+NIC_IO_CFG1     equ 0x52
+
+NIC_RX_RING_SIZE equ 0x2000        ; 8KB ring (fits the boot budget)
+NIC_RX_RING_MASK equ 0x1FFF
+NIC_TX_BUF_SIZE  equ 0x800         ; 2KB frame build/DMA buffer
+ETH_TYPE_ARP_W   equ 0x0608        ; "08 06" as a little-endian memory word
+ETH_TYPE_IP_W    equ 0x0008        ; "08 00" as a little-endian memory word
+IP_PROTO_ICMP    equ 0x01
+IP_PROTO_UDP     equ 0x11
+
+; ---- Intel e1000 (82540/82541/82545/82546/8257x "PRO/1000") support -----
+; A second NIC backend behind the exact same nic_init/nic_send_raw/nic_fetch_rx
+; entry points the RTL8139 driver above already exposes, so ARP/IPv4/ICMP/
+; UDP-DNS and every shell command above never need to know which chip is
+; live - they only ever touch nic_present/nic_mac and call nic_send_raw /
+; nic_fetch_rx. nic_driver_type (0=rtl8139, 1=e1000) picks the branch inside
+; those three functions. Unlike the RTL8139's port I/O, e1000 registers are
+; memory-mapped (BAR0), so this backend uses ordinary loads/stores against
+; the identity-mapped physical address in nic_mmio_base instead of in/out.
+E1000_VENDOR_ID  equ 0x8086
+
+E1000_CTRL       equ 0x0000
+E1000_STATUS     equ 0x0008
+E1000_ICR        equ 0x00C0
+E1000_IMS        equ 0x00D0
+E1000_IMC        equ 0x00D8
+E1000_RCTL       equ 0x0100
+E1000_TCTL       equ 0x0400
+E1000_TIPG       equ 0x0410
+E1000_RDBAL      equ 0x2800
+E1000_RDBAH      equ 0x2804
+E1000_RDLEN      equ 0x2808
+E1000_RDH        equ 0x2810
+E1000_RDT        equ 0x2818
+E1000_TDBAL      equ 0x3800
+E1000_TDBAH      equ 0x3804
+E1000_TDLEN      equ 0x3808
+E1000_TDH        equ 0x3810
+E1000_TDT        equ 0x3818
+E1000_MTA        equ 0x5200
+E1000_RAL0       equ 0x5400
+E1000_RAH0       equ 0x5404
+
+E1000_CTRL_RST   equ 0x04000000
+E1000_CTRL_SLU_ASDE equ 0x00000060   ; SLU (bit6) | ASDE (bit5)
+
+E1000_RCTL_EN    equ 0x00000002
+E1000_RCTL_UPE   equ 0x00000008
+E1000_RCTL_MPE   equ 0x00000010
+E1000_RCTL_BAM   equ 0x00008000
+E1000_RCTL_SECRC equ 0x04000000      ; strip the 4-byte Ethernet CRC, like RTL8139's ring does
+
+E1000_TCTL_EN    equ 0x00000002
+E1000_TCTL_PSP   equ 0x00000008
+E1000_TCTL_CT    equ 0x000000F0      ; collision threshold 0x0F << 4
+E1000_TCTL_COLD  equ 0x00040000      ; collision distance 0x40 << 12 (full duplex)
+E1000_TIPG_VAL   equ 0x0060200A      ; Intel-recommended IPGT/IPGR1/IPGR2 for full duplex
+
+E1000_TXD_CMD_EOP_IFCS_RS equ 0x0B   ; EOP(0x01) | IFCS(0x02) | RS(0x08)
+E1000_DD         equ 0x01            ; Descriptor Done, shared by RX/TX status bytes
+
+E1000_RX_DESC_COUNT equ 8            ; 8 * 16B = 128B: the minimum ring length e1000 accepts
+E1000_TX_DESC_COUNT equ 8
+E1000_RX_BUF_SIZE   equ 2048
+
+; ---- Realtek RTL8168/8169/8161 ("PCIe GBE Family Controller") support ---
+; A third NIC backend behind the same nic_init/nic_send_raw/nic_fetch_rx
+; entry points (nic_driver_type: 0=rtl8139, 1=e1000, 2=rtl8168). This is
+; the common gigabit Realtek chip found on most real desktop motherboards -
+; a completely different beast from the old RTL8139: descriptor rings like
+; e1000, but reached over port I/O (BAR0) like the RTL8139 driver, so it
+; reuses nic_io_read8/16/32 / nic_io_write8/16/32 against nic_io_base. Only
+; the "normal priority" TX queue is used; the high-priority queue is left
+; zeroed/unused. Register offsets and the reset/bring-up sequence follow
+; the publicly documented RTL8169 programming model (OSDev.org's RTL8169
+; page, itself sourced from Realtek's public datasheet).
+RTL_VENDOR_ID    equ 0x10EC
+
+RTL_IO_IDR0      equ 0x00             ; MAC address, 6 bytes
+RTL_IO_TNPDS_LO  equ 0x20             ; Tx Normal Priority Descriptor Start Addr (low dword)
+RTL_IO_TNPDS_HI  equ 0x24
+RTL_IO_THPDS_LO  equ 0x28             ; Tx High Priority ring - unused, kept zeroed
+RTL_IO_THPDS_HI  equ 0x2C
+RTL_IO_CMD       equ 0x37             ; Chip Command register
+RTL_IO_TPPOLL    equ 0x38             ; Transmit Priority Polling (kick DMA)
+RTL_IO_IMR       equ 0x3C
+RTL_IO_ISR       equ 0x3E
+RTL_IO_TCR       equ 0x40             ; TxConfig
+RTL_IO_RCR       equ 0x44             ; RxConfig
+RTL_IO_9346CR    equ 0x50             ; EEPROM/config-register lock
+RTL_IO_CPCMD     equ 0xE0             ; C+ Command Register
+RTL_IO_RMS       equ 0xDA             ; Rx max packet size (word)
+RTL_IO_MTPS      equ 0xEC             ; Tx max packet size, 128-byte units (byte)
+RTL_IO_RDSAR_LO  equ 0xE4             ; Rx Descriptor Start Addr (low dword)
+RTL_IO_RDSAR_HI  equ 0xE8
+RTL_IO_PHYSTATUS equ 0x6C             ; PHY status register; bit1 = LinkStatus
+RTL_IO_PHYAR     equ 0x60             ; PHY (MDIO) Access Register
+RTL_PHYSTATUS_LINK equ 0x02
+
+RTL_CMD_RST      equ 0x10
+RTL_CMD_TE       equ 0x04
+RTL_CMD_RE       equ 0x08
+RTL_9346_UNLOCK  equ 0xC0
+RTL_9346_LOCK    equ 0x00
+RTL_TPPOLL_NPQ   equ 0x40
+
+RTL_DESC_OWN     equ 0x80000000
+RTL_DESC_EOR     equ 0x40000000
+RTL_DESC_FS      equ 0x20000000
+RTL_DESC_LS      equ 0x10000000
+
+RTL_RX_DESC_COUNT equ 8
+RTL_TX_DESC_COUNT equ 8
+RTL_RX_BUF_SIZE   equ 2048
+
+; ---- I/O helpers -------------------------------------------------
+; nic_io_read8/16/32: edi = port -> al/ax/eax
+nic_io_read8:
+    mov dx, di
+    in al, dx
+    ret
+nic_io_read16:
+    mov dx, di
+    in ax, dx
+    ret
+nic_io_read32:
+    mov dx, di
+    in eax, dx
+    ret
+; nic_io_write8/16/32: edi = port, data in al/ax/eax
+nic_io_write8:
+    mov dx, di
+    out dx, al
+    ret
+nic_io_write16:
+    mov dx, di
+    out dx, ax
+    ret
+nic_io_write32:
+    mov dx, di
+    out dx, eax
+    ret
+; nic_io_read_block: edi = start port, rsi = dst, rcx = byte count
+nic_io_read_block:
+    push rax
+    push rcx
+    push rdi
+    push rsi
+.bloop:
+    mov dx, di
+    in al, dx
+    mov [rsi], al
+    inc edi
+    inc rsi
+    dec rcx
+    jnz .bloop
+    pop rsi
+    pop rdi
+    pop rcx
+    pop rax
+    ret
+
+; rtc_sec_now: eax = current RTC seconds (0..59), zero-extended. Used for
+; coarse 1s-granularity timeouts in the ARP / ICMP / DNS wait loops.
+rtc_sec_now:
+    push rdx
+    mov al, 0x00
+    call cmos_read
+    movzx eax, al
+    pop rdx
+    ret
+
+; ---- PCI ---------------------------------------------------------
+; pci_find_nic: scans bus 0 for vendor 10EC device 8139. Returns CF=0 and
+; nic_pci_bus/dev/func set, or CF=1.
+; pci_find_nic: brute-force scan of every PCI bus (0..255), every device
+; (0..31), function 0 first and then functions 1..7 if the header-type byte
+; says the device is multi-function - matching vendor 0x10EC/device 0x8139.
+; A bus-0-only scan (the original version of this routine) finds nothing on
+; real hardware, where the NIC typically sits behind a PCIe root port on a
+; non-zero bus; QEMU's flat topology just happened to put it on bus 0.
+; Returns CF=0 and nic_pci_bus/dev/func set, or CF=1.
+pci_find_nic:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push r8
+    push r9
+    push r11
+    xor ebx, ebx                     ; bus
+.pbus_loop:
+    cmp ebx, 256
+    jae .pnot_found
+    xor ecx, ecx                     ; device
+.pdev_loop:
+    cmp ecx, 32
+    jae .pnext_bus
+    xor edx, edx                     ; try function 0 first
+    xor r8, r8
+    call pci_read32
+    cmp eax, 0xFFFFFFFF
+    je .pnext_dev                    ; nothing at this slot at all
+    cmp ax, NIC_VENDOR_ID
+    jne .pf0_no_match
+    shr eax, 16
+    cmp ax, NIC_DEVICE_ID
+    je .pfound
+.pf0_no_match:
+    xor edx, edx
+    mov r8, 0x0C                     ; header-type dword
+    call pci_read32
+    shr eax, 16
+    test al, 0x80                    ; multi-function bit
+    jz .pnext_dev                    ; single-function: nothing more here
+    mov r11d, 1
+.pfunc_loop:
+    cmp r11d, 8
+    jae .pnext_dev
+    mov edx, r11d
+    xor r8, r8
+    call pci_read32
+    cmp eax, 0xFFFFFFFF
+    je .pfunc_next
+    cmp ax, NIC_VENDOR_ID
+    jne .pfunc_next
+    shr eax, 16
+    cmp ax, NIC_DEVICE_ID
+    je .pfound
+.pfunc_next:
+    inc r11d
+    jmp .pfunc_loop
+.pnext_dev:
+    inc ecx
+    jmp .pdev_loop
+.pnext_bus:
+    inc ebx
+    jmp .pbus_loop
+.pnot_found:
+    pop r11
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    stc
+    ret
+.pfound:
+    mov [nic_pci_bus], bl
+    mov [nic_pci_dev], cl
+    mov [nic_pci_func], dl
+    pop r11
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    clc
+    ret
+
+; pci_find_e1000: brute-force scan of PCI bus 0, vendor 0x8086, matching any
+; device id in e1000_dev_ids. Real e1000-family silicon spans a lot of PCI
+; device ids across generations (82540/82541/82545/82546/82571-82574/...),
+; unlike the RTL8139's single fixed id, so this checks the incoming device
+; id against a table instead of one constant. QEMU's "e1000" model reports
+; 0x100E. Returns CF=0 and nic_pci_bus/dev/func set, or CF=1.
+; pci_find_e1000: brute-force scan of every PCI bus (0..255), every device,
+; function 0 first and then functions 1..7 if multi-function, vendor 0x8086,
+; matching any device id in e1000_dev_ids. Real e1000-family silicon spans a
+; lot of PCI device ids across generations (82540/82541/82545/82546/82571-
+; 82574/...), unlike the RTL8139's single fixed id, so this checks the
+; incoming device id against a table instead of one constant. QEMU's "e1000"
+; model reports 0x100E. A bus-0-only scan misses real hardware, where the
+; NIC usually sits behind a PCIe root port on a non-zero bus - see
+; pci_find_nic above for the same fix. Returns CF=0 and nic_pci_bus/dev/func
+; set, or CF=1.
+pci_find_e1000:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push r8
+    push r9
+    push r10
+    push r11
+    xor ebx, ebx                     ; bus
+.ebus_loop:
+    cmp ebx, 256
+    jae .enot_found
+    xor ecx, ecx                     ; device
+.edev_loop:
+    cmp ecx, 32
+    jae .enext_bus
+    xor edx, edx                     ; try function 0 first
+    xor r8, r8
+    call pci_read32
+    cmp eax, 0xFFFFFFFF
+    je .enext_dev                    ; nothing at this slot at all
+    cmp ax, E1000_VENDOR_ID
+    jne .ef0_no_match
+    shr eax, 16                      ; eax = device id
+    lea r9, [e1000_dev_ids]
+    mov r10d, E1000_DEV_ID_COUNT
+.ecmp_loop0:
+    cmp word [r9], ax
+    je .efound
+    add r9, 2
+    dec r10d
+    jnz .ecmp_loop0
+.ef0_no_match:
+    xor edx, edx
+    mov r8, 0x0C                     ; header-type dword
+    call pci_read32
+    shr eax, 16
+    test al, 0x80                    ; multi-function bit
+    jz .enext_dev                    ; single-function: nothing more here
+    mov r11d, 1
+.efunc_loop:
+    cmp r11d, 8
+    jae .enext_dev
+    mov edx, r11d
+    xor r8, r8
+    call pci_read32
+    cmp eax, 0xFFFFFFFF
+    je .efunc_next
+    cmp ax, E1000_VENDOR_ID
+    jne .efunc_next
+    shr eax, 16
+    lea r9, [e1000_dev_ids]
+    mov r10d, E1000_DEV_ID_COUNT
+.ecmp_loopN:
+    cmp word [r9], ax
+    je .efound
+    add r9, 2
+    dec r10d
+    jnz .ecmp_loopN
+.efunc_next:
+    inc r11d
+    jmp .efunc_loop
+.enext_dev:
+    inc ecx
+    jmp .edev_loop
+.enext_bus:
+    inc ebx
+    jmp .ebus_loop
+.enot_found:
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    stc
+    ret
+.efound:
+    mov [nic_pci_bus], bl
+    mov [nic_pci_dev], cl
+    mov [nic_pci_func], dl
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    clc
+    ret
+
+; pci_find_rtl8168: brute-force scan of PCI bus 0, vendor 0x10EC, matching
+; any device id in rtl_dev_ids. Returns CF=0 and nic_pci_bus/dev/func set,
+; or CF=1.
+; pci_find_rtl8168: brute-force scan of every PCI bus (0..255), every
+; device, function 0 first and then functions 1..7 if multi-function,
+; vendor 0x10EC, matching any device id in rtl_dev_ids. A bus-0-only scan
+; misses real hardware, where the NIC usually sits behind a PCIe root port
+; on a non-zero bus - see pci_find_nic above for the same fix. Returns
+; CF=0 and nic_pci_bus/dev/func set, or CF=1.
+pci_find_rtl8168:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push r8
+    push r9
+    push r10
+    push r11
+    xor ebx, ebx                     ; bus
+.rbus_loop:
+    cmp ebx, 256
+    jae .rnot_found
+    xor ecx, ecx                     ; device
+.rdev_loop:
+    cmp ecx, 32
+    jae .rnext_bus
+    xor edx, edx                     ; try function 0 first
+    xor r8, r8
+    call pci_read32
+    cmp eax, 0xFFFFFFFF
+    je .rnext_dev                    ; nothing at this slot at all
+    cmp ax, RTL_VENDOR_ID
+    jne .rf0_no_match
+    shr eax, 16                     ; eax = device id
+    lea r9, [rtl_dev_ids]
+    mov r10d, RTL_DEV_ID_COUNT
+.rcmp_loop0:
+    cmp word [r9], ax
+    je .rfound
+    add r9, 2
+    dec r10d
+    jnz .rcmp_loop0
+.rf0_no_match:
+    xor edx, edx
+    mov r8, 0x0C                     ; header-type dword
+    call pci_read32
+    shr eax, 16
+    test al, 0x80                    ; multi-function bit
+    jz .rnext_dev                    ; single-function: nothing more here
+    mov r11d, 1
+.rfunc_loop:
+    cmp r11d, 8
+    jae .rnext_dev
+    mov edx, r11d
+    xor r8, r8
+    call pci_read32
+    cmp eax, 0xFFFFFFFF
+    je .rfunc_next
+    cmp ax, RTL_VENDOR_ID
+    jne .rfunc_next
+    shr eax, 16
+    lea r9, [rtl_dev_ids]
+    mov r10d, RTL_DEV_ID_COUNT
+.rcmp_loopN:
+    cmp word [r9], ax
+    je .rfound
+    add r9, 2
+    dec r10d
+    jnz .rcmp_loopN
+.rfunc_next:
+    inc r11d
+    jmp .rfunc_loop
+.rnext_dev:
+    inc ecx
+    jmp .rdev_loop
+.rnext_bus:
+    inc ebx
+    jmp .rbus_loop
+.rnot_found:
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    stc
+    ret
+.rfound:
+    mov [nic_pci_bus], bl
+    mov [nic_pci_dev], cl
+    mov [nic_pci_func], dl
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    clc
+    ret
+
+; pci_pm_wake: force the device at nic_pci_bus/dev/func out of D3 into D0
+; via its PCI Power Management capability, if it has one. On real hardware,
+; firmware quite often leaves an onboard NIC parked in D3hot at handoff
+; (or a previous OS's ACPI driver put it there and a warm reset didn't
+; clear it) - config/IO/MMIO reads and writes to a device in D3 are
+; unreliable (commonly read back as all-1s/garbage, writes silently
+; dropped), so every other fix in the bring-up path is moot until this
+; runs. QEMU's virtual devices are always already in D0, which is why
+; this was invisible there. Walks the capabilities list from offset 0x34
+; looking for PCI_CAP_ID_PM (0x01), clears the PowerState bits in PMCSR
+; (cap_ptr+4) to select D0, then waits >=10ms per the PCI PM spec before
+; the device's config space is touched again. No-op if the device has no
+; PM capability, or is already in D0.
+pci_pm_wake:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push r8
+    push r9
+    push r10
+    push r11
+
+    movzx ebx, byte [nic_pci_bus]
+    movzx ecx, byte [nic_pci_dev]
+    movzx edx, byte [nic_pci_func]
+    mov r8b, 0x34                  ; Capabilities Pointer register
+    call pci_read32
+    movzx r11d, al                 ; r11 = offset of first capability
+.pmw_walk:
+    test r11d, r11d
+    jz .pmw_done                   ; end of list: no PM capability, nothing to do
+    movzx ebx, byte [nic_pci_bus]
+    movzx ecx, byte [nic_pci_dev]
+    movzx edx, byte [nic_pci_func]
+    mov r8d, r11d
+    and r8d, 0xFC
+    call pci_read32                ; al=cap id, ah=next ptr (bits 8:15 of eax)
+    cmp al, 0x01                   ; PCI_CAP_ID_PM
+    je .pmw_found
+    mov r10d, eax
+    shr r10d, 8
+    movzx r11d, r10b               ; next capability pointer
+    jmp .pmw_walk
+.pmw_found:
+    mov r9d, r11d
+    and r9d, 0xFC
+    add r9d, 4                     ; PMCSR lives in the dword right after the cap header
+    movzx ebx, byte [nic_pci_bus]
+    movzx ecx, byte [nic_pci_dev]
+    movzx edx, byte [nic_pci_func]
+    mov r8d, r9d
+    call pci_read32
+    and eax, 0xFFFFFFFC            ; PowerState = 00b -> D0 (bits 1:0 of PMCSR)
+    mov r10d, eax
+    movzx ebx, byte [nic_pci_bus]
+    movzx ecx, byte [nic_pci_dev]
+    movzx edx, byte [nic_pci_func]
+    mov r8d, r9d
+    call pci_write32
+    ; PCI Power Management spec: after a D3hot->D0 transition, software
+    ; must not access the function's config/IO/memory space for >=10ms.
+    mov r9, 0x8000000
+.pmw_delay:
+    dec r9
+    jnz .pmw_delay
+.pmw_done:
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; pci_disable_aspm: clear ASPM (Active State Power Management, L0s/L1) in the
+; PCI Express Capability's Link Control register for the device at
+; nic_pci_bus/dev/func, if it has one. Firmware on most real boards leaves
+; ASPM enabled by default; a driver that only pokes the legacy I/O BAR and
+; never does the associated PCIe link power-state handshake can end up with
+; a chip whose descriptor-DMA engine stalls in a low-power link state - a TX
+; descriptor gets handed to it (OWN set) but the engine never actually
+; drains it, even though the copper PHY link itself is up (PHY link state
+; and PCIe link power state are independent). QEMU's virtual PCIe root port
+; doesn't implement ASPM at all, which is why this is invisible there. Walks
+; the same capabilities list pci_pm_wake does, looking for PCI_CAP_ID_EXP
+; (0x10) this time, then clears bits 1:0 (ASPM Control) of the Link Control
+; register at cap_ptr+0x10. No-op if the device has no PCIe capability, or
+; ASPM is already off.
+PCI_CAP_ID_EXP equ 0x10
+pci_disable_aspm:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push r8
+    push r9
+    push r10
+    push r11
+
+    movzx ebx, byte [nic_pci_bus]
+    movzx ecx, byte [nic_pci_dev]
+    movzx edx, byte [nic_pci_func]
+    mov r8b, 0x34                  ; Capabilities Pointer register
+    call pci_read32
+    movzx r11d, al                 ; r11 = offset of first capability
+.asp_walk:
+    test r11d, r11d
+    jz .asp_done                   ; end of list: no PCIe capability
+    movzx ebx, byte [nic_pci_bus]
+    movzx ecx, byte [nic_pci_dev]
+    movzx edx, byte [nic_pci_func]
+    mov r8d, r11d
+    and r8d, 0xFC
+    call pci_read32                ; al=cap id, ah=next ptr (bits 8:15)
+    cmp al, PCI_CAP_ID_EXP
+    je .asp_found
+    mov r10d, eax
+    shr r10d, 8
+    movzx r11d, r10b
+    jmp .asp_walk
+.asp_found:
+    mov r9d, r11d
+    and r9d, 0xFC
+    add r9d, 0x10                  ; Link Control register: cap_ptr+0x10 (word)
+    movzx ebx, byte [nic_pci_bus]
+    movzx ecx, byte [nic_pci_dev]
+    movzx edx, byte [nic_pci_func]
+    mov r8d, r9d
+    call pci_read32
+    and eax, 0xFFFFFFFC             ; clear ASPM Control (bits 1:0): L0s/L1 off
+    mov r10d, eax
+    movzx ebx, byte [nic_pci_bus]
+    movzx ecx, byte [nic_pci_dev]
+    movzx edx, byte [nic_pci_func]
+    mov r8d, r9d
+    call pci_write32
+.asp_done:
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; ---- e1000 MMIO helpers -------------------------------------------
+; e1000_reg_read32:  edi = register offset -> eax = value
+; e1000_reg_write32: edi = register offset, eax = value to write
+; BAR0 is identity-mapped (same trick expand_identity_map already sets up
+; for every other DMA buffer in this kernel), so this is a plain load/store
+; against nic_mmio_base+offset - no port I/O involved.
+e1000_reg_read32:
+    push rbx
+    push rdi
+    mov ebx, [nic_mmio_base]
+    add rbx, rdi
+    mov eax, [rbx]
+    pop rdi
+    pop rbx
+    ret
+e1000_reg_write32:
+    push rbx
+    push rdi
+    mov ebx, [nic_mmio_base]
+    add rbx, rdi
+    mov [rbx], eax
+    pop rdi
+    pop rbx
+    ret
+
+; ---- bring-up ----------------------------------------------------
+nic_init:
+    push rbx
+    push rcx
+    push rdx
+    push r8
+    push r9
+    push r10
+    push rdi
+    push rsi
+
+    mov byte [nic_present], 0
+    mov byte [nic_driver_type], 0
+    call pci_find_nic
+    jc .try_e1000
+
+    call pci_pm_wake                 ; make sure it's in D0 before we touch it
+    call pci_disable_aspm            ; keep the PCIe link out of L0s/L1
+
+    ; PCI command: enable I/O space (bit0) + bus master (bit2)
+    movzx ebx, byte [nic_pci_bus]
+    movzx ecx, byte [nic_pci_dev]
+    movzx edx, byte [nic_pci_func]
+    mov r8b, NIC_PCI_CMD
+    call pci_read32
+    or eax, 0x0005
+    mov r10d, eax
+    movzx ebx, byte [nic_pci_bus]
+    movzx ecx, byte [nic_pci_dev]
+    movzx edx, byte [nic_pci_func]
+    mov r8b, NIC_PCI_CMD
+    call pci_write32
+
+    ; BAR0 must be an I/O bar (QEMU's RTL8139 uses I/O by default)
+    movzx ebx, byte [nic_pci_bus]
+    movzx ecx, byte [nic_pci_dev]
+    movzx edx, byte [nic_pci_func]
+    mov r8b, NIC_PCI_BAR0
+    call pci_read32
+    test eax, 1
+    jz .ndone
+    and eax, 0xFFFFFFFC
+    mov [nic_io_base], eax
+
+    ; read the MAC from IDR0..IDR5
+    mov edi, [nic_io_base]
+    add edi, NIC_IO_IDR0
+    lea rsi, [nic_mac]
+    mov rcx, 6
+    call nic_io_read_block
+
+    ; soft reset: write RST (0x10) to CMD, poll until it clears
+    mov edi, [nic_io_base]
+    add edi, NIC_IO_CMD
+    mov al, 0x10
+    call nic_io_write8
+    mov r9, 0x200000
+.nreset_wait:
+    mov edi, [nic_io_base]
+    add edi, NIC_IO_CMD
+    call nic_io_read8
+    test al, 0x10
+    jz .nreset_done
+    dec r9
+    jnz .nreset_wait
+    jmp .ndone
+.nreset_done:
+
+    ; CONFIG1=0, interrupt mask off, clear ISR
+    mov edi, [nic_io_base]
+    add edi, NIC_IO_CFG1
+    xor al, al
+    call nic_io_write8
+    mov edi, [nic_io_base]
+    add edi, NIC_IO_IMR
+    xor ax, ax
+    call nic_io_write16
+    mov edi, [nic_io_base]
+    add edi, NIC_IO_ISR
+    mov ax, 0xFFFF
+    call nic_io_write16
+
+    ; point the 8KB RX ring at our DMA buffer (identity-mapped)
+    mov edi, [nic_io_base]
+    add edi, NIC_IO_RBSTART
+    lea eax, [nic_rx_ring]
+    call nic_io_write32
+
+    ; RCR = AB|AM|APM|AAP (accept everything), TCR = 0, CAPR/CBR = 0
+    mov edi, [nic_io_base]
+    add edi, NIC_IO_RCR
+    mov eax, 0x0000000F
+    call nic_io_write32
+    mov edi, [nic_io_base]
+    add edi, NIC_IO_TCR
+    xor eax, eax
+    call nic_io_write32
+    ; seed CAPR = ring - 16 (the chip trails the read position by 16), CBR = 0
+    mov edi, [nic_io_base]
+    add edi, NIC_IO_CAPR
+    mov ax, NIC_RX_RING_SIZE - 16
+    call nic_io_write16
+    mov edi, [nic_io_base]
+    add edi, NIC_IO_CBR
+    xor eax, eax
+    call nic_io_write32
+
+    ; software state
+    mov dword [nic_capr], 0
+    mov byte [nic_arp_tried], 0
+    mov byte [nic_dns_retry], 0
+    mov byte [nic_tx_desc], 0
+    mov word [nic_dns_id], 1
+    mov word [nic_echo_id], 0x1234
+    mov word [nic_echo_seq], 1
+    mov byte [nic_echo_got], 0
+    mov byte [nic_echo_retry], 0
+    mov word [nic_ip_id], 0x4200
+
+    ; CMD = RE|TE = 0x0C; live
+    mov edi, [nic_io_base]
+    add edi, NIC_IO_CMD
+    mov al, 0x0C
+    call nic_io_write8
+
+    mov byte [nic_present], 1
+    clc
+    jmp .ndone
+
+; ---- e1000 bring-up (only reached if no RTL8139 was found above) --
+.try_e1000:
+    call pci_find_e1000
+    jc .try_rtl8168
+
+    call pci_pm_wake                 ; make sure it's in D0 before we touch it
+    call pci_disable_aspm            ; keep the PCIe link out of L0s/L1
+
+    ; PCI command: enable memory space (bit1) + bus master (bit2)
+    movzx ebx, byte [nic_pci_bus]
+    movzx ecx, byte [nic_pci_dev]
+    movzx edx, byte [nic_pci_func]
+    mov r8b, NIC_PCI_CMD
+    call pci_read32
+    or eax, 0x0006
+    mov r10d, eax
+    movzx ebx, byte [nic_pci_bus]
+    movzx ecx, byte [nic_pci_dev]
+    movzx edx, byte [nic_pci_func]
+    mov r8b, NIC_PCI_CMD
+    call pci_write32
+
+    ; BAR0 must be a memory BAR (bit0=0 - an I/O bar here would mean a chip
+    ; this driver doesn't understand); mask off the low 4 type/prefetch bits
+    movzx ebx, byte [nic_pci_bus]
+    movzx ecx, byte [nic_pci_dev]
+    movzx edx, byte [nic_pci_func]
+    mov r8b, NIC_PCI_BAR0
+    call pci_read32
+    test eax, 1
+    jnz .ndone
+    and eax, 0xFFFFFFF0
+    mov [nic_mmio_base], eax
+
+    ; full device reset: CTRL.RST, then poll for it to self-clear
+    mov edi, E1000_CTRL
+    mov eax, E1000_CTRL_RST
+    call e1000_reg_write32
+    mov r9, 0x1000000
+.e1k_reset_wait:
+    mov edi, E1000_CTRL
+    call e1000_reg_read32
+    test eax, E1000_CTRL_RST
+    jz .e1k_reset_done
+    dec r9
+    jnz .e1k_reset_wait
+    jmp .ndone
+.e1k_reset_done:
+
+    ; polled driver, same discipline as the RTL8139 side: mask interrupts,
+    ; then read ICR once to drop anything reset/link-change latched there
+    mov edi, E1000_IMC
+    mov eax, 0xFFFFFFFF
+    call e1000_reg_write32
+    mov edi, E1000_ICR
+    call e1000_reg_read32
+
+    ; link up: CTRL.SLU + CTRL.ASDE so the PHY auto-negotiates on real wire
+    mov edi, E1000_CTRL
+    call e1000_reg_read32
+    or eax, E1000_CTRL_SLU_ASDE
+    mov edi, E1000_CTRL
+    call e1000_reg_write32
+
+    ; zero the multicast table array (128 x 32-bit entries)
+    xor r9d, r9d
+.e1k_mta_loop:
+    cmp r9d, 128
+    jae .e1k_mta_done
+    mov ecx, r9d
+    shl ecx, 2
+    mov edi, E1000_MTA
+    add edi, ecx
+    xor eax, eax
+    call e1000_reg_write32
+    inc r9d
+    jmp .e1k_mta_loop
+.e1k_mta_done:
+
+    ; MAC address: real e1000 hardware auto-loads it from the EEPROM into
+    ; RAL0/RAH0 during PCI reset (the datasheets call this out explicitly -
+    ; software isn't expected to read the EEPROM directly for it), so read
+    ; it back here rather than talk to the EEPROM ourselves. That keeps this
+    ; driver EEPROM-layout-agnostic and works the same on QEMU's model and
+    ; on real 82540/82545/82571/82574-family cards.
+    mov edi, E1000_RAL0
+    call e1000_reg_read32
+    mov [nic_mac], al
+    mov [nic_mac+1], ah
+    shr eax, 16
+    mov [nic_mac+2], al
+    mov [nic_mac+3], ah
+    mov edi, E1000_RAH0
+    call e1000_reg_read32
+    mov [nic_mac+4], al
+    mov [nic_mac+5], ah
+
+    ; RX ring: E1000_RX_DESC_COUNT descriptors, each pointing at its own
+    ; 2KB buffer in e1000_rx_bufs (identity-mapped, so the linked address
+    ; is already the physical address the chip needs).
+    xor r9d, r9d
+.e1k_rxd_loop:
+    cmp r9d, E1000_RX_DESC_COUNT
+    jae .e1k_rxd_done
+    mov eax, r9d
+    shl eax, 4
+    lea rdi, [e1000_rx_desc + rax]
+    mov eax, r9d
+    imul eax, E1000_RX_BUF_SIZE
+    lea rsi, [e1000_rx_bufs + rax]
+    mov [rdi], rsi
+    mov dword [rdi+8], 0
+    mov dword [rdi+12], 0
+    inc r9d
+    jmp .e1k_rxd_loop
+.e1k_rxd_done:
+    mov edi, E1000_RDBAL
+    lea eax, [e1000_rx_desc]
+    call e1000_reg_write32
+    mov edi, E1000_RDBAH
+    xor eax, eax
+    call e1000_reg_write32
+    mov edi, E1000_RDLEN
+    mov eax, E1000_RX_DESC_COUNT * 16
+    call e1000_reg_write32
+    mov edi, E1000_RDH
+    xor eax, eax
+    call e1000_reg_write32
+    mov edi, E1000_RDT
+    mov eax, E1000_RX_DESC_COUNT - 1
+    call e1000_reg_write32
+    mov edi, E1000_RCTL
+    mov eax, E1000_RCTL_EN | E1000_RCTL_UPE | E1000_RCTL_MPE | E1000_RCTL_BAM | E1000_RCTL_SECRC
+    call e1000_reg_write32
+
+    ; TX ring: every descriptor points at the same nic_tx_buf. That's safe
+    ; because nic_send_raw_e1000 always waits for DD before returning (same
+    ; synchronous, no-overlapping-sends contract nic_send_raw already keeps
+    ; for the RTL8139 side), so only one send is ever in flight.
+    xor r9d, r9d
+.e1k_txd_loop:
+    cmp r9d, E1000_TX_DESC_COUNT
+    jae .e1k_txd_done
+    mov eax, r9d
+    shl eax, 4
+    lea rdi, [e1000_tx_desc + rax]
+    lea rsi, [nic_tx_buf]
+    mov [rdi], rsi
+    mov dword [rdi+8], 0
+    mov dword [rdi+12], 0
+    inc r9d
+    jmp .e1k_txd_loop
+.e1k_txd_done:
+    mov edi, E1000_TDBAL
+    lea eax, [e1000_tx_desc]
+    call e1000_reg_write32
+    mov edi, E1000_TDBAH
+    xor eax, eax
+    call e1000_reg_write32
+    mov edi, E1000_TDLEN
+    mov eax, E1000_TX_DESC_COUNT * 16
+    call e1000_reg_write32
+    mov edi, E1000_TDH
+    xor eax, eax
+    call e1000_reg_write32
+    mov edi, E1000_TDT
+    xor eax, eax
+    call e1000_reg_write32
+    mov edi, E1000_TIPG
+    mov eax, E1000_TIPG_VAL
+    call e1000_reg_write32
+    mov edi, E1000_TCTL
+    mov eax, E1000_TCTL_EN | E1000_TCTL_PSP | E1000_TCTL_CT | E1000_TCTL_COLD
+    call e1000_reg_write32
+
+    ; software state
+    mov dword [e1000_rx_idx], 0
+    mov dword [e1000_tx_idx], 0
+    mov byte [nic_arp_tried], 0
+    mov byte [nic_dns_retry], 0
+    mov word [nic_dns_id], 1
+    mov word [nic_echo_id], 0x1234
+    mov word [nic_echo_seq], 1
+    mov byte [nic_echo_got], 0
+    mov byte [nic_echo_retry], 0
+    mov word [nic_ip_id], 0x4200
+
+    mov byte [nic_driver_type], 1
+    mov byte [nic_present], 1
+    clc
+    jmp .ndone
+
+; ---- RTL8168/8169/8161 bring-up (only reached if neither RTL8139 nor
+; e1000 was found above) -------------------------------------------
+.try_rtl8168:
+    call pci_find_rtl8168
+    jc .ndone
+
+    call pci_pm_wake                 ; make sure it's in D0 before we touch it
+    call pci_disable_aspm            ; keep the PCIe link out of L0s/L1 so the
+                                      ; descriptor DMA engine doesn't stall
+
+    ; PCI command: enable I/O space (bit0) + bus master (bit2) - same as
+    ; the RTL8139 path, this chip is also reached over its I/O BAR0.
+    movzx ebx, byte [nic_pci_bus]
+    movzx ecx, byte [nic_pci_dev]
+    movzx edx, byte [nic_pci_func]
+    mov r8b, NIC_PCI_CMD
+    call pci_read32
+    or eax, 0x0005
+    mov r10d, eax
+    movzx ebx, byte [nic_pci_bus]
+    movzx ecx, byte [nic_pci_dev]
+    movzx edx, byte [nic_pci_func]
+    mov r8b, NIC_PCI_CMD
+    call pci_write32
+
+    ; BAR0 must be an I/O bar
+    movzx ebx, byte [nic_pci_bus]
+    movzx ecx, byte [nic_pci_dev]
+    movzx edx, byte [nic_pci_func]
+    mov r8b, NIC_PCI_BAR0
+    call pci_read32
+    test eax, 1
+    jz .ndone
+    and eax, 0xFFFFFFFC
+    mov [nic_io_base], eax
+
+    ; --- EXPERIMENTAL for RTL8168E-and-later: do NOT soft-reset the chip,
+    ; and do NOT overwrite TCR/RCR/CPCMD with generic values. netinfo/dhcp
+    ; diagnostics on this hardware confirmed this chip doesn't match any of
+    ; the older, well-documented RTL8168B/C/CP/D/DP revisions - meaning it's
+    ; 8168E or newer, a generation where Realtek's own driver depends on
+    ; uploading real firmware microcode into the chip as part of bring-up,
+    ; something this driver has no way to do. If your board's own firmware/
+    ; option ROM already touched this NIC at boot (very common for onboard
+    ; LAN even with PXE boot disabled), it likely already ran that correct
+    ; vendor init before our OS took over. RST + full TCR/RCR/CPCMD rewrite
+    ; below would throw all of that away and replace it with generic values
+    ; that this generation may not actually accept. So: skip RST, skip the
+    ; TCR/RCR/CPCMD writes, and only touch what we must - interrupts and our
+    ; own descriptor rings - so whatever good state exists is preserved.
+    mov edi, [nic_io_base]
+    add edi, RTL_IO_TCR
+    call nic_io_read32
+    mov [nic_hwver_raw], eax
+
+    ; read the MAC from IDR0..IDR5 (works whether or not we reset - IDR is
+    ; always readable)
+    mov edi, [nic_io_base]
+    add edi, RTL_IO_IDR0
+    lea rsi, [nic_mac]
+    mov rcx, 6
+    call nic_io_read_block
+
+    ; interrupts off (polled driver, same discipline as the other two
+    ; backends), clear any latched status
+    mov edi, [nic_io_base]
+    add edi, RTL_IO_IMR
+    xor ax, ax
+    call nic_io_write16
+    mov edi, [nic_io_base]
+    add edi, RTL_IO_ISR
+    mov ax, 0xFFFF
+    call nic_io_write16
+
+    ; RxConfig only - unlike TCR/CPCMD (left alone above, since touching
+    ; those is what broke TX on this chip generation) RCR doesn't affect
+    ; the TX path at all. It's specifically what decides which incoming
+    ; packet types get let into the RX ring - if the board's firmware left
+    ; it in some narrow PXE-only unicast filter, a broadcast DHCP offer
+    ; would be silently dropped before ever reaching our ring, which is
+    ; exactly consistent with "raw frames seen: 0" despite link being up
+    ; and TX now working. Accept broadcast/multicast/matching-unicast/all.
+    mov edi, [nic_io_base]
+    add edi, RTL_IO_RCR
+    mov eax, 0x0000E70F
+    call nic_io_write32
+
+    ; RxMaxSize (0xDA): hardware length filter applied to every incoming
+    ; frame BEFORE it reaches the descriptor ring - this is separate from
+    ; RCR's type filtering (broadcast/multicast/unicast) above. This was
+    ; never being written anywhere, which on power-on-reset defaults leaves
+    ; it at 0 - "accept 0-byte frames only" - so the chip was silently
+    ; discarding every real frame at the MAC filter stage regardless of
+    ; what RCR said. That's the actual explanation for "raw frames seen: 0"
+    ; despite link up, TX working, and RCR set to accept everything. Set it
+    ; well above any real frame size (1536) and safely within RTL_RX_BUF_SIZE.
+    mov edi, [nic_io_base]
+    add edi, RTL_IO_RMS
+    mov ax, 0x1FFF
+    call nic_io_write16
+
+    ; MaxTxPacketSize (0xEC, 128-byte units): the TX-side analog of RMS.
+    ; Also never written/left at 0 - hasn't caused a visible failure yet
+    ; because DHCP discover is small, but leaving it at 0 is the same class
+    ; of bug and will bite on any larger outbound packet. 0x3B * 128 = 7552
+    ; bytes, comfortably above anything this driver sends.
+    mov edi, [nic_io_base]
+    add edi, RTL_IO_MTPS
+    mov al, 0x3B
+    call nic_io_write8
+
+    ; RX ring: RTL_RX_DESC_COUNT descriptors {command dword, vlan dword
+    ; (unused), buf_lo dword, buf_hi dword}, each pointing at its own
+    ; 2KB buffer in rtl_rx_bufs (identity-mapped physical address).
+    xor r9d, r9d
+.rtl_rxd_loop:
+    cmp r9d, RTL_RX_DESC_COUNT
+    jae .rtl_rxd_done
+    mov eax, r9d
+    shl eax, 4
+    lea rdi, [rtl_rx_desc + rax]
+    mov eax, RTL_DESC_OWN
+    or eax, RTL_RX_BUF_SIZE
+    cmp r9d, RTL_RX_DESC_COUNT - 1
+    jne .rtl_rxd_noeor
+    or eax, RTL_DESC_EOR
+.rtl_rxd_noeor:
+    mov [rdi], eax
+    mov dword [rdi+4], 0
+    mov eax, r9d
+    imul eax, RTL_RX_BUF_SIZE
+    lea rsi, [rtl_rx_bufs + rax]
+    mov [rdi+8], esi
+    mov dword [rdi+12], 0
+    inc r9d
+    jmp .rtl_rxd_loop
+.rtl_rxd_done:
+    mov edi, [nic_io_base]
+    add edi, RTL_IO_RDSAR_LO
+    lea eax, [rtl_rx_desc]
+    call nic_io_write32
+    mov edi, [nic_io_base]
+    add edi, RTL_IO_RDSAR_HI
+    xor eax, eax
+    call nic_io_write32
+
+    ; TX ring: every descriptor points at the same nic_tx_buf, same
+    ; single-frame-in-flight contract nic_send_raw_rtl8168 keeps.
+    ; High-priority ring left zeroed/unused.
+    xor r9d, r9d
+.rtl_txd_loop:
+    cmp r9d, RTL_TX_DESC_COUNT
+    jae .rtl_txd_done
+    mov eax, r9d
+    shl eax, 4
+    lea rdi, [rtl_tx_desc + rax]
+    mov dword [rdi], 0
+    mov dword [rdi+4], 0
+    lea rsi, [nic_tx_buf]
+    mov [rdi+8], esi
+    mov dword [rdi+12], 0
+    inc r9d
+    jmp .rtl_txd_loop
+.rtl_txd_done:
+    mov edi, [nic_io_base]
+    add edi, RTL_IO_TNPDS_LO
+    lea eax, [rtl_tx_desc]
+    call nic_io_write32
+    mov edi, [nic_io_base]
+    add edi, RTL_IO_TNPDS_HI
+    xor eax, eax
+    call nic_io_write32
+    mov edi, [nic_io_base]
+    add edi, RTL_IO_THPDS_LO
+    xor eax, eax
+    call nic_io_write32
+    mov edi, [nic_io_base]
+    add edi, RTL_IO_THPDS_HI
+    xor eax, eax
+    call nic_io_write32
+
+    ; enable Rx+Tx, then lock config registers back down
+    mov edi, [nic_io_base]
+    add edi, RTL_IO_CMD
+    mov al, RTL_CMD_RE | RTL_CMD_TE
+    call nic_io_write8
+    mov edi, [nic_io_base]
+    add edi, RTL_IO_9346CR
+    mov al, RTL_9346_LOCK
+    call nic_io_write8
+
+    ; wait for the copper link to actually come up before handing the NIC
+    ; to the rest of the stack. QEMU's virtual link is always already "up",
+    ; which is why this was never needed there - real Gigabit autonegotiation
+    ; plus switch-port bring-up (STP listening/learning, etc.) commonly takes
+    ; several seconds, and frames sent before the link is up are just dropped.
+    ; ~5s budget (500 * ~10ms); if it times out we still proceed - nic_present
+    ; is still set below so a late link-up will work once dhcp/ping retry.
+    mov r9d, 500
+.rtl_link_wait:
+    mov edi, [nic_io_base]
+    add edi, RTL_IO_PHYSTATUS
+    call nic_io_read8
+    test al, RTL_PHYSTATUS_LINK
+    jnz .rtl_link_up
+    mov r10, 0x80000              ; ~10ms busy-wait
+.rtl_link_delay:
+    dec r10
+    jnz .rtl_link_delay
+    dec r9d
+    jnz .rtl_link_wait
+.rtl_link_up:
+
+    ; software state
+    mov dword [rtl_rx_idx], 0
+    mov dword [rtl_tx_idx], 0
+    mov byte [nic_arp_tried], 0
+    mov byte [nic_dns_retry], 0
+    mov word [nic_dns_id], 1
+    mov word [nic_echo_id], 0x1234
+    mov word [nic_echo_seq], 1
+    mov byte [nic_echo_got], 0
+    mov byte [nic_echo_retry], 0
+    mov word [nic_ip_id], 0x4200
+
+    mov byte [nic_driver_type], 2
+    mov byte [nic_present], 1
+    clc
+.ndone:
+    pop rsi
+    pop rdi
+    pop r10
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; mdio_write_rtl: dl = PHY register address (0-31), eax = 16-bit value to
+; write (low 16 bits used). Uses PHYAR (offset 0x60): bit31=1 triggers a
+; write, register addr in bits 20:16, data in bits 15:0. Hardware clears
+; bit31 when the write completes; we poll for that with a bounded budget.
+mdio_write_rtl:
+    push rax
+    push rcx
+    push rdx
+    push rdi
+    push r9
+
+    movzx ecx, dl
+    and ecx, 0x1F
+    shl ecx, 16
+    and eax, 0xFFFF
+    or ecx, eax
+    or ecx, 0x80000000
+    mov edi, [nic_io_base]
+    add edi, RTL_IO_PHYAR
+    mov eax, ecx
+    call nic_io_write32
+
+    mov r9, 2000
+.mwr_wait:
+    mov edi, [nic_io_base]
+    add edi, RTL_IO_PHYAR
+    call nic_io_read32
+    test eax, 0x80000000
+    jz .mwr_done
+    dec r9
+    jnz .mwr_wait
+.mwr_done:
+    pop r9
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; rtl_phy_power_up_and_renegotiate: mirrors the real-hardware PHY bring-up
+; sequence used by Realtek's own driver source (register page select via
+; 0x1F, clear the power-down bit at 0x0E, then force BMCR reset + enable +
+; restart-autonegotiation at register 0x00). Purely additive - if the PHY
+; was already fine this just makes it renegotiate again, which is harmless.
+rtl_phy_power_up_and_renegotiate:
+    push rax
+    push rdx
+
+    mov dl, 0x1F
+    xor eax, eax
+    call mdio_write_rtl        ; select PHY register page 0
+
+    mov dl, 0x0E
+    xor eax, eax
+    call mdio_write_rtl        ; clear power-down bit (page-specific reg)
+
+    mov dl, 0x00                ; BMCR
+    mov eax, 0x9200              ; RESET | ANENABLE | ANRESTART
+    call mdio_write_rtl
+
+    pop rdx
+    pop rax
+    ret
+
+; nic_send_raw: rcx = byte length of the frame already built in nic_tx_buf.
+; Loads TSAD0 with the buffer address, writes the length to TSD0 to trigger
+; the DMA+transmit, then waits for TxStatOk (bit15) in TSD0. Returns CF=0 on
+; success. Callers always wait for completion, so no in-flight TX precedes us.
+nic_send_raw:
+    cmp byte [nic_driver_type], 1
+    je nic_send_raw_e1000
+    cmp byte [nic_driver_type], 2
+    je nic_send_raw_rtl8168
+    push rax
+    push rcx
+    push rdx
+    push rdi
+    push r8
+    push r9
+    ; Round-robin the 4 C-mode TX descriptors: QEMU's rtl8139 model only
+    ; transmits the descriptor at its internal currTxDesc (which advances
+    ; after every successful TX), so the driver must keep writing the
+    ; descriptor the chip currently expects. nic_tx_desc tracks that.
+    ; NOTE: desc*4 lives in r8 because nic_io_write32/read32 clobber dx.
+    movzx r8d, byte [nic_tx_desc]
+    shl r8d, 2
+    mov edi, [nic_io_base]
+    add edi, r8d
+    add edi, NIC_IO_TSAD0
+    lea eax, [nic_tx_buf]
+    call nic_io_write32
+    mov edi, [nic_io_base]
+    add edi, r8d
+    add edi, NIC_IO_TSD0
+    mov eax, ecx
+    and eax, 0xFFFF
+    call nic_io_write32
+    mov r9, 0x200000
+.tsr_wait_done:
+    mov edi, [nic_io_base]
+    add edi, r8d
+    add edi, NIC_IO_TSD0
+    call nic_io_read32
+    test eax, 0x2000                ; TOK (Transmit OK, bit 13)
+    jnz .tsr_ok
+    dec r9
+    jnz .tsr_wait_done
+    jmp .tsr_err
+.tsr_ok:
+    movzx eax, byte [nic_tx_desc]
+    inc eax
+    and eax, 3
+    mov [nic_tx_desc], al
+    pop r9
+    pop r8
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rax
+    clc
+    ret
+.tsr_err:
+    pop r9
+    pop r8
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rax
+    stc
+    ret
+
+; nic_send_raw_e1000: same contract as nic_send_raw (rcx = frame length
+; already built in nic_tx_buf, CF=0 on success). Every TX descriptor in the
+; ring already points at nic_tx_buf (see nic_init's e1000 bring-up), so we
+; only need to fill in length/cmd, kick TDT, and wait for the chip to set
+; Descriptor Done on the slot we just queued.
+nic_send_raw_e1000:
+    push rax
+    push rcx
+    push rdx
+    push rdi
+    push rsi
+    push r8
+    push r9
+    push r10
+
+    mov r8d, [e1000_tx_idx]
+    mov eax, r8d
+    shl eax, 4
+    lea r10, [e1000_tx_desc + rax]   ; kept across the TDT write below
+
+    mov ax, cx
+    mov [r10+8], ax                  ; length
+    mov byte [r10+10], 0             ; cso
+    mov byte [r10+11], E1000_TXD_CMD_EOP_IFCS_RS
+    mov byte [r10+12], 0             ; status: clear DD before kicking the ring
+
+    mov eax, r8d
+    inc eax
+    cmp eax, E1000_TX_DESC_COUNT
+    jb .e1ks_no_wrap
+    xor eax, eax
+.e1ks_no_wrap:
+    mov [e1000_tx_idx], eax
+
+    mov edi, E1000_TDT
+    call e1000_reg_write32           ; eax still holds the new tail index
+
+    mov r9, 0x1000000
+.e1ks_wait:
+    movzx eax, byte [r10+12]
+    test al, E1000_DD
+    jnz .e1ks_ok
+    dec r9
+    jnz .e1ks_wait
+    jmp .e1ks_err
+.e1ks_ok:
+    pop r10
+    pop r9
+    pop r8
+    pop rsi
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rax
+    clc
+    ret
+.e1ks_err:
+    pop r10
+    pop r9
+    pop r8
+    pop rsi
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rax
+    stc
+    ret
+
+; nic_send_raw_rtl8168: same contract as nic_send_raw (rcx = frame length
+; already built in nic_tx_buf, CF=0 on success). Every TX descriptor in the
+; ring already points at nic_tx_buf, so we only need to fill in the
+; command dword (OWN|FS|LS|len, +EOR on the last slot), kick TPPoll, and
+; wait for the chip to clear OWN on the slot we just queued.
+nic_send_raw_rtl8168:
+    push rax
+    push rcx
+    push rdx
+    push rdi
+    push r8
+    push r9
+    push r10
+
+    mov r8d, [rtl_tx_idx]
+    mov eax, r8d
+    shl eax, 4
+    lea r10, [rtl_tx_desc + rax]     ; kept across the TPPoll write below
+
+    mov eax, RTL_DESC_OWN | RTL_DESC_FS | RTL_DESC_LS
+    mov edx, ecx
+    and edx, 0xFFFF
+    or eax, edx
+    cmp r8d, RTL_TX_DESC_COUNT - 1
+    jne .rtks_noeor
+    or eax, RTL_DESC_EOR
+.rtks_noeor:
+    mov [r10], eax                   ; command dword: hand this slot to the NIC
+
+    mov eax, r8d
+    inc eax
+    cmp eax, RTL_TX_DESC_COUNT
+    jb .rtks_no_wrap
+    xor eax, eax
+.rtks_no_wrap:
+    mov [rtl_tx_idx], eax
+
+    mov edi, [nic_io_base]
+    add edi, RTL_IO_TPPOLL
+    mov al, RTL_TPPOLL_NPQ
+    call nic_io_write8
+
+    mov r9, 0x1000000
+.rtks_wait:
+    mov eax, [r10]
+    test eax, RTL_DESC_OWN
+    jz .rtks_ok
+    dec r9
+    jnz .rtks_wait
+    jmp .rtks_err
+.rtks_ok:
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rax
+    clc
+    ret
+.rtks_err:
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rax
+    stc
+    ret
+
+; ---- RX ----------------------------------------------------------
+; nic_write_capr: write CAPR = (nic_capr - 16) mod ring. The RTL8139's CAPR
+; trails the true read position by 16 bytes (QEMU adds 0x10 on every write),
+; so the driver must program it 16 less than the next-packet offset.
+nic_write_capr:
+    push rax
+    push rdi
+    mov eax, [nic_capr]
+    sub eax, 16
+    and eax, NIC_RX_RING_MASK
+    mov edi, [nic_io_base]
+    add edi, NIC_IO_CAPR
+    call nic_io_write16
+    pop rdi
+    pop rax
+    ret
+
+; nic_fetch_rx: if a packet is ready at the software CAPR, copies the actual
+; ethernet frame (raw descriptor length minus the 4-byte CRC) from the ring
+; into nic_rx_frame, handling wrap-around, advances/writes CAPR, and returns
+; al=1. Returns al=0 when the ring is drained. nic_rx_len = frame bytes.
+nic_fetch_rx:
+    push rbx
+    push rcx
+    push rdx
+    push rdi
+    push rsi
+    push r9
+    cmp byte [nic_present], 0
+    je .frx_none
+    cmp byte [nic_driver_type], 1
+    je .frx_e1000
+    cmp byte [nic_driver_type], 2
+    je .frx_rtl8168
+    mov eax, [nic_capr]
+    and eax, NIC_RX_RING_MASK
+    lea rsi, [nic_rx_ring + rax]
+    mov ax, [rsi]
+    test ax, 0x0001               ; ROK set? (QEMU always sets it; empty = 0)
+    jz .frx_none
+    movzx ecx, word [rsi+2]
+    and ecx, 0x3FFF
+    mov r9d, ecx                  ; raw length incl. the 4-byte CRC
+    sub ecx, 4
+    jbe .frx_skip                 ; raw length <= 4: error descriptor
+    mov [nic_rx_len], ecx
+    lea rbx, [nic_rx_ring]
+    mov eax, [nic_capr]
+    and eax, NIC_RX_RING_MASK
+    add eax, 4
+    mov edx, eax
+    lea rdi, [nic_rx_frame]
+.frx_copy:
+    mov esi, edx
+    and esi, NIC_RX_RING_MASK
+    mov al, [rbx+rsi]
+    mov [rdi], al
+    inc edx
+    inc rdi
+    dec rcx
+    jnz .frx_copy
+.frx_adv:
+    mov eax, [nic_capr]
+    mov ecx, r9d
+    add ecx, 3
+    and ecx, 0xFFFFFFFC
+    add eax, 4
+    add eax, ecx
+    and eax, NIC_RX_RING_MASK
+    mov [nic_capr], eax
+    call nic_write_capr
+    mov al, 1
+    jmp .frx_out
+.frx_skip:
+    mov eax, [nic_capr]
+    add eax, 4
+    and eax, NIC_RX_RING_MASK
+    mov [nic_capr], eax
+    call nic_write_capr
+    jmp .frx_none
+
+; e1000 RX path: descriptor-ring equivalent of the ring-buffer walk above.
+; e1000_rx_idx is the software head - the next descriptor we expect the
+; chip to have finished (status.DD set). RCTL's SECRC bit already strips
+; the trailing 4-byte CRC, so the descriptor's length is the frame length.
+.frx_e1000:
+    mov eax, [e1000_rx_idx]
+    mov ecx, eax
+    shl ecx, 4
+    lea rsi, [e1000_rx_desc + rcx]
+    movzx edx, byte [rsi+12]         ; status byte
+    test dl, E1000_DD
+    jz .frx_none
+    movzx ecx, word [rsi+8]          ; frame length
+    cmp ecx, 1514
+    ja .e1frx_skip
+    cmp ecx, 0
+    je .e1frx_skip
+    mov [nic_rx_len], ecx
+    mov rbx, [rsi]                   ; this descriptor's buffer_addr
+    lea rdi, [nic_rx_frame]
+.e1frx_copy:
+    mov al, [rbx]
+    mov [rdi], al
+    inc rbx
+    inc rdi
+    dec rcx
+    jnz .e1frx_copy
+    mov byte [rsi+12], 0             ; clear DD: descriptor free for reuse
+    mov edi, E1000_RDT
+    mov eax, [e1000_rx_idx]
+    call e1000_reg_write32           ; tell the chip this slot is available again
+    mov eax, [e1000_rx_idx]
+    inc eax
+    cmp eax, E1000_RX_DESC_COUNT
+    jb .e1frx_nowrap
+    xor eax, eax
+.e1frx_nowrap:
+    mov [e1000_rx_idx], eax
+    mov al, 1
+    jmp .frx_out
+.e1frx_skip:
+    mov byte [rsi+12], 0
+    mov edi, E1000_RDT
+    mov eax, [e1000_rx_idx]
+    call e1000_reg_write32
+    mov eax, [e1000_rx_idx]
+    inc eax
+    cmp eax, E1000_RX_DESC_COUNT
+    jb .e1frx_skip_nowrap
+    xor eax, eax
+.e1frx_skip_nowrap:
+    mov [e1000_rx_idx], eax
+    jmp .frx_none
+; RTL8168 RX path: descriptor-ring walk, same shape as the e1000 branch
+; above but over the RTL8169-style descriptor (command dword, vlan dword
+; [unused], buf_lo, buf_hi=0). rtl_rx_idx is the software head - the next
+; descriptor we expect the chip to have cleared OWN on. The low 14 bits
+; of the command dword give the frame length *including* the trailing
+; 4-byte CRC (this chip doesn't strip it for us), so we subtract 4 the
+; same way the RTL8139 path above does.
+.frx_rtl8168:
+    mov r9d, [rtl_rx_idx]
+    mov eax, r9d
+    shl eax, 4
+    lea rsi, [rtl_rx_desc + rax]
+    mov eax, [rsi]
+    test eax, RTL_DESC_OWN
+    jnz .frx_none                    ; still owned by the NIC: nothing ready
+
+    movzx ecx, ax
+    and ecx, 0x3FFF
+    sub ecx, 4                       ; drop the trailing CRC
+    jbe .rtlfrx_skip                 ; runt/error descriptor: drop and requeue
+
+    mov [nic_rx_len], ecx
+    mov ebx, [rsi+8]                 ; buffer physical addr (identity-mapped)
+    lea rdi, [nic_rx_frame]
+.rtlfrx_copy:
+    mov al, [rbx]
+    mov [rdi], al
+    inc rbx
+    inc rdi
+    dec rcx
+    jnz .rtlfrx_copy
+
+    mov eax, RTL_DESC_OWN | RTL_RX_BUF_SIZE
+    cmp r9d, RTL_RX_DESC_COUNT - 1
+    jne .rtlfrx_noeor1
+    or eax, RTL_DESC_EOR
+.rtlfrx_noeor1:
+    mov [rsi], eax                   ; hand the descriptor back to the NIC
+
+    mov eax, r9d
+    inc eax
+    cmp eax, RTL_RX_DESC_COUNT
+    jb .rtlfrx_nowrap1
+    xor eax, eax
+.rtlfrx_nowrap1:
+    mov [rtl_rx_idx], eax
+    mov al, 1
+    jmp .frx_out
+
+.rtlfrx_skip:
+    mov eax, RTL_DESC_OWN | RTL_RX_BUF_SIZE
+    cmp r9d, RTL_RX_DESC_COUNT - 1
+    jne .rtlfrx_noeor2
+    or eax, RTL_DESC_EOR
+.rtlfrx_noeor2:
+    mov [rsi], eax
+
+    mov eax, r9d
+    inc eax
+    cmp eax, RTL_RX_DESC_COUNT
+    jb .rtlfrx_nowrap2
+    xor eax, eax
+.rtlfrx_nowrap2:
+    mov [rtl_rx_idx], eax
+    jmp .frx_none
+
+.frx_none:
+    xor al, al
+.frx_out:
+    pop r9
+    pop rsi
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; netpoll: drain the RX ring and dispatch each frame. Preserves everything.
+netpoll:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rdi
+    push rsi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    cmp byte [nic_present], 0
+    je .np_done
+.np_loop:
+    call nic_fetch_rx
+    cmp al, 1
+    jne .np_done
+    inc dword [nic_rx_seen]
+    cmp byte [nic_diag_verbose], 0
+    je .np_nodiag
+    cmp byte [nic_diag_rx_count], 12
+    jae .np_nodiag
+    inc byte [nic_diag_rx_count]
+    call netdiag_dump_frame
+.np_nodiag:
+    mov ax, [nic_rx_frame+12]
+    cmp ax, ETH_TYPE_ARP_W
+    je .np_arp
+    cmp ax, ETH_TYPE_IP_W
+    je .np_ip
+    jmp .np_loop
+.np_arp:
+    call handle_arp
+    jmp .np_loop
+.np_ip:
+    call handle_ipv4
+    jmp .np_loop
+.np_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rsi
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; ---- ARP ---------------------------------------------------------
+; handle_arp: ARP request for our IP -> send a reply. ARP reply -> learn
+; the sender into the cache.
+handle_arp:
+    push rbx
+    push rcx
+    push rdx
+    push rdi
+    push rsi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    lea rsi, [nic_rx_frame + 14]
+    mov ax, [rsi+6]
+    cmp ax, 0x0100
+    je .arp_req
+    cmp ax, 0x0200
+    je .arp_rep
+    jmp .arp_done
+.arp_req:
+    ; only answer if tpa (payload+24) == our IP
+    mov eax, [rsi+24]
+    cmp eax, [nic_ip]
+    jne .arp_done
+    ; build reply directly in nic_tx_buf
+    lea rdi, [nic_tx_buf]
+    lea rsi, [nic_rx_frame + 14 + 8]   ; requester MAC
+    mov rcx, 6
+    rep movsb
+    lea rsi, [nic_mac]
+    mov rcx, 6
+    rep movsb
+    mov byte [rdi], 0x08
+    mov byte [rdi+1], 0x06
+    add rdi, 2
+    mov byte [rdi], 0x00
+    mov byte [rdi+1], 0x01
+    mov byte [rdi+2], 0x08
+    mov byte [rdi+3], 0x00
+    mov byte [rdi+4], 6
+    mov byte [rdi+5], 4
+    mov byte [rdi+6], 0x00
+    mov byte [rdi+7], 0x02
+    lea rsi, [nic_mac]
+    mov rcx, 6
+    push rdi
+    add rdi, 8
+    rep movsb
+    pop rdi
+    mov eax, [nic_ip]
+    mov [rdi+14], eax
+    lea rsi, [nic_rx_frame + 14 + 8]
+    mov rcx, 6
+    push rdi
+    add rdi, 18
+    rep movsb
+    pop rdi
+    mov eax, [nic_rx_frame + 14 + 14]
+    mov [rdi+24], eax
+    mov ecx, 42
+    call nic_send_raw
+    jmp .arp_done
+.arp_rep:
+    mov eax, [nic_rx_frame + 14 + 14]
+    lea rsi, [nic_rx_frame + 14 + 8]
+    call nic_arp_learn
+    jmp .arp_done
+.arp_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rsi
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; nic_arp_request: eax = target IP. Broadcasts an ARP request.
+nic_arp_request:
+    push rbx
+    push rcx
+    push rdx
+    push rdi
+    push rsi
+    push r9
+    mov r9d, eax
+    lea rdi, [nic_tx_buf]
+    mov ecx, 6
+    mov al, 0xFF
+    rep stosb
+    lea rsi, [nic_mac]
+    mov rcx, 6
+    rep movsb
+    mov byte [rdi], 0x08
+    mov byte [rdi+1], 0x06
+    add rdi, 2
+    mov byte [rdi], 0x00
+    mov byte [rdi+1], 0x01
+    mov byte [rdi+2], 0x08
+    mov byte [rdi+3], 0x00
+    mov byte [rdi+4], 6
+    mov byte [rdi+5], 4
+    mov byte [rdi+6], 0x00
+    mov byte [rdi+7], 0x01
+    lea rsi, [nic_mac]
+    mov rcx, 6
+    push rdi
+    add rdi, 8
+    rep movsb
+    pop rdi
+    mov eax, [nic_ip]
+    mov [rdi+14], eax
+    mov qword [rdi+18], 0
+    mov [rdi+24], r9d
+    mov ecx, 42
+    cmp byte [nic_diag_verbose], 0
+    je .areq_nodump
+    push rcx
+    mov rsi, msg_diag_tx
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    pop rcx
+    push rcx
+    lea rsi, [nic_tx_buf]
+    call netdiag_dump_tx_frame
+    pop rcx
+.areq_nodump:
+    call nic_send_raw
+    pop r9
+    pop rsi
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; nic_arp_learn: eax = IP, rsi = 6-byte MAC. Insert/replace in the cache.
+nic_arp_learn:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r9
+    push r10
+    xor r9, r9
+.learn_loop:
+    cmp r9, NIC_ARP_CACHE_ENTRIES
+    jae .learn_new
+    imul rbx, r9, 10
+    lea rdi, [nic_arp_cache + rbx + 6]
+    cmp eax, [rdi]
+    je .learn_hit
+    inc r9
+    jmp .learn_loop
+.learn_new:
+    movzx r9, byte [nic_arp_next]
+    and r9, NIC_ARP_CACHE_ENTRIES-1
+    movzx r10, byte [nic_arp_next]
+    inc r10
+    mov [nic_arp_next], r10b
+.learn_hit:
+    imul rbx, r9, 10
+    lea rdi, [nic_arp_cache + rbx]
+    mov rcx, 6
+    rep movsb
+    mov [rdi], eax
+    pop r10
+    pop r9
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; nic_arp_lookup: eax = IP -> CF=0 and rdi = MAC ptr if cached, else CF=1.
+nic_arp_lookup:
+    push rbx
+    push rcx
+    push r9
+    xor r9, r9
+.lloop:
+    cmp r9, NIC_ARP_CACHE_ENTRIES
+    jae .lmiss
+    imul rbx, r9, 10
+    lea rdi, [nic_arp_cache + rbx + 6]
+    cmp eax, [rdi]
+    je .lhit
+    inc r9
+    jmp .lloop
+.lhit:
+    imul rbx, r9, 10
+    lea rdi, [nic_arp_cache + rbx]
+    pop r9
+    pop rcx
+    pop rbx
+    clc
+    ret
+.lmiss:
+    pop r9
+    pop rcx
+    pop rbx
+    stc
+    ret
+
+; nic_arp_resolve: eax = IP -> CF=0 and rdi = MAC ptr (cached or just
+; resolved via broadcast + wait), or CF=1 after retries/timeout.
+nic_arp_resolve:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push r9
+    push r10
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r12, rax
+    mov byte [nic_arp_tried], 0
+.ares:
+    mov eax, r12d
+    call nic_arp_lookup
+    jnc .ares_have
+    mov eax, r12d
+    call nic_arp_request
+    jc .ares_fail
+    call rtc_sec_now
+    mov r13, rax
+.ares_wait:
+    call netpoll
+    mov eax, r12d
+    call nic_arp_lookup
+    jnc .ares_have
+    call rtc_sec_now
+    cmp eax, r13d
+    jne .ares_tick
+    jmp .ares_wait
+.ares_tick:
+    cmp byte [nic_arp_tried], 0
+    jne .ares_fail
+    mov byte [nic_arp_tried], 1
+    jmp .ares
+.ares_have:
+    clc
+    jmp .ares_out
+.ares_fail:
+    stc
+.ares_out:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r10
+    pop r9
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; ---- IPv4 --------------------------------------------------------
+; net_checksum16: rsi = data, ecx = byte count -> ax = one's-complement sum.
+net_checksum16:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push r8
+    xor eax, eax
+    mov r8, rcx
+    mov rdx, rcx
+    shr rdx, 1
+.cs_words:
+    test rdx, rdx
+    jz .cs_odd
+    movzx ecx, byte [rsi]
+    shl ecx, 8
+    movzx ebx, byte [rsi+1]
+    or ecx, ebx
+    add eax, ecx
+    adc eax, 0
+    add rsi, 2
+    dec rdx
+    jmp .cs_words
+.cs_odd:
+    test r8, 1
+    jz .cs_fold
+    movzx ecx, byte [rsi]
+    shl ecx, 8
+    add eax, ecx
+    adc eax, 0
+.cs_fold:
+    mov edx, eax
+    shr edx, 16
+    test edx, edx
+    jz .cs_done
+    and eax, 0xFFFF
+    add eax, edx
+    adc eax, 0
+    jmp .cs_fold
+.cs_done:
+    not eax
+    and eax, 0xFFFF
+    pop r8
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; net_udp_checksum: rsi = udp datagram ptr, ecx = udp len, r8d = src IP, r9d = dst IP -> ax = checksum
+net_udp_checksum:
+    push rbx
+    push rcx
+    push rdx
+    push rdi
+    push rsi
+    push r8
+    push r9
+    push r10
+    push r11
+    mov r10, rsi
+    mov r11d, ecx
+    lea rdi, [net_build_buf + 1536]
+    mov eax, r8d
+    mov [rdi], eax
+    mov eax, r9d
+    mov [rdi+4], eax
+    mov byte [rdi+8], 0
+    mov byte [rdi+9], 0x11
+    mov ax, r11w
+    rol ax, 8
+    mov [rdi+10], ax
+    lea rdi, [net_build_buf + 1536 + 12]
+    mov rsi, r10
+    mov ecx, r11d
+    rep movsb
+    mov word [net_build_buf + 1536 + 12 + 6], 0
+    lea rsi, [net_build_buf + 1536]
+    mov ecx, r11d
+    add ecx, 12
+    call net_checksum16
+    cmp ax, 0
+    jne .uc_ok
+    mov ax, 0xFFFF
+.uc_ok:
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rsi
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; nic_send_ip: rsi = payload ptr, ecx = payload len, r8d = dst IP,
+; r9b = protocol. Routes (same-subnet direct, else via nic_gw), resolves
+; the nexthop MAC, builds the eth+ip frame in nic_tx_buf and sends it.
+nic_send_ip:
+    push rbx
+    push rcx
+    push rdx
+    push rdi
+    push rsi
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r10, rsi
+    mov r11d, ecx
+    mov r12d, r8d
+    mov r13b, r9b
+    mov r14d, r12d
+    mov eax, r12d
+    cmp eax, 0xFFFFFFFF
+    je .sip_broadcast
+    and eax, [nic_mask]
+    mov edx, [nic_ip]
+    and edx, [nic_mask]
+    cmp eax, edx
+    je .sip_direct
+    mov r14d, [nic_gw]
+.sip_direct:
+    mov eax, r14d
+    call nic_arp_resolve
+    jc .sip_fail
+    mov rsi, rdi
+    jmp .sip_have_mac
+.sip_broadcast:
+    lea rsi, [mac_broadcast]
+.sip_have_mac:
+    lea rdi, [nic_tx_buf]
+    mov rcx, 6
+    rep movsb
+    lea rsi, [nic_mac]
+    mov rcx, 6
+    rep movsb
+    mov byte [rdi], 0x08
+    mov byte [rdi+1], 0x00
+    add rdi, 2
+    mov r15, rdi
+    mov byte [rdi], 0x45
+    mov byte [rdi+1], 0x00
+    mov eax, r11d
+    add eax, 20
+    mov byte [rdi+3], al
+    shr eax, 8
+    mov byte [rdi+2], al
+    mov ax, [nic_ip_id]
+    mov byte [rdi+4], ah
+    mov byte [rdi+5], al
+    inc word [nic_ip_id]
+    mov word [rdi+6], 0x0000
+    mov byte [rdi+8], 64
+    mov byte [rdi+9], r13b
+    mov word [rdi+10], 0
+    mov eax, [nic_ip]
+    mov [rdi+12], eax
+    mov [rdi+16], r12d
+    add rdi, 20
+    mov rsi, r10
+    mov rcx, r11
+    rep movsb
+    mov rsi, r15
+    mov ecx, 20
+    call net_checksum16
+    ror ax, 8
+    mov word [r15+10], ax
+    mov ecx, r11d
+    add ecx, 34
+    cmp byte [nic_diag_verbose], 0
+    je .sip_nodump
+    cmp byte [nic_diag_tx_dumped], 0
+    jne .sip_nodump
+    mov byte [nic_diag_tx_dumped], 1
+    push rcx
+    mov rsi, msg_diag_tx
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    pop rcx
+    push rcx
+    lea rsi, [nic_tx_buf]
+    call netdiag_dump_tx_frame
+    pop rcx
+.sip_nodump:
+    call nic_send_raw
+    jc .sip_fail
+    clc
+    jmp .sip_out
+.sip_fail:
+    stc
+.sip_out:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop rsi
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; ---- ICMP --------------------------------------------------------
+; handle_ipv4: parse the frame in nic_rx_frame. Echo requests get an echo
+; reply; echo replies matching nic_echo_id are recorded for bounce/monitor;
+; UDP port 53 is handed to dns_handle_reply.
+handle_ipv4:
+    push rbx
+    push rcx
+    push rdx
+    push rdi
+    push rsi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    lea rsi, [nic_rx_frame + 14]
+    mov al, [rsi]
+    shr al, 4
+    cmp al, 4
+    jne .ip_done
+    movzx eax, byte [rsi]
+    and al, 0x0F
+    imul eax, 4
+    mov [nic_ihl], al
+    mov al, [rsi+9]
+    mov eax, [rsi+16]
+    cmp eax, [nic_ip]
+    je .ip_ours
+    cmp eax, 0xFFFFFFFF
+    je .ip_ours
+    cmp dword [nic_ip], 0
+    je .ip_ours             ; no lease yet: accept unicast DHCP OFFER/ACK too
+    jmp .ip_done
+.ip_ours:
+    mov al, [rsi+9]
+    cmp al, IP_PROTO_ICMP
+    je .ip_icmp
+    cmp al, IP_PROTO_UDP
+    je .ip_udp
+    jmp .ip_done
+.ip_icmp:
+    ; icmp header at rsi + ihl
+    movzx eax, byte [nic_ihl]
+    add rsi, rax
+    mov al, [rsi]
+    cmp al, 8
+    je .ip_icmp_req
+    cmp al, 0
+    jne .ip_done
+    movzx eax, byte [rsi+4]
+    shl eax, 8
+    movzx edx, byte [rsi+5]
+    or eax, edx
+    cmp ax, [nic_echo_id]
+    jne .ip_done
+    mov byte [nic_echo_got], 1
+    movzx eax, byte [rsi+6]
+    shl eax, 8
+    movzx edx, byte [rsi+7]
+    or eax, edx
+    mov [nic_echo_seq], ax
+    mov eax, [nic_rx_frame + 14 + 12]
+    mov [nic_echo_src_ip], eax
+    jmp .ip_done
+.ip_icmp_req:
+    call icmp_send_reply
+    jmp .ip_done
+.ip_udp:
+    movzx eax, byte [nic_ihl]
+    add rsi, rax
+    ; source port (bytes 0-1) - DNS server legitimately replies from :53
+    movzx eax, byte [rsi]
+    shl eax, 8
+    movzx edx, byte [rsi+1]
+    or eax, edx
+    cmp ax, 53
+    je .ip_udp_dns
+    ; destination port (bytes 2-3) - DHCP replies are addressed to our :68
+    movzx eax, byte [rsi+2]
+    shl eax, 8
+    movzx edx, byte [rsi+3]
+    or eax, edx
+    cmp ax, 68
+    je .ip_udp_dhcp
+    jmp .ip_done
+.ip_udp_dns:
+    call dns_handle_reply
+    jmp .ip_done
+.ip_udp_dhcp:
+    call dhcp_handle_packet
+    jmp .ip_done
+.ip_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rsi
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; icmp_send_reply: build an echo reply for the request in nic_rx_frame.
+icmp_send_reply:
+    push rbx
+    push rcx
+    push rdx
+    push rdi
+    push rsi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    mov eax, [nic_rx_frame + 14 + 12]
+    mov r12d, eax
+    movzx eax, byte [nic_rx_frame + 14]
+    and al, 0x0F
+    imul eax, 4
+    lea r13, [nic_rx_frame + 14 + rax]
+    movzx eax, byte [nic_rx_frame+14+2]
+    shl eax, 8
+    movzx edx, byte [nic_rx_frame+14+3]
+    or eax, edx
+    movzx ecx, byte [nic_rx_frame+14]
+    and cl, 0x0F
+    imul ecx, 4
+    sub eax, ecx
+    mov r11d, eax
+    lea rdi, [nic_tx_buf]
+    lea rsi, [nic_rx_frame+6]
+    mov rcx, 6
+    rep movsb
+    lea rsi, [nic_mac]
+    mov rcx, 6
+    rep movsb
+    mov byte [rdi], 0x08
+    mov byte [rdi+1], 0x00
+    add rdi, 2
+    mov byte [rdi], 0x45
+    mov byte [rdi+1], 0x00
+    mov eax, r11d
+    add eax, 20
+    mov byte [rdi+3], al
+    shr eax, 8
+    mov byte [rdi+2], al
+    mov ax, [nic_ip_id]
+    mov byte [rdi+4], ah
+    mov byte [rdi+5], al
+    inc word [nic_ip_id]
+    mov word [rdi+6], 0
+    mov byte [rdi+8], 64
+    mov byte [rdi+9], IP_PROTO_ICMP
+    mov word [rdi+10], 0
+    mov eax, [nic_ip]
+    mov [rdi+12], eax
+    mov [rdi+16], r12d
+    add rdi, 20
+    mov byte [rdi], 0
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 0
+    mov ax, [r13+4]
+    mov [rdi+4], ax
+    mov ax, [r13+6]
+    mov [rdi+6], ax
+    mov r8, rdi
+    add rdi, 8
+    lea rsi, [r13+8]
+    mov ecx, r11d
+    sub ecx, 8
+    rep movsb
+    mov rsi, r8
+    mov ecx, r11d
+    call net_checksum16
+    ror ax, 8
+    mov word [r8+2], ax
+    lea rsi, [nic_tx_buf + 14]
+    mov ecx, 20
+    call net_checksum16
+    ror ax, 8
+    mov word [nic_tx_buf + 14 + 10], ax
+    mov ecx, r11d
+    add ecx, 34
+    call nic_send_raw
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rsi
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; bounce_send: sends an ICMP echo request to nic_bounce_target (dd) with
+; id = nic_echo_id and seq = nic_echo_seq, then bumps the seq.
+bounce_send:
+    push rbx
+    push rcx
+    push rdx
+    push rdi
+    push rsi
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r12d, [nic_bounce_target]
+    lea rdi, [net_build_buf]
+    mov byte [rdi], 8
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 0
+    mov ax, [nic_echo_id]
+    mov byte [rdi+4], ah
+    mov byte [rdi+5], al
+    mov ax, [nic_echo_seq]
+    mov byte [rdi+6], ah
+    mov byte [rdi+7], al
+    lea rsi, [icmp_data_pad]
+    mov ecx, 32
+    add rdi, 8
+    rep movsb
+    lea rsi, [net_build_buf]
+    mov ecx, 40
+    call net_checksum16
+    mov byte [net_build_buf+2], ah
+    mov byte [net_build_buf+3], al
+    lea rsi, [net_build_buf]
+    mov ecx, 40
+    mov r8d, r12d
+    mov r9b, IP_PROTO_ICMP
+    call nic_send_ip
+    jc .bs_fail
+    inc word [nic_echo_seq]
+    clc
+    jmp .bs_out
+.bs_fail:
+    stc
+.bs_out:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop rsi
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; ---- UDP / DNS ---------------------------------------------------
+; nic_send_udp: rsi = payload, ecx = payload len, r8d = dst IP, r9w = dst
+; port, r10w = src port. Builds the UDP datagram in net_build_buf, then
+; ships it as an IP payload.
+nic_send_udp:
+    push rbx
+    push rcx
+    push rdx
+    push rdi
+    push rsi
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r11, rsi
+    mov r12d, ecx
+    mov r13d, r8d
+    mov r14w, r9w
+    mov r15w, r10w
+    ; The payload (r11) is often the same net_build_buf we're about to
+    ; build the datagram in (callers construct their message there before
+    ; calling us), aliased with dst = src+8. If we wrote the 8-byte UDP
+    ; header first, it would destroy the payload's own first 8 bytes
+    ; before they could ever be copied - no copy direction fixes that.
+    ; So: shift the payload into place first (back-to-front, since
+    ; dst > src makes that direction overlap-safe), and only write the
+    ; header afterward, once bytes 0-7 are no longer needed as payload.
+    mov rsi, r11
+    add rsi, r12
+    dec rsi
+    lea rdi, [net_build_buf + 8]
+    add rdi, r12
+    dec rdi
+    mov rcx, r12
+    std
+    rep movsb
+    cld
+    lea rdi, [net_build_buf]
+    mov ax, r15w
+    mov byte [rdi], ah
+    mov byte [rdi+1], al
+    mov ax, r14w
+    mov byte [rdi+2], ah
+    mov byte [rdi+3], al
+    mov eax, r12d
+    add eax, 8
+    mov byte [rdi+4], ah
+    mov byte [rdi+5], al
+    mov word [rdi+6], 0
+    push rax
+    push rsi
+    push rcx
+    push r8
+    push r9
+    lea rsi, [net_build_buf]
+    mov ecx, r12d
+    add ecx, 8
+    mov r8d, [nic_ip]
+    mov r9d, r13d
+    call net_udp_checksum
+    ; net_checksum16's result is a host-order logical 16-bit value, same
+    ; as nic_send_ip's IP-header checksum - that call site byte-swaps with
+    ; ror ax,8 before the store (see nic_send_ip below) because `mov word`
+    ; writes little-endian but the wire field needs big-endian. This call
+    ; site was missing that same swap, so every outgoing UDP checksum
+    ; (DHCP discover/request included) was written backwards. QEMU's slirp
+    ; doesn't validate UDP checksums so this never showed up there, but a
+    ; real DHCP server will silently drop a packet with a bad checksum -
+    ; which is indistinguishable from "no response" on our end.
+    ror ax, 8
+    mov [net_build_buf + 6], ax
+    pop r9
+    pop r8
+    pop rcx
+    pop rsi
+    pop rax
+    lea rsi, [net_build_buf]
+    mov ecx, r12d
+    add ecx, 8
+    mov r8d, r13d
+    mov r9b, IP_PROTO_UDP
+    call nic_send_ip
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop rsi
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; dns_skip_name: rsi = ptr to a DNS name -> rsi advanced past it. Handles
+; both plain label sequences and 2-byte compression pointers.
+dns_skip_name:
+    push rax
+    push rbx
+.dn_loop:
+    mov al, [rsi]
+    test al, al
+    jz .dn_zterm
+    mov bl, al
+    and bl, 0xC0
+    cmp bl, 0xC0
+    je .dn_ptr
+    movzx rax, al
+    add rsi, rax
+    inc rsi
+    jmp .dn_loop
+.dn_zterm:
+    inc rsi
+    jmp .dn_out
+.dn_ptr:
+    add rsi, 2
+.dn_out:
+    pop rbx
+    pop rax
+    ret
+
+; dns_handle_reply: parse the DNS response whose UDP payload is in
+; nic_rx_frame (ip header at +14). On an A record for our query id, store
+; nic_dns_result and set nic_dns_done.
+dns_handle_reply:
+    push rbx
+    push rcx
+    push rdx
+    push rdi
+    push rsi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    movzx eax, byte [nic_rx_frame+14]
+    and al, 0x0F
+    imul eax, 4
+    lea r14, [nic_rx_frame + 14 + rax + 8]   ; udp payload start
+    movzx eax, byte [r14]
+    shl eax, 8
+    movzx edx, byte [r14+1]
+    or eax, edx
+    cmp ax, [nic_dns_query_id]
+    jne .dh_done
+    ; ancount at payload+6
+    movzx r9d, byte [r14+6]
+    shl r9d, 8
+    movzx r10d, byte [r14+7]
+    or r9d, r10d
+    mov rsi, r14
+    add rsi, 12
+    call dns_skip_name
+    add rsi, 4
+    xor r11d, r11d
+.dh_answer:
+    cmp r11d, r9d
+    jae .dh_notfound
+    call dns_skip_name
+    movzx r8d, byte [rsi]
+    shl r8d, 8
+    movzx r10d, byte [rsi+1]
+    or r8d, r10d
+    add rsi, 2
+    add rsi, 2
+    add rsi, 4
+    movzx r10d, byte [rsi]
+    shl r10d, 8
+    movzx r12d, byte [rsi+1]
+    or r10d, r12d
+    add rsi, 2
+    cmp r8d, 1
+    jne .dh_skip
+    cmp r10d, 4
+    jne .dh_skip
+    mov eax, [rsi]
+    mov [nic_dns_result], eax
+    mov byte [nic_dns_done], 1
+    jmp .dh_done
+.dh_skip:
+    add rsi, r10
+    inc r11d
+    jmp .dh_answer
+.dh_notfound:
+    mov byte [nic_dns_done], 1
+    mov dword [nic_dns_result], 0xFFFFFFFF
+.dh_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rsi
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; dns_query: rsi = hostname (null-terminated). If it's already a dotted
+; quad, returns eax = IP. Otherwise sends a DNS A query to nic_dns:53,
+; waits for the reply (with one retry), and returns eax = IP, or
+; 0xFFFFFFFF on failure.
+dns_query:
+    push rbx
+    push rcx
+    push rdx
+    push rdi
+    push rsi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    call ip_parse_arg
+    jnc .dq_done
+    ; live-trace every frame that arrives while we wait (ARP reply, DNS
+    ; reply) so a real-hardware "unresolved" can be localized to TX-vs-RX
+    ; vs-parse from the console instead of guessing. Cleared below.
+    mov byte [nic_diag_verbose], 1
+    mov r12, rsi
+    mov byte [nic_dns_retry], 0
+    mov ax, [nic_dns_id]
+    inc word [nic_dns_id]
+    mov r13w, ax
+    lea rdi, [net_build_buf]
+    mov byte [rdi], ah
+    mov byte [rdi+1], al
+    mov byte [rdi+2], 0x01
+    mov byte [rdi+3], 0x00
+    mov byte [rdi+4], 0x00
+    mov byte [rdi+5], 0x01
+    mov byte [rdi+6], 0x00
+    mov byte [rdi+7], 0x00
+    mov byte [rdi+8], 0x00
+    mov byte [rdi+9], 0x00
+    mov byte [rdi+10], 0x00
+    mov byte [rdi+11], 0x00
+    add rdi, 12
+    mov rsi, r12
+.dq_label:
+    mov r10, rsi
+    mov r14, rdi
+    inc rdi
+    xor r11, r11
+.dq_count:
+    mov al, [rsi]
+    cmp al, '.'
+    je .dq_ldone
+    test al, al
+    jz .dq_ldone
+    mov [rdi], al
+    inc rdi
+    inc rsi
+    inc r11
+    jmp .dq_count
+.dq_ldone:
+    mov [r14], r11b
+    cmp byte [rsi], 0
+    je .dq_lend
+    inc rsi
+    jmp .dq_label
+.dq_lend:
+    mov byte [rdi], 0
+    inc rdi
+    mov byte [rdi], 0x00
+    mov byte [rdi+1], 0x01
+    mov byte [rdi+2], 0x00
+    mov byte [rdi+3], 0x01
+    add rdi, 4
+    lea rcx, [net_build_buf]
+    sub rdi, rcx
+    mov r14, rdi
+    ; send
+    mov byte [nic_dns_done], 0
+    mov [nic_dns_query_id], r13w
+    lea rsi, [net_build_buf]
+    mov ecx, r14d
+    mov r8d, [nic_dns]
+    mov r9w, 53
+    mov r10w, 0x8B00
+    call nic_send_udp
+    jc .dq_fail
+.dq_send2:
+    call rtc_sec_now
+    mov r15, rax
+.dq_wait:
+    call netpoll
+    cmp byte [nic_dns_done], 0
+    jne .dq_have
+    call rtc_sec_now
+    cmp eax, r15d
+    jne .dq_tick
+    jmp .dq_wait
+.dq_tick:
+    cmp byte [nic_dns_retry], 0
+    jne .dq_fail
+    mov byte [nic_dns_retry], 1
+    lea rsi, [net_build_buf]
+    mov ecx, r14d
+    mov r8d, [nic_dns]
+    mov r9w, 53
+    mov r10w, 0x8B00
+    call nic_send_udp
+    jc .dq_fail
+    jmp .dq_send2
+.dq_have:
+    mov eax, [nic_dns_result]
+    jmp .dq_done
+.dq_fail:
+    mov byte [nic_diag_verbose], 0
+    mov eax, 0xFFFFFFFF
+.dq_done:
+    mov byte [nic_diag_verbose], 0
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rsi
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; ---- text helpers ------------------------------------------------
+; ip_parse_arg: rsi = "a.b.c.d" -> CF=0 and eax = IP if valid, else CF=1.
+ip_parse_arg:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    xor r8d, r8d
+    mov r9d, 4
+.ipa_octet:
+    call parse_octet
+    jc .ipa_fail
+    shl r8d, 8
+    or r8b, al
+    dec r9d
+    jz .ipa_all
+    cmp byte [rsi], '.'
+    jne .ipa_fail
+    inc rsi
+    jmp .ipa_octet
+.ipa_all:
+    mov al, [rsi]
+    test al, al
+    jz .ipa_ok
+    cmp al, ' '
+    je .ipa_ok
+    jmp .ipa_fail
+.ipa_ok:
+    bswap r8d
+    mov eax, r8d
+    clc
+    jmp .ipa_out
+.ipa_fail:
+    stc
+.ipa_out:
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; parse_octet: rsi = decimal number -> al = value (0..255), rsi advanced.
+parse_octet:
+    push rbx
+    push rcx
+    push rdx
+    xor rbx, rbx
+    mov rcx, 3
+.po_digit:
+    cmp rcx, 0
+    jle .po_done
+    mov al, [rsi]
+    cmp al, '0'
+    jb .po_done
+    cmp al, '9'
+    ja .po_done
+    imul rbx, 10
+    sub al, '0'
+    movzx rax, al
+    add rbx, rax
+    cmp rbx, 255
+    ja .po_fail
+    inc rsi
+    dec rcx
+    jmp .po_digit
+.po_done:
+    cmp rcx, 3
+    je .po_fail
+    mov al, bl
+    clc
+    jmp .po_out
+.po_fail:
+    stc
+.po_out:
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; ip_parse_to: rsi = dotted quad string, rdi = 4-byte destination.
+ip_parse_to:
+    call ip_parse_arg
+    jc .ipt_fail
+    mov [rdi], eax
+    clc
+    ret
+.ipt_fail:
+    stc
+    ret
+
+; u8_to_dec: rbx = value (0..255), rcx = output buffer (>=4B). NUL-terminated.
+u8_to_dec:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push r8
+    test rbx, rbx
+    jnz .u8_nonzero
+    mov byte [rcx], '0'
+    mov byte [rcx+1], 0
+    jmp .u8_out
+.u8_nonzero:
+    lea r8, [rcx+3]
+    mov byte [r8+1], 0
+.u8_digit:
+    mov rax, rbx
+    xor edx, edx
+    mov ebx, 10
+    div ebx
+    mov rbx, rax
+    add dl, '0'
+    mov [r8], dl
+    dec r8
+    test rbx, rbx
+    jnz .u8_digit
+    inc r8
+.u8_shift:
+    mov al, [r8]
+    mov [rcx], al
+    inc rcx
+    inc r8
+    test al, al
+    jnz .u8_shift
+.u8_out:
+    pop r8
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; ipv4_to_str: rsi = 4-byte IP, rdi = output buffer (>=16B).
+ipv4_to_str:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    xor r8, r8
+.i4s_octet:
+    movzx rbx, byte [rsi + r8]
+    lea rcx, [dec_tmp_buf]
+    call u8_to_dec
+    lea rcx, [dec_tmp_buf]
+.i4s_append:
+    mov al, [rcx]
+    test al, al
+    jz .i4s_sep
+    mov [rdi], al
+    inc rdi
+    inc rcx
+    jmp .i4s_append
+.i4s_sep:
+    inc r8
+    cmp r8, 4
+    jae .i4s_end
+    mov byte [rdi], '.'
+    inc rdi
+    jmp .i4s_octet
+.i4s_end:
+    mov byte [rdi], 0
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; print_mac: prints nic_mac as xx:xx:xx:xx:xx:xx.
+print_mac:
+    push rbx
+    push rcx
+    push rsi
+    lea rsi, [nic_mac]
+    mov rcx, 6
+.pm_loop:
+    movzx rbx, byte [rsi]
+    mov al, bl
+    shr al, 4
+    call print_hex_nibble
+    mov al, bl
+    and al, 0x0F
+    call print_hex_nibble
+    inc rsi
+    dec rcx
+    jz .pm_done
+    mov al, ':'
+    call putchar
+    jmp .pm_loop
+.pm_done:
+    pop rsi
+    pop rcx
+    pop rbx
+    ret
+print_hex_nibble:
+    cmp al, 10
+    jb .phn_num
+    add al, 'a'-10
+    jmp .phn_put
+.phn_num:
+    add al, '0'
+.phn_put:
+    push rbx
+    mov bl, [cur_normal_attr]
+    call putchar
+    pop rbx
+    ret
+
+; print_hex32: eax = value -> prints 8 hex digits, most significant first.
+print_hex32:
+    push rax
+    push rcx
+    push rdx
+    mov edx, eax
+    mov ecx, 8
+.ph32_loop:
+    mov eax, edx
+    rol eax, 4          ; rotate the next nibble into bits 3:0
+    mov edx, eax
+    and al, 0x0F
+    call print_hex_nibble
+    dec ecx
+    jnz .ph32_loop
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; print_hex8: al = value -> prints 2 hex digits.
+print_hex8:
+    push rax
+    push rcx
+    mov cl, al
+    shr al, 4
+    and al, 0x0F
+    call print_hex_nibble
+    mov al, cl
+    and al, 0x0F
+    call print_hex_nibble
+    pop rcx
+    pop rax
+    ret
+
+; netdiag_dump_frame: prints a one-line summary of the frame currently in
+; nic_rx_frame - EtherType, and for IPv4, protocol + src/dst IP, and for
+; UDP, src/dst port. Only called when nic_diag_verbose is set (during the
+; dhcp wait loop) so normal shell use isn't spammed by background ARP/ICMP
+; traffic. This exists to answer "what is actually arriving" directly,
+; instead of continuing to infer it from the send-side code.
+netdiag_dump_frame:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+
+    mov rsi, msg_diag_type
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    mov al, [nic_rx_frame+12]
+    call print_hex8
+    mov al, [nic_rx_frame+13]
+    call print_hex8
+
+    mov al, [nic_rx_frame+12]
+    cmp al, 0x08
+    jne .ndf_arp
+    mov al, [nic_rx_frame+13]
+    cmp al, 0x00
+    jne .ndf_arp
+    jmp .ndf_ip
+.ndf_arp:
+    mov al, [nic_rx_frame+12]
+    cmp al, 0x08
+    jne .ndf_nl
+    mov al, [nic_rx_frame+13]
+    cmp al, 0x06
+    jne .ndf_nl
+    ; ARP payload starts at offset 14. op is a big-endian word at +6/+7;
+    ; spa (sender protocol address, i.e. sender's IP) is 4 bytes at +14.
+    mov rsi, msg_diag_arp_op
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    mov al, [nic_rx_frame+14+6]
+    call print_hex8
+    mov al, [nic_rx_frame+14+7]
+    call print_hex8
+    mov rsi, msg_diag_arp_spa
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    lea rsi, [nic_rx_frame+14+14]
+    call print_ip4
+    jmp .ndf_nl
+.ndf_ip:
+    mov rsi, msg_diag_proto
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    mov al, [nic_rx_frame+14+9]
+    call print_hex8
+
+    mov rsi, msg_diag_src
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    lea rsi, [nic_rx_frame+14+12]
+    call print_ip4
+
+    mov rsi, msg_diag_dst
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    lea rsi, [nic_rx_frame+14+16]
+    call print_ip4
+
+    mov al, [nic_rx_frame+14+9]
+    cmp al, IP_PROTO_UDP
+    jne .ndf_nl
+
+    movzx eax, byte [nic_rx_frame+14]
+    and al, 0x0F
+    imul eax, 4
+    add eax, 14
+    lea rdi, [nic_rx_frame + rax]
+
+    mov rsi, msg_diag_sport
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    movzx eax, byte [rdi]
+    call print_hex8
+    movzx eax, byte [rdi+1]
+    call print_hex8
+
+    mov rsi, msg_diag_dport
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    movzx eax, byte [rdi+2]
+    call print_hex8
+    movzx eax, byte [rdi+3]
+    call print_hex8
+
+.ndf_nl:
+    mov rsi, msg_nl
+    mov al, [cur_normal_attr]
+    call print_string_attr
+
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; netdiag_dump_tx_frame: prints a hex dump of the fully-assembled frame
+; about to leave the NIC (eth header + ip header + payload), 16
+; space-separated hex bytes per line, so it can be checked by hand
+; against RFC 2131/RFC 791 field offsets when there's no external
+; capture tool available. rsi = frame ptr, rcx = frame length in bytes.
+; Only called when nic_diag_verbose is set (during the dhcp wait), so
+; normal shell use isn't spammed by a dump on every packet sent.
+netdiag_dump_tx_frame:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    xor ebx, ebx            ; ebx = bytes printed on the current line
+.ndtf_loop:
+    test rcx, rcx
+    jz .ndtf_flush
+    movzx eax, byte [rsi]
+    call print_hex8
+    mov al, ' '
+    call putchar
+    inc rsi
+    dec rcx
+    inc ebx
+    cmp ebx, 16
+    jne .ndtf_loop
+    mov al, 10
+    call putchar
+    xor ebx, ebx
+    jmp .ndtf_loop
+.ndtf_flush:
+    test ebx, ebx
+    jz .ndtf_done
+    mov al, 10
+    call putchar
+.ndtf_done:
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; print_ip4: rsi = 4-byte IP -> prints "a.b.c.d".
+print_ip4:
+    push rsi
+    push rdi
+    lea rdi, [net_ip_str]
+    call ipv4_to_str
+    lea rsi, [net_ip_str]
+    call print_string
+    pop rdi
+    pop rsi
+    ret
+
 ; fs_save: writes the OS volume (device 0, nodes 0..OS_NODES) then every
 ; mounted volume back to its own device. Returns CF=0 on success, CF=1 if
 ; the OS volume's disk isn't there/isn't responding. A mounted volume that
@@ -7874,6 +12179,48 @@ print_string_attr:
 ; When pipe_capture_on is set (a "~" pipe is capturing a command's
 ; output - see process_segment), characters are appended to
 ; pipe_capture_buf instead of touching the screen/cursor at all.
+serial_init:
+    push rax
+    push rdx
+    mov dx, 0x3FB
+    mov al, 0x80               ; DLAB = 1
+    out dx, al
+    mov dx, 0x3F8
+    mov al, 0x01               ; divisor 1 -> 115200 baud
+    out dx, al
+    mov dx, 0x3F9
+    xor al, al
+    out dx, al
+    mov dx, 0x3FB
+    mov al, 0x03               ; 8N1, DLAB = 0
+    out dx, al
+    mov dx, 0x3FA
+    mov al, 0xC7               ; FIFO on, clear, 14-byte trigger
+    out dx, al
+    pop rdx
+    pop rax
+    ret
+
+; serial_mirror: transmit the char in al on COM1 (blocks until THR empty).
+; The char is parked in cl because dx (used for the port address) overlaps dl.
+serial_mirror:
+    push rax
+    push rcx
+    push rdx
+    mov cl, al
+    mov dx, 0x3FD
+.sm_wait:
+    in al, dx
+    test al, 0x20
+    jz .sm_wait
+    mov dx, 0x3F8
+    mov al, cl
+    out dx, al
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
 putchar:
     push rax
     push rbx
@@ -7941,11 +12288,14 @@ putchar:
     mov byte [cursor_col], 0
     inc byte [cursor_row]
     cmp byte [cursor_row], VGA_ROWS
-    jne .out
+    jne .nl_out
     call scroll_screen
     mov byte [cursor_row], VGA_ROWS-1
+.nl_out:
+    mov al, 0x0A
 .out:
     call update_cursor
+    call serial_mirror
     pop rdi
     pop rdx
     pop rcx
@@ -8853,7 +13203,9 @@ wig_str_buf:   times 16 db 0    ; scratch for the wig clock widget
 wig_last_sec:  db 0             ; last second the widget drew (redraw gate)
 
 banner:
-    db "ShellyForever v0.1.2 -- 'help' for commands", 10, 0
+    db "ShellyForever v0.1.3 -- 'help' for commands", 10, 0
+build_stamp:
+    db "build 20260805c -- dhcp/dns parser hardening", 10, 0
 
 prompt_head: db "rush>", 0
 prompt_tail: db ": ", 0
@@ -8899,6 +13251,15 @@ str_time:   db "time", 0
 str_write:  db "write", 0
 str_wig:    db "wig", 0
 str_shelly: db "shelly", 0
+str_netinfo: db "netinfo", 0
+str_bounce:  db "bounce", 0
+str_monitor: db "monitor", 0
+str_dns:     db "dns", 0
+str_net:     db "net", 0
+str_dhcp:    db "dhcp", 0
+str_net_ip:  db "ip", 0
+str_net_gw:  db "gw", 0
+str_net_dns: db "dns", 0
 
 ; shelly splash banner pieces
 SHELLY_PAL_LEN equ 6
@@ -9033,6 +13394,66 @@ msg_loaded_fs:  db "Loaded filesystem from disk.", 10, 10, 0
 msg_fresh_fs:   db "No saved filesystem found - starting fresh.", 10, 10, 0
 msg_no_disk:    db "No disk detected - filesystem will not persist.", 10, 10, 0
 msg_sync_failed: db "error: sync failed - disk not available.", 10, 0
+
+; --- NIC / network messages ---
+msg_net_no_nic:    db "network: no NIC detected.", 10, 0
+msg_net_usage:     db "net: usage: net ip|gw|dns <a.b.c.d>", 10, 0
+msg_net_bad_ip:    db "network: bad IPv4 address: ", 0
+msg_net_unresolved: db "network: could not resolve host.", 10, 0
+msg_dhcp_start:    db "dhcp: requesting IP lease...", 10, 0
+msg_dhcp_ok:       db "dhcp: lease acquired.", 10, 0
+msg_dhcp_fail:     db "dhcp: no response - timed out waiting for an offer.", 10, 0
+msg_dhcp_send_fail: db "dhcp: failed to transmit discover (TX error - link/chip problem).", 10, 0
+msg_dhcp_rx_seen:  db "dhcp: raw frames seen on the wire while waiting: ", 0
+msg_dhcp_no_frames: db "dhcp: NO raw frames arrived at all (link down? wrong port? NIC not receiving?)", 10, 0
+msg_dhcp_had_frames: db "dhcp: frames arrived but no OFFER/ACK was recognized (packets blocked or parser)", 10, 0
+msg_diag_type:     db "  rx: type=0x", 0
+msg_diag_proto:    db " proto=0x", 0
+msg_diag_src:      db " src=", 0
+msg_diag_dst:      db " dst=", 0
+msg_diag_sport:    db " sport=0x", 0
+msg_diag_dport:    db " dport=0x", 0
+msg_diag_arp_op:   db " op=0x", 0
+msg_diag_arp_spa:  db " spa=", 0
+msg_diag_tx:       db 10, "  tx: ", 0
+msg_diag_pcists:   db "diag: PCI status reg (bits 8/11/12/13/14/15=parity/abort): ", 0
+msg_diag_txdesc:   db "diag: failed TX descriptor raw command dword: ", 0
+msg_diag_tppoll:   db "diag: TPPoll readback (bit6=NPQ still pending): ", 0
+msg_diag_chipraw:  db "diag: TxConfig HW-ID raw (captured right after reset): ", 0
+msg_diag_chipname: db "diag: chip family match: ", 0
+msg_chip_8168b:    db "RTL8168B/8111B", 0
+msg_chip_8168c:    db "RTL8168C/8111C", 0
+msg_chip_8168cp:   db "RTL8168CP/8111CP", 0
+msg_chip_8168d:    db "RTL8168D/8111D", 0
+msg_chip_8168dp:   db "RTL8168DP/8111DP", 0
+msg_chip_unknown:  db "no match against known older-gen IDs - likely RTL8168E or later", 0
+msg_ni_mac:        db "MAC : ", 0
+msg_ni_drv:        db "DRV : ", 0
+msg_ni_drv_8139:   db "rtl8139", 10, 0
+msg_ni_drv_e1000:  db "e1000", 10, 0
+msg_ni_drv_8168:   db "rtl8168/8169/8161", 10, 0
+msg_ni_iobase:     db "IOB : 0x", 0
+msg_ni_link:       db "LINK: ", 0
+msg_ni_link_up:    db "up", 10, 0
+msg_ni_link_down:  db "down", 10, 0
+msg_ni_link_na:    db "n/a (not rtl8168)", 10, 0
+msg_ni_ip:         db "IP  : ", 0
+msg_ni_mask:       db "MASK: ", 0
+msg_ni_gw:         db "GW  : ", 0
+msg_ni_dns:        db "DNS : ", 0
+msg_nl:            db 10, 0
+msg_dns_usage:     db "dns: usage: dns <hostname>", 10, 0
+msg_dns_res:       db "dns: ", 0
+msg_dns_equals:    db " = ", 0
+msg_dns_fail:      db "dns: resolution failed.", 10, 0
+msg_bounce_usage:  db "bounce: usage: bounce <host>", 10, 0
+msg_bounce_reply:  db "Reply from ", 0
+msg_bounce_bytes:  db " bytes=32", 10, 0
+msg_bounce_timeout: db "Request timed out.", 10, 0
+msg_monitor_usage: db "monitor: usage: monitor <host>", 10, 0
+msg_monitor_timeout: db "timeout", 10, 0
+msg_monitor_stopped: db 10, "monitor stopped.", 10, 0
+icmp_data_pad:     db "ShellyForever ping payload 0123456789abcdef", 0
 
 ; --- SFFS disk / mount messages ---
 msg_dscan_header: db "Scanning for SFFS disks...", 10, 0
@@ -9181,6 +13602,12 @@ help_text:
     db "  ;                  chain commands, e.g. show hi ; show bye", 10
     db "  ~                  pipe output, e.g. calc 1+2*3 ~ = a ; show a", 10
     db "  $                  comment line (lines starting with $ are skipped)", 10
+    db "  netinfo            show NIC MAC address and IP/mask/gw/DNS", 10
+    db "  net <ip|gw|dns>    change static network configuration", 10
+    db "  dhcp               obtain IP address, gateway, and DNS via DHCP", 10
+    db "  dns <host>         resolve a hostname via DNS", 10
+    db "  bounce <host>      send a single ICMP echo (ping)", 10
+    db "  monitor <host>     ping repeatedly until Esc", 10
     db "  help <command>     show detailed help for one command", 10, 10, 0
 
 ; --- per-command detail text for "help <command>" (see help_lookup) ---
@@ -9482,6 +13909,122 @@ disk_use_ahci:    db 0             ; set by disk_select_device: 0=ATA, 1=AHCI
 ahci_cur_slot:    db 0             ; which AHCI slot is currently selected
 ahci_op_cmd:      db 0             ; pending ATA command byte (read vs write)
 ahci_op_write:    db 0             ; 1 if the pending op is a write
+
+; --- RTL8139 NIC driver state ---
+nic_present:     db 0             ; 1 = NIC found and rings live
+nic_pci_bus:     db 0
+nic_pci_dev:     db 0
+nic_pci_func:    db 0
+ALIGN 4
+nic_io_base:     dd 0             ; BAR0 I/O port base (RTL8139)
+nic_driver_type: db 0             ; 0 = rtl8139, 1 = e1000; set by nic_init
+ALIGN 4
+nic_mmio_base:   dd 0             ; BAR0 MMIO physical base (e1000)
+nic_rx_seen:     dd 0             ; diagnostic: raw frames seen since last reset
+nic_mac:         times 6 db 0
+nic_ip:          db 10, 0, 2, 15  ; static config (QEMU slirp defaults)
+nic_mask:        db 255, 255, 255, 0
+nic_gw:          db 10, 0, 2, 2
+nic_dns:         db 10, 0, 2, 3
+nic_capr:        dd 0             ; software RX read pointer (ring offset)
+nic_ihl:         db 0             ; IPv4 header length (bytes) of current frame
+nic_ip_id:       dw 0x4200        ; IPv4 identification counter
+NIC_ARP_CACHE_ENTRIES equ 4
+nic_arp_cache:   times NIC_ARP_CACHE_ENTRIES*10 db 0   ; per entry: 6B MAC + 4B IP
+nic_arp_next:    db 0
+nic_arp_tried:   db 0             ; ARP resolve retry flag
+nic_tx_desc:     db 0             ; C-mode TX descriptor currently in use (0..3)
+nic_bounce_target: dd 0           ; IP the bounce/monitor loop is pinging
+nic_echo_id:     dw 0x1234
+nic_echo_seq:    dw 1
+nic_echo_got:    db 0             ; 1 = matching echo reply received
+nic_echo_retry:  db 0             ; bounce retry flag
+nic_echo_seq_rcv: dw 0
+nic_echo_src_ip: dd 0             ; source IP of the last matching reply
+nic_dns_id:      dw 1
+nic_dns_query_id: dw 0
+nic_dns_done:    db 0
+nic_dns_retry:   db 0
+nic_dns_result:  dd 0
+dhcp_xid:        dd 0
+dhcp_offered_ip: dd 0
+dhcp_done:       db 0
+dhcp_retries:    db 0
+dhcp_msg_type:   db 0      ; DHCP message type (53) seen in the last offer/ack
+nic_diag_verbose: db 0     ; 1 = netpoll prints a summary of every frame it sees
+nic_diag_rx_count: db 0    ; caps how many "rx: ..." lines netpoll will print
+                           ; per dhcp/bounce attempt - on a real LAN with
+                           ; constant background broadcast traffic this was
+                           ; still unbounded even after the tx dump got
+                           ; throttled, and could flood the screen across a
+                           ; long multi-retry wait on its own
+nic_dns_seen:    db 0      ; 1 = the router sent DHCP option 6 (DNS server)
+                           ; at some point this lease - if it never does,
+                           ; cmd_dhcp falls back to using the gateway as
+                           ; DNS, since many consumer routers proxy DNS on
+                           ; their own LAN IP without advertising option 6
+nic_diag_tx_dumped: db 0   ; 1 = the full tx hex dump has already fired this
+                           ; dhcp session - keeps retries from re-flooding
+                           ; the screen with the same packet layout
+mac_broadcast:   db 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
+
+; --- NIC buffers (all resb, identity-mapped, so linked = physical addr) ---
+ALIGN 16
+nic_rx_ring:     times NIC_RX_RING_SIZE db 0    ; 8KB DMA RX ring
+ALIGN 16
+nic_tx_buf:      times NIC_TX_BUF_SIZE db 0     ; 2KB frame build/DMA buffer
+net_build_buf:   times 2048 db 0                ; dns query / udp / icmp build area
+
+; --- e1000 descriptor rings + RX buffers (identity-mapped; the linked
+; address doubles as the physical address the chip DMAs into/out of, same
+; trick as nic_rx_ring/nic_tx_buf above) ---
+ALIGN 16
+e1000_rx_desc:   times E1000_RX_DESC_COUNT * 16 db 0
+ALIGN 16
+e1000_tx_desc:   times E1000_TX_DESC_COUNT * 16 db 0
+ALIGN 16
+e1000_rx_bufs:   times E1000_RX_DESC_COUNT * E1000_RX_BUF_SIZE db 0
+ALIGN 4
+e1000_rx_idx:    dd 0             ; software head: next descriptor to check for DD
+e1000_tx_idx:    dd 0             ; next TX descriptor slot to use
+
+; e1000_dev_ids: PCI device ids (vendor 0x8086) pci_find_e1000 matches
+; against, spanning the common real-hardware e1000/e1000e generations:
+; 82540/82541/82544/82545/82546/82547 (PCI/PCIe PRO/1000) and 82571-82583
+; (server/desktop PRO/1000 PT/PM/GT). QEMU's "e1000" model reports 0x100E.
+e1000_dev_ids:
+    dw 0x100E, 0x100F, 0x1004, 0x1001, 0x1010, 0x1012, 0x1013, 0x1019
+    dw 0x101D, 0x101E, 0x1026, 0x1027, 0x1028, 0x1075, 0x1076, 0x1077
+    dw 0x1078, 0x107C, 0x105E, 0x105F, 0x1060, 0x108B, 0x108C, 0x109A
+    dw 0x10B9, 0x10D3, 0x10EA, 0x10F5, 0x150C
+E1000_DEV_ID_COUNT equ ($ - e1000_dev_ids) / 2
+
+; --- RTL8168 descriptor rings + RX buffers (identity-mapped) ---
+ALIGN 256
+rtl_rx_desc:     times RTL_RX_DESC_COUNT * 16 db 0
+ALIGN 256
+rtl_tx_desc:     times RTL_TX_DESC_COUNT * 16 db 0
+ALIGN 16
+rtl_rx_bufs:     times RTL_RX_DESC_COUNT * RTL_RX_BUF_SIZE db 0
+ALIGN 4
+rtl_rx_idx:      dd 0             ; software head: next descriptor to check for OWN=0
+rtl_tx_idx:      dd 0             ; next TX descriptor slot to use
+nic_hwver_raw:   dd 0             ; raw TxConfig value captured right after
+                                   ; reset, before our own TCR write - used
+                                   ; to identify the exact chip revision
+
+; rtl_dev_ids: PCI device ids (vendor 0x10EC) pci_find_rtl8168 matches
+; against - the RTL8169-compatible C+ descriptor interface shared by the
+; common real-hardware gigabit Realtek chips. Deliberately doesn't include
+; the 2.5GbE RTL8125, which uses a different descriptor/register layout.
+rtl_dev_ids:
+    dw 0x8168, 0x8169, 0x8161, 0x8136
+RTL_DEV_ID_COUNT equ ($ - rtl_dev_ids) / 2
+
+nic_rx_frame:    times 1536 db 0                ; wrap-reassembly staging
+nic_rx_len:      dd 0                           ; bytes in nic_rx_frame
+dec_tmp_buf:     times 8 db 0
+net_ip_str:      times 20 db 0
 
 ; Command list (1KB/port, must be 1KB-aligned), FIS receive area (256B/port,
 ; must be 256B-aligned), and command table (256B/port, must be 128B-aligned,

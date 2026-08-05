@@ -630,120 +630,253 @@ party_lex:
 
 ; ------------------------------------------------------------
 ; party_exec: walks the token stream produced by party_lex and runs
-; it. v0.1-of-v0.1: only `display <literal>` statements are actually
-; executed right now (string/int/float/true/false, optional leading
-; unary minus on a number). vars/if/while/func are next - hitting one
-; right now reports it as an unsupported-statement error rather than
-; silently doing nothing, so scripts fail loudly instead of quietly.
+; it. v0.1-of-v0.1: `display <literal>` statements (string/int/float/
+; true/false, optional leading unary minus on a number) and `while
+; (true|false) { ... }` loops with a bare boolean-literal condition
+; are runnable now. vars/if/func are next - hitting one right now
+; reports it as an unsupported-statement error rather than silently
+; doing nothing, so scripts fail loudly instead of quietly.
 ; Out: party_exec_ok = 1 success, 0 failure (+ party_error_line set).
 ; ------------------------------------------------------------
 party_exec:
     push rbx
     push r12
     push r13
+    push r14
+    push r15
     xor r13, r13                  ; token cursor
     mov byte [party_exec_ok], 1
+    mov byte [party_killed], 0
+    mov byte [kill_flag], 0
 
-.pe_stmt_loop:
+    mov r14, TOK_EOF               ; top level runs until EOF
+    call party_exec_stmts
+
+.pe_out:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ------------------------------------------------------------
+; party_exec_stmts: executes statements starting at token r13 until
+; it reaches a token whose type equals r14 (the "stop token" - callers
+; pass TOK_EOF for the top level, TOK_RBRACE for a block body), or
+; hits an error, or the running script is killed (Esc). Does NOT
+; consume the stop token itself - the caller decides what to do with
+; it. Recurses into itself for a while-loop's body.
+; In: r13 = starting token index, r14 = stop token type.
+; Out: r13 = index of the stop token (success), or of the offending
+; token (error). party_exec_ok is left at 1 on success/kill, set to 0
+; on error (+ party_error_line). Clobbers rax, rbx, r8-r11, r15.
+; ------------------------------------------------------------
+party_exec_stmts:
+.pes_stmt_loop:
+    cmp byte [party_killed], 0
+    jne .pes_out                  ; Esc was pressed inside a nested loop - unwind
     call party_tok_ptr
     movzx eax, byte [rbx]
     cmp eax, TOK_NEWLINE
-    jne .pe_check_eof
+    jne .pes_check_stop
     inc r13
-    jmp .pe_stmt_loop
-.pe_check_eof:
+    jmp .pes_stmt_loop
+.pes_check_stop:
+    cmp eax, r14d
+    je .pes_out                   ; found our stop token - leave it unconsumed
     cmp eax, TOK_EOF
-    je .pe_success
+    je .pes_err_here              ; EOF before the expected stop token (e.g. unclosed '{')
     cmp eax, TOK_DISPLAY
-    je .pe_display
-    jmp .pe_err_here              ; vars/if/while/func: not runnable yet
+    je .pes_display
+    cmp eax, TOK_WHILE
+    je .pes_while
+    jmp .pes_err_here             ; vars/if/func: not runnable yet
 
-.pe_display:
+.pes_display:
     inc r13                       ; consume 'display'
     call party_tok_ptr
     movzx eax, byte [rbx]
 
     xor r11, r11                  ; r11 = 1 if a leading '-' was seen
     cmp eax, TOK_MINUS
-    jne .pe_disp_dispatch
+    jne .pes_disp_dispatch
     mov r11, 1
     inc r13
     call party_tok_ptr
     movzx eax, byte [rbx]
 
-.pe_disp_dispatch:
+.pes_disp_dispatch:
     cmp eax, TOK_STR
-    je .pe_disp_str
+    je .pes_disp_str
     cmp eax, TOK_INT
-    je .pe_disp_num
+    je .pes_disp_num
     cmp eax, TOK_FLOAT
-    je .pe_disp_num
+    je .pes_disp_num
     cmp eax, TOK_TRUE
-    je .pe_disp_true
+    je .pes_disp_true
     cmp eax, TOK_FALSE
-    je .pe_disp_false
-    jmp .pe_err_here               ; display needs a literal for now
+    je .pes_disp_false
+    jmp .pes_err_here              ; display needs a literal for now
 
-.pe_disp_str:
+.pes_disp_str:
     cmp r11, 1
-    je .pe_err_here                ; "-"+string makes no sense
+    je .pes_err_here               ; "-"+string makes no sense
     call party_print_tok_text
     inc r13
-    jmp .pe_stmt_end
+    jmp .pes_stmt_end
 
-.pe_disp_num:
+.pes_disp_num:
     cmp r11, 1
-    jne .pe_disp_num_go
+    jne .pes_disp_num_go
     mov rsi, str_minus_char
     call print_string
-.pe_disp_num_go:
+.pes_disp_num_go:
     call party_print_tok_text
     inc r13
-    jmp .pe_stmt_end
+    jmp .pes_stmt_end
 
-.pe_disp_true:
+.pes_disp_true:
     cmp r11, 1
-    je .pe_err_here
+    je .pes_err_here
     mov rsi, kw_true
     call print_string
     inc r13
-    jmp .pe_stmt_end
+    jmp .pes_stmt_end
 
-.pe_disp_false:
+.pes_disp_false:
     cmp r11, 1
-    je .pe_err_here
+    je .pes_err_here
     mov rsi, kw_false
     call print_string
     inc r13
-    jmp .pe_stmt_end
+    jmp .pes_stmt_end
 
-.pe_stmt_end:
+.pes_stmt_end:
     mov rsi, newline_str
     call print_string
+    jmp .pes_stmt_loop
+
+; ---- while (true|false) { ... } ----
+.pes_while:
+    inc r13                        ; consume 'while'
     call party_tok_ptr
     movzx eax, byte [rbx]
-    cmp eax, TOK_NEWLINE
-    je .pe_consume_nl
-    cmp eax, TOK_EOF
-    je .pe_stmt_loop
-    jmp .pe_err_here               ; junk after the displayed value
-.pe_consume_nl:
-    inc r13
-    jmp .pe_stmt_loop
+    cmp eax, TOK_LPAREN
+    jne .pes_err_here
+    inc r13                        ; consume '('
 
-.pe_err_here:
+    call party_tok_ptr
+    movzx eax, byte [rbx]
+    cmp eax, TOK_TRUE
+    je .pes_while_cond_true
+    cmp eax, TOK_FALSE
+    je .pes_while_cond_false
+    jmp .pes_err_here              ; only a bare true/false condition for now
+.pes_while_cond_true:
+    mov r15, 1
+    jmp .pes_while_cond_done
+.pes_while_cond_false:
+    xor r15, r15
+.pes_while_cond_done:
+    inc r13                        ; consume true/false
+    call party_tok_ptr
+    movzx eax, byte [rbx]
+    cmp eax, TOK_RPAREN
+    jne .pes_err_here
+    inc r13                        ; consume ')'
+
+    call party_tok_ptr
+    movzx eax, byte [rbx]
+    cmp eax, TOK_LBRACE
+    jne .pes_err_here
+    inc r13                        ; consume '{' - r13 now = first body token
+    mov r10, r13                   ; remember body start, for re-running it
+
+    cmp r15, 0
+    jne .pes_while_run
+
+    ; condition is false: skip the body without running it, consume
+    ; the matching '}', and move on to whatever follows the loop.
+    call party_skip_block
+    call party_tok_ptr
+    movzx eax, byte [rbx]
+    cmp eax, TOK_RBRACE
+    jne .pes_err_here
+    inc r13
+    jmp .pes_stmt_loop
+
+.pes_while_run:
+    ; condition is a constant `true`, so this really does loop
+    ; forever (same as the language spec's own loop.pa example).
+    ; Poll for Esc each iteration - there's no timer/IRQ here to
+    ; preempt a tight loop otherwise, so without this the machine
+    ; would just hang with no way to stop it.
+    call kbd_poll
+    cmp byte [kill_flag], 0
+    je .pes_while_not_killed
+    mov byte [party_killed], 1
+    mov rsi, msg_party_killed
+    mov al, ATTR_ERROR
+    call print_string_attr
+    jmp .pes_out
+.pes_while_not_killed:
+    mov r13, r10
+    push r10
+    push r14
+    mov r14, TOK_RBRACE
+    call party_exec_stmts
+    pop r14
+    pop r10
+    cmp byte [party_exec_ok], 0
+    je .pes_out                   ; error already recorded by the nested call
+    cmp byte [party_killed], 0
+    jne .pes_out
+    jmp .pes_while_run
+
+.pes_err_here:
     call party_tok_ptr
     mov eax, [rbx+4]               ; token's start offset
     call party_line_at
     mov [party_error_line], eax
     mov byte [party_exec_ok], 0
-    jmp .pe_out
 
-.pe_success:
-.pe_out:
-    pop r13
-    pop r12
-    pop rbx
+.pes_out:
+    ret
+
+; ------------------------------------------------------------
+; party_skip_block: r13 = first token inside a block (already past
+; its opening '{'). Advances r13 past the block WITHOUT running any
+; of it, stopping at the matching '}' (not consumed) - used to skip
+; a while-body whose condition is false. Only tracks brace depth, so
+; it doesn't validate anything inside the skipped block.
+; Clobbers rax, rbx, rcx.
+; ------------------------------------------------------------
+party_skip_block:
+    mov ecx, 1
+.psb_loop:
+    call party_tok_ptr
+    movzx eax, byte [rbx]
+    cmp eax, TOK_EOF
+    je .psb_out                    ; unterminated block - caller's next
+                                    ; token check (expects '}') will error
+    cmp eax, TOK_LBRACE
+    jne .psb_check_rbrace
+    inc ecx
+    inc r13
+    jmp .psb_loop
+.psb_check_rbrace:
+    cmp eax, TOK_RBRACE
+    jne .psb_next
+    dec ecx
+    cmp ecx, 0
+    je .psb_out                    ; matching close brace - leave r13 on it
+    inc r13
+    jmp .psb_loop
+.psb_next:
+    inc r13
+    jmp .psb_loop
+.psb_out:
     ret
 
 ; party_tok_ptr: in r13=token index -> rbx = &party_tokens[r13]
@@ -909,6 +1042,7 @@ party_dump_tokens:
 msg_party_usage:    db 'usage: party <file.pa>', 10, 0
 msg_party_lex_err:  db 'party: lex error near line ', 0
 msg_party_exec_err: db 'party: error near line ', 0
+msg_party_killed:   db 10, 'party: script killed (Esc)', 10, 0
 str_party:          db 'party', 0
 str_tokens_flag:    db '-tokens', 0
 str_minus_char:     db '-', 0
@@ -969,6 +1103,7 @@ party_tok_names:
 
 party_lex_ok:      db 0
 party_exec_ok:     db 0
+party_killed:      db 0
 party_error_line:  dd 0
 party_ident_buf:   times PARTY_IDENT_MAX db 0
 party_text_buf:    times 64 db 0
