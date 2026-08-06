@@ -643,16 +643,29 @@ cmd_tcp:
     call print_string_attr
     ret
 .sendfail:
+    ; nic_arp_resolve records WHY the send failed: a genuine raw-TX/hardware
+    ; problem (reason 0) versus the broadcast going out fine but nobody ever
+    ; answering it (reason 1). These are very different situations and used
+    ; to be reported identically as a "TX error - link/chip problem", which
+    ; is actively misleading when the NIC itself did nothing wrong.
+    cmp byte [nic_last_fail_reason], 1
+    je .sendfail_noreply
     mov rsi, msg_tcp_sendfail
     mov al, ATTR_ERROR
     call print_string_attr
     ; RTL8168: dump PCI Status + the failed TX descriptor + a fresh TPPoll
     ; readback, same diagnostic the dhcp wait path prints on send failure -
     ; this distinguishes a bus-level error (abort/parity) from the descriptor
-    ; engine silently never touching the slot.
+    ; engine silently never touching the slot. Only meaningful for a genuine
+    ; raw-TX failure, so skip it entirely for the no-reply case above.
     cmp byte [nic_driver_type], 2
     jne .sendfail_done
     call netdiag_dump_tx
+    jmp .sendfail_done
+.sendfail_noreply:
+    mov rsi, msg_tcp_sendfail_noreply
+    mov al, ATTR_ERROR
+    call print_string_attr
 .sendfail_done:
     ret
 .unresolved:

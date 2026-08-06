@@ -2470,6 +2470,30 @@ netdiag_dump_tx:
     mov rsi, msg_nl
     call print_string
 
+    ; Raw start/end rtc_sec_now() readings plus the actual number of
+    ; second-boundary ticks the wait loop observed, printed separately from
+    ; the subtracted "elapsed" figure above. If elapsed reads suspiciously
+    ; low (e.g. 0) despite the budget being generous, this tells us whether
+    ; that's a bad subtraction (start/end look like a real ~20s apart once
+    ; you account for a minute wrap) or a genuinely fast exit (ticks well
+    ; below the ~21 a real timeout should produce) - two very different
+    ; bugs that a single "elapsed: 0" can't distinguish between.
+    mov rsi, msg_diag_rawsec
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    movzx eax, byte [nic_tx_wait_start]
+    call tcp_print_dec
+    mov rsi, msg_diag_rawsec_sep
+    call print_string
+    movzx eax, byte [nic_tx_wait_end]
+    call tcp_print_dec
+    mov rsi, msg_diag_rawsec_ticks
+    call print_string
+    movzx eax, byte [nic_tx_wait_ticks]
+    call tcp_print_dec
+    mov rsi, msg_nl
+    call print_string
+
     pop r10
     pop r8
     pop rdi
@@ -7819,7 +7843,33 @@ rtc_sec_now:
     call cmos_read
     cmp al, bl
     jne .rsn_retry                ; two reads disagree - torn/transient, retry
+    ; BUGFIX: this used to return the raw CMOS byte unconverted. Real
+    ; hardware defaults to BCD mode (status B bit2 clear), same as
+    ; rtc_update already accounts for - so a seconds value of "10" comes
+    ; back as the byte 0x10 (16 decimal), "20" as 0x20 (32 decimal), etc.
+    ; Tick DETECTION (a plain inequality compare against the previous
+    ; reading) still fired correctly every real second regardless, so the
+    ; wait loop's actual budget was never shortened by this - but the
+    ; elapsed-time SUBTRACTION in the error path assumes plain binary
+    ; 0..59 seconds, so once start/end straddle a tens-digit boundary the
+    ; math comes out wrong (this is why a real ~5-6s wait was being
+    ; reported as "elapsed: 0" in netdiag_dump_tx). Mirror rtc_update's
+    ; own check of status register B bit2 rather than assuming BCD
+    ; unconditionally - only convert if the chip is actually in BCD mode.
+    push rax
+    mov al, 0x0B
+    call cmos_read
+    test al, 0x04
+    jnz .rsn_binary               ; bit2 set = already binary, nothing to do
+    pop rax
+    mov al, bl
+    call bcd_to_bin
     movzx eax, al
+    jmp .rsn_done
+.rsn_binary:
+    pop rax
+    movzx eax, bl
+.rsn_done:
     pop rdx
     pop rbx
     ret
@@ -8985,7 +9035,36 @@ rtl_phy_power_up_and_renegotiate:
 ; Loads TSAD0 with the buffer address, writes the length to TSD0 to trigger
 ; the DMA+transmit, then waits for TxStatOk (bit15) in TSD0. Returns CF=0 on
 ; success. Callers always wait for completion, so no in-flight TX precedes us.
+;
+; Pad undersized frames up to the Ethernet minimum (60 bytes, before the
+; 4-byte FCS the NIC appends) before handing off to any backend. QEMU's
+; device models are lenient about short frames, but real hardware is not
+; guaranteed to be - this is exactly what was going on with the RTL8168
+; "TX error" on ARP broadcasts (42 bytes): no PCI bus error, no stuck NPQ,
+; the frame eventually completes, just unreliably/late relative to our
+; completion-wait budget. DHCP frames never showed this because they're
+; already well over 60 bytes. Doing this once, here, covers every backend
+; (rtl8139/e1000/rtl8168) instead of patching each short-frame caller.
 nic_send_raw:
+    cmp ecx, 60
+    jae .nsr_no_pad
+    push rax
+    push rcx
+    push rdx
+    push rdi
+    mov edx, ecx                 ; edx = original frame length (pad start offset)
+    mov eax, 60
+    sub eax, edx                 ; eax = number of zero pad bytes needed
+    lea rdi, [nic_tx_buf + rdx]
+    mov ecx, eax
+    xor al, al
+    rep stosb
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rax
+    mov ecx, 60                  ; frame length is now the Ethernet minimum
+.nsr_no_pad:
     cmp byte [nic_driver_type], 1
     je nic_send_raw_e1000
     cmp byte [nic_driver_type], 2
@@ -9181,7 +9260,19 @@ nic_send_raw_rtl8168:
                                   ; so netdiag_dump_tx can report real elapsed
                                   ; wall-clock time on failure, not just a tick
                                   ; count that's always the same constant.
-    mov r11d, 5                 ; ~5-6s budget
+    ; Bumped 5 -> 20: with rtc_sec_now's BCD bug fixed we can finally trust
+    ; the elapsed-time diagnostic, but the last two runs still failed with
+    ; an identical signature (no PCI error, NPQ/OWN both eventually clear)
+    ; even after padding ruled out short-frame handling as the cause. That
+    ; points at this chip/link genuinely needing longer than 5-6s for its
+    ; first TX after an idle gap (e.g. PHY/EEE low-power wake, or link
+    ; re-training) rather than a logic bug in the wait itself. Widening
+    ; the budget is a cheap way to confirm that: if this send now
+    ; succeeds, the real elapsed-seconds print (now trustworthy) tells us
+    ; how much headroom this hardware actually needs so the budget can be
+    ; set correctly instead of guessed at again.
+    mov r11d, 20                 ; ~20-21s budget
+    mov byte [nic_tx_wait_ticks], 0
 .rtks_wait:
     ; Force-flush any posted DMA write the NIC has queued upstream before
     ; trusting the in-RAM copy of the descriptor. Two separate runs of this
@@ -9234,6 +9325,7 @@ nic_send_raw_rtl8168:
     jmp .rtks_wait
 .rtks_tick:
     mov r9d, eax
+    inc byte [nic_tx_wait_ticks]
     dec r11d
     ; BUGFIX: this used to be `jz .rtks_err`, which bails the instant the
     ; clock ticks into the budget's last second - without ever actually
@@ -9263,6 +9355,7 @@ nic_send_raw_rtl8168:
     ret
 .rtks_err:
     call rtc_sec_now
+    mov [nic_tx_wait_end], al
     sub al, [nic_tx_wait_start]
     jns .rtks_err_nowrap
     add al, 60                   ; CMOS seconds wrapped past 59 mid-wait
@@ -9778,7 +9871,13 @@ nic_arp_lookup:
     ret
 
 ; nic_arp_resolve: eax = IP -> CF=0 and rdi = MAC ptr (cached or just
-; resolved via broadcast + wait), or CF=1 after retries/timeout.
+; resolved via broadcast + wait), or CF=1 after retries/timeout. On CF=1,
+; nic_last_fail_reason tells the caller which of two very different things
+; happened: 0 = the raw broadcast itself never got out (hardware/TX-level
+; problem - see nic_send_raw_rtl8168), 1 = the broadcast went out fine but
+; no ARP reply ever came back (peer/gateway didn't answer in time). These
+; used to be reported identically, which is how a plain "nobody answered"
+; timeout ended up being diagnosed as a NIC hardware fault.
 nic_arp_resolve:
     push rbx
     push rcx
@@ -9791,7 +9890,6 @@ nic_arp_resolve:
     push r14
     push r15
     mov r12, rax
-    mov byte [nic_arp_tried], 0
     xor r15d, r15d           ; ARP-broadcast raw-TX retry counter - separate from
                               ; the reply-wait retry below. This covers the NIC
                               ; itself failing to get the broadcast frame out
@@ -9801,6 +9899,10 @@ nic_arp_resolve:
                               ; instantly, even though the same class of failure
                               ; is known to be a transient completion-detection
                               ; race on this chip (see nic_send_raw_rtl8168).
+    xor ebx, ebx              ; ARP-reply resend-round counter (separate axis from
+                              ; r15d above: this counts full "resend + wait again"
+                              ; rounds after a genuinely-sent broadcast got no
+                              ; reply, not raw TX failures).
 .ares:
     mov eax, r12d
     call nic_arp_lookup
@@ -9810,12 +9912,20 @@ nic_arp_resolve:
     call nic_arp_request
     jnc .ares_sent
     cmp r15d, 3
-    jae .ares_fail
+    jae .ares_fail_tx
     inc r15d
     jmp .ares_send
 .ares_sent:
+    ; Wait for a reply using the same wall-clock-tick pattern as the raw TX
+    ; wait: up to ~5-6s of continuous polling per round (budget in whole-
+    ; second ticks; the current partial second is "free", same reasoning as
+    ; nic_send_raw_rtl8168's js fix - see there for why `js` instead of `jz`).
+    ; The old code gave up after at most a single, possibly sub-1-second,
+    ; tick - nowhere near enough time for a real ARP reply, especially right
+    ; after DHCP when the gateway/switch may not have us in its table yet.
     call rtc_sec_now
-    mov r13, rax
+    mov r13d, eax
+    mov r14d, 5               ; ~5-6s per round
 .ares_wait:
     call netpoll
     mov eax, r12d
@@ -9826,14 +9936,26 @@ nic_arp_resolve:
     jne .ares_tick
     jmp .ares_wait
 .ares_tick:
-    cmp byte [nic_arp_tried], 0
-    jne .ares_fail
-    mov byte [nic_arp_tried], 1
-    jmp .ares
+    mov r13d, eax
+    dec r14d
+    js .ares_round_done        ; budget for this round exhausted
+    jmp .ares_wait
+.ares_round_done:
+    ; Up to 3 resend rounds total (~15-18s of real reply-wait time) before
+    ; giving up, instead of the old single near-instant attempt.
+    cmp ebx, 2
+    jae .ares_fail_noreply
+    inc ebx
+    jmp .ares_send              ; resend the broadcast, then wait again
 .ares_have:
     clc
     jmp .ares_out
-.ares_fail:
+.ares_fail_tx:
+    mov byte [nic_last_fail_reason], 0
+    stc
+    jmp .ares_out
+.ares_fail_noreply:
+    mov byte [nic_last_fail_reason], 1
     stc
 .ares_out:
     pop r15
@@ -9961,6 +10083,11 @@ nic_send_ip:
     push r13
     push r14
     push r15
+    mov byte [nic_last_fail_reason], 0   ; default to "raw TX" until/unless
+                                          ; nic_arp_resolve below says otherwise -
+                                          ; prevents a stale reason from a
+                                          ; previous, unrelated resolve leaking
+                                          ; into this send's failure report
     mov r10, rsi
     mov r11d, ecx
     mov r12d, r8d
@@ -13726,6 +13853,9 @@ msg_diag_pcists:   db "diag: PCI status reg (bits 8/11/12/13/14/15=parity/abort)
 msg_diag_txdesc:   db "diag: failed TX descriptor raw command dword: ", 0
 msg_diag_tppoll:   db "diag: TPPoll readback (bit6=NPQ still pending): ", 0
 msg_diag_waitsecs: db "diag: TX wait - real seconds elapsed before giving up: ", 0
+msg_diag_rawsec:   db "diag: TX wait raw start/end rtc seconds: ", 0
+msg_diag_rawsec_sep: db " / ", 0
+msg_diag_rawsec_ticks: db ", ticks observed: ", 0
 msg_diag_chipraw:  db "diag: TxConfig HW-ID raw (captured right after reset): ", 0
 msg_diag_chipname: db "diag: chip family match: ", 0
 msg_chip_8168b:    db "RTL8168B/8111B", 0
@@ -13770,6 +13900,7 @@ msg_tcp_recv:       db "tcp: received ", 0
 msg_tcp_bytes:      db " bytes.", 10, 0
 msg_tcp_timeout:    db "tcp: timed out waiting for a reply.", 10, 0
 msg_tcp_sendfail:   db "tcp: failed to transmit (TX error - link/chip problem).", 10, 0
+msg_tcp_sendfail_noreply: db "tcp: failed to transmit (no ARP reply - peer/gateway unreachable).", 10, 0
 msg_tcp_cancelled:  db 10, "tcp: cancelled.", 10, 0
 msg_tcp_reset:      db "tcp: connection reset by peer.", 10, 0
 icmp_data_pad:     db "ShellyForever ping payload 0123456789abcdef", 0
@@ -14256,7 +14387,14 @@ nic_ip_id:       dw 0x4200        ; IPv4 identification counter
 NIC_ARP_CACHE_ENTRIES equ 4
 nic_arp_cache:   times NIC_ARP_CACHE_ENTRIES*10 db 0   ; per entry: 6B MAC + 4B IP
 nic_arp_next:    db 0
-nic_arp_tried:   db 0             ; ARP resolve retry flag
+nic_arp_tried:   db 0             ; unused now (nic_arp_resolve tracks its own
+                                   ; round counters in registers) - kept so
+                                   ; existing reset-on-init writes stay valid
+nic_last_fail_reason: db 0        ; set by nic_arp_resolve on CF=1: 0 = raw
+                                   ; broadcast TX itself failed (hardware/
+                                   ; timeout - see nic_send_raw_rtl8168 diag),
+                                   ; 1 = broadcast sent fine, just never got
+                                   ; an ARP reply back in time
 nic_last_tx_ctx: db 0             ; 0 = data/segment frame, 1 = ARP broadcast -
                                    ; set right before every nic_send_raw call so
                                    ; a failure dump can say which frame it was
@@ -14347,6 +14485,17 @@ nic_tx_wait_elapsed: db 0         ; real wall-clock seconds actually spent
                                    ; wait budget genuinely ran out or something
                                    ; failed fast, instead of guessing from
                                    ; how long a failure "felt" on screen
+nic_tx_wait_end:     db 0         ; raw rtc_sec_now() reading at the moment
+                                   ; .rtks_err fires - printed alongside
+                                   ; nic_tx_wait_start so a bad elapsed
+                                   ; computation can be told apart from a
+                                   ; genuinely-fast failure, instead of
+                                   ; trusting the subtracted value alone
+nic_tx_wait_ticks:   db 0         ; number of real second-boundary ticks
+                                   ; actually observed by the wait loop
+                                   ; before giving up (should be ~budget+1
+                                   ; on a real timeout; a low number here
+                                   ; means the loop exited some other way)
 
 ; rtl_dev_ids: PCI device ids (vendor 0x10EC) pci_find_rtl8168 matches
 ; against - the RTL8169-compatible C+ descriptor interface shared by the
