@@ -1,6 +1,6 @@
 # ShellyForever
 
-**Version:** 0.1.4
+**Version:** 0.1.5
 
 A 64-bit shell-based OS written entirely in x86-64 NASM assembly, from scratch —
 no C, no BIOS libraries beyond boot-time disk/keyboard calls, no existing kernel.
@@ -78,11 +78,13 @@ no C, no BIOS libraries beyond boot-time disk/keyboard calls, no existing kernel
 | `rboot` | `rboot` | save to disk, then restart (requires auth) |
 | `sdown` | `sdown` | save to disk, then shut down (requires auth) |
 | `netinfo` | `netinfo` | show the NIC's MAC address and static IP/mask/gateway/DNS config |
-| `net` | `net ip 10.0.2.20`, `net gw 10.0.2.2`, `net dns 8.8.8.8` | change the static IP, gateway, or DNS config |
+| `net` | `net ip 10.0.2.20`, `net gw 10.0.2.2`, `net dns 8.8.8.8`, `net on`, `net off`, `net reset` | change static IP/gw/DNS, or bring NIC up / shut down / restart without reboot |
 | `dns` | `dns google.com` | resolve a hostname via the configured DNS server |
 | `bounce` | `bounce 10.0.2.2` | send one ICMP echo (ping) with a ~2-3s timeout |
 | `monitor` | `monitor google.com` | ping repeatedly, one line per reply, until Esc |
 | `tcp` | `tcp 10.0.2.2 8000` | open a TCP connection, send a payload, and print the reply |
+| `take` | `take http://10.0.2.2:8000/notes.txt notes.txt` | HTTP GET a file from a server, save to local file |
+| `give` | `give http://10.0.2.2:8000/upload notes.txt` | HTTP POST a local file to a server endpoint |
 
 ### Line editing: history, tab completion, and scrollback
 
@@ -619,6 +621,45 @@ and doesn't require any host firewall changes. To test `tcp` end-to-end, run
 `take http://host/path <file>` and `give http://host/upload <file>` (HTTP/1.0
 GET/POST with content-length) is planned next; see `milestones.txt`.
 
+### HTTP take / give
+
+`take <url> <file>` downloads a file over HTTP/1.0 and saves the response
+body to the given local file (creating or overwriting it in the current
+directory). `give <url> <file>` reads a local file and POSTs its content
+to the URL with `Content-Type: text/plain` and a `Content-Length` header,
+then prints the server's reply. Both commands resolve the hostname from
+the URL via DNS, do a full TCP handshake + send + receive + close, and are
+Esc-cancelable while they wait.
+
+```
+rush>/home: take http://10.0.2.2:8000/notes.txt notes.txt
+take: getting /notes.txt from 10.0.2.2
+take: saved to notes.txt
+rush>/home: give http://10.0.2.2:8000/upload notes.txt
+give: posting /upload to 10.0.2.2
+HTTP/1.0 200 OK
+...
+rush>/home:
+```
+
+To test against Python's `http.server` (which serves GET only):
+
+```bash
+# host:
+python -m http.server 8000 --bind 127.0.0.1
+
+# ShellyForever (QEMU):
+take http://10.0.2.2:8000/somefile.txt somefile.txt
+view somefile.txt
+```
+
+Files larger than ~160 bytes are fine — the SFFS v3 chained-file system
+stores them across multiple filesystem nodes.
+
+Only plain HTTP is supported (no HTTPS). The response body is extracted
+by scanning for the blank line (`\r\n\r\n`) after the HTTP response headers,
+so it works with most HTTP/1.0 and HTTP/1.1 servers.
+
 ## Shutdown (`sdown`)
 
 There's no ACPI table parsing in this kernel, so `sdown` doesn't negotiate a
@@ -688,6 +729,15 @@ message and then nothing, which is your cue to power off manually.
 
 ## What's new
 
+- **HTTP `take` / `give` (v0.1.5)** — `take <url> <file>` does an HTTP/1.0
+  GET and saves the response body to a local file in the current directory;
+  `give <url> <file>` reads a local file and POSTs it to the URL. Both
+  commands parse `http://host[:port]/path` URLs, resolve the hostname via
+  DNS, perform a full TCP exchange (handshake + send + receive + FIN), and
+  are Esc-cancelable while they wait. `take` strips HTTP response headers
+  (scanning for the CRLF-CRLF blank line) and writes the plain body via
+  `fs_write_file`, so files of any size up to ~10 KB work transparently
+  across the SFFS v3 chained-file system.
 - **Real-hardware bring-up fixes (v0.1.4)** — three bugs that only show up
   on real hardware (invisible to QEMU's virtual devices), found and fixed
   after `tcp` reached a real RTL8168 board and initially failed:

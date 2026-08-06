@@ -107,15 +107,26 @@ Milestone C.1 - Real-hardware bring-up fixes          -> DONE, VERIFIED ON REAL 
   dhcp/netinfo were already confirmed working pre-fix; tcp was the one
   still failing (silent link-down, bug 3) until this pass.
 
-Milestone D - HTTP take / give                       -> NOT STARTED
+Milestone D - HTTP take / give                       -> DONE
+   take <url> <file> does an HTTP/1.0 GET, strips response headers
+   (CRLF-CRLF scan), and writes the body to a local file via
+   fs_write_file (SFFS v3 chained). give <url> <file> reads a local
+   file, builds a POST with Content-Type and Content-Length headers,
+   and prints the server's reply. Both parse http://host[:port]/path
+   URLs, resolve via DNS, run the full TCP exchange (handshake +
+   send + receive + FIN), and are Esc-cancelable. http_rx_buf is
+   3072 bytes (bigger than TCP_PAYLOAD_MAX) to fit HTTP responses
+   comfortably. Built on top of the tcp.asm engine unchanged.
+
+   Assembled cleanly with nasm -f bin and the full image (build.sh)
+   builds without error.
 
 Budget, actual vs planned:
-  Planned: KERNEL_SECTORS 260 -> 290, FS_LBA_START stays 300.
-  Actual: KERNEL_SECTORS is at 404 (Milestone B's NIC/stack code ran
-  well past the 290 estimate and C grew it further) and FS_LBA_START
-  moved to 400 to stay clear of it. Still comfortably inside a 2 MB
-  image; if D overruns the same way, expect another FS_LBA_START bump
-  rather than reusing 400 as gospel.
+   Planned: KERNEL_SECTORS 260 -> 290, FS_LBA_START stays 300.
+   Actual: KERNEL_SECTORS is at 404 (Milestone B's NIC/stack code ran
+   well past the 290 estimate and C grew it further) and FS_LBA_START
+   is at 460 (bumped from 400). Still comfortably inside a 2 MB
+   image.
 
 README.md has been updated to document Milestones A, B, and C as
 shipped. D (take/give) stays out of the README until it's real.

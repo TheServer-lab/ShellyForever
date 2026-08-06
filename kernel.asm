@@ -951,6 +951,18 @@ dispatch:
     cmp al, 1
     je cmd_tcp
 
+    mov rsi, cmd_buf
+    mov rdi, str_take
+    call str_eq
+    cmp al, 1
+    je cmd_take
+
+    mov rsi, cmd_buf
+    mov rdi, str_give
+    call str_eq
+    cmp al, 1
+    je cmd_give
+
     ; --- user-defined alias? (see "ali <name> <commands>") ---
     mov rsi, cmd_buf
     call alias_lookup
@@ -1912,6 +1924,18 @@ help_lookup:
     cmp al, 1
     je .h_shelly
 
+    mov rsi, arg1_buf
+    mov rdi, str_take
+    call str_eq
+    cmp al, 1
+    je .h_take
+
+    mov rsi, arg1_buf
+    mov rdi, str_give
+    call str_eq
+    cmp al, 1
+    je .h_give
+
     ; unknown command name
     mov rsi, msg_help_unknown1
     mov al, ATTR_ERROR
@@ -2043,6 +2067,14 @@ help_lookup:
     mov rsi, help_shelly
     jmp .h_print
 
+.h_take:
+    mov rsi, help_take
+    jmp .h_print
+
+.h_give:
+    mov rsi, help_give
+    jmp .h_print
+
 .h_print:
     mov al, [cur_normal_attr]
     call print_string_attr
@@ -2150,10 +2182,27 @@ cmd_netinfo:
     ret
 
 ; ------------------------------------------------------------
-; cmd_net: net ip|gw|dns <a.b.c.d> - change the static IP config.
+; cmd_net: net ip|gw|dns <a.b.c.d> | net on|off|reset
 cmd_net:
     cmp byte [arg1_buf], 0
     je .usage
+    ; "net on" / "net off" / "net reset" don't need arg2
+    lea rsi, [arg1_buf]
+    mov rdi, str_net_on
+    call str_eq
+    cmp al, 1
+    je .net_on
+    lea rsi, [arg1_buf]
+    mov rdi, str_net_off
+    call str_eq
+    cmp al, 1
+    je .net_off
+    lea rsi, [arg1_buf]
+    mov rdi, str_net_reset
+    call str_eq
+    cmp al, 1
+    je .net_reset
+    ; remaining subcommands need arg2
     cmp byte [arg2_buf], 0
     je .usage
     lea rsi, [arg1_buf]
@@ -2173,6 +2222,59 @@ cmd_net:
     je .set_dns
 .usage:
     mov rsi, msg_net_usage
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    ret
+.net_on:
+    cmp byte [nic_present], 0
+    je .do_reinit
+    mov rsi, msg_net_already_on
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    ret
+.do_reinit:
+    call nic_init
+    cmp byte [nic_present], 0
+    je .on_fail
+    mov rsi, msg_net_on_ok
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    ret
+.on_fail:
+    mov rsi, msg_net_on_fail
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+.net_off:
+    cmp byte [nic_present], 0
+    je .off_already
+    call nic_shutdown
+    mov rsi, msg_net_off_ok
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    ret
+.off_already:
+    mov rsi, msg_net_already_off
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    ret
+.net_reset:
+    cmp byte [nic_present], 0
+    jne .do_reset
+    ; NIC isn't active - just try init
+    call nic_init
+    cmp byte [nic_present], 0
+    je .on_fail
+    mov rsi, msg_net_on_ok
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    ret
+.do_reset:
+    call nic_shutdown
+    call nic_init
+    cmp byte [nic_present], 0
+    je .on_fail
+    mov rsi, msg_net_reset_ok
     mov al, [cur_normal_attr]
     call print_string_attr
     ret
@@ -8967,6 +9069,105 @@ nic_init:
     pop rbx
     ret
 
+; ============================================================
+; nic_shutdown -- Bring the active NIC down (stop TX/RX, soft reset).
+;              Called by "net off" and "net reset". After calling
+;              this, nic_present is 0 and nic_driver_type is 0 so
+;              every network command will just print "no NIC".
+; ============================================================
+nic_shutdown:
+    push rdi
+    push rax
+    push rcx
+    push r9
+    cmp byte [nic_present], 0
+    je .ns_out
+
+    cmp byte [nic_driver_type], 0
+    je .ns_rtl8139
+    cmp byte [nic_driver_type], 1
+    je .ns_e1000
+    cmp byte [nic_driver_type], 2
+    je .ns_rtl8168
+    jmp .ns_clear
+
+.ns_rtl8139:
+    ; Stop TX and RX engines (write 0 to CMD)
+    mov edi, [nic_io_base]
+    add edi, NIC_IO_CMD
+    xor al, al
+    call nic_io_write8
+    ; Soft reset
+    mov edi, [nic_io_base]
+    add edi, NIC_IO_CMD
+    mov al, 0x10
+    call nic_io_write8
+    mov r9d, 0x200000
+.ns_r8139_wait:
+    mov edi, [nic_io_base]
+    add edi, NIC_IO_CMD
+    call nic_io_read8
+    test al, 0x10
+    jz .ns_clear
+    dec r9d
+    jnz .ns_r8139_wait
+    jmp .ns_clear
+
+.ns_e1000:
+    ; Disable RX/TX control, then device reset
+    mov edi, E1000_CTRL
+    xor eax, eax
+    call e1000_reg_write32
+    ; Device reset
+    mov edi, E1000_CTRL
+    mov eax, E1000_CTRL_RST
+    call e1000_reg_write32
+    mov r9d, 0x100000
+.ns_e1k_wait:
+    mov edi, E1000_CTRL
+    call e1000_reg_read32
+    test eax, E1000_CTRL_RST
+    jz .ns_clear
+    dec r9d
+    jnz .ns_e1k_wait
+    jmp .ns_clear
+
+.ns_rtl8168:
+    ; Unlock config registers first
+    mov edi, [nic_io_base]
+    add edi, RTL_IO_9346CR
+    mov al, RTL_9346_UNLOCK
+    call nic_io_write8
+    ; Stop TX/RX
+    mov edi, [nic_io_base]
+    add edi, RTL_IO_CMD
+    xor al, al
+    call nic_io_write8
+    ; Soft reset
+    mov edi, [nic_io_base]
+    add edi, RTL_IO_CMD
+    mov al, RTL_CMD_RST
+    call nic_io_write8
+    mov r9d, 0x100000
+.ns_r8168_wait:
+    mov edi, [nic_io_base]
+    add edi, RTL_IO_CMD
+    call nic_io_read8
+    test al, RTL_CMD_RST
+    jz .ns_clear
+    dec r9d
+    jnz .ns_r8168_wait
+
+.ns_clear:
+    mov byte [nic_present], 0
+    mov byte [nic_driver_type], 0
+.ns_out:
+    pop r9
+    pop rcx
+    pop rax
+    pop rdi
+    ret
+
 ; mdio_write_rtl: dl = PHY register address (0-31), eax = 16-bit value to
 ; write (low 16 bits used). Uses PHYAR (offset 0x60): bit31=1 triggers a
 ; write, register addr in bits 20:16, data in bits 15:0. Hardware clears
@@ -12355,6 +12556,7 @@ cmd_shelly_rainbow:
 
 %include "party.asm"
 %include "tcp.asm"
+%include "http.asm"
 
 ; print_prompt: prints "rush>" + current path + ": "
 print_prompt:
@@ -13688,9 +13890,14 @@ str_dns:     db "dns", 0
 str_net:     db "net", 0
 str_dhcp:    db "dhcp", 0
 str_tcp:     db "tcp", 0
+str_take:    db "take", 0
+str_give:    db "give", 0
 str_net_ip:  db "ip", 0
 str_net_gw:  db "gw", 0
-str_net_dns: db "dns", 0
+str_net_dns:  db "dns", 0
+str_net_on:   db "on", 0
+str_net_off:  db "off", 0
+str_net_reset: db "reset", 0
 
 ; shelly splash banner pieces
 SHELLY_PAL_LEN equ 6
@@ -13828,9 +14035,15 @@ msg_sync_failed: db "error: sync failed - disk not available.", 10, 0
 
 ; --- NIC / network messages ---
 msg_net_no_nic:    db "network: no NIC detected.", 10, 0
-msg_net_usage:     db "net: usage: net ip|gw|dns <a.b.c.d>", 10, 0
+msg_net_usage:     db "net: usage: net ip|gw|dns <a.b.c.d> | net on|off|reset", 10, 0
 msg_net_bad_ip:    db "network: bad IPv4 address: ", 0
 msg_net_unresolved: db "network: could not resolve host.", 10, 0
+msg_net_on_ok:      db "net: NIC brought up.", 10, 0
+msg_net_on_fail:    db "net: NIC bring-up failed - no compatible NIC found.", 10, 0
+msg_net_already_on: db "net: NIC is already up.", 10, 0
+msg_net_off_ok:     db "net: NIC shut down.", 10, 0
+msg_net_already_off: db "net: NIC is already down.", 10, 0
+msg_net_reset_ok:   db "net: NIC reset complete.", 10, 0
 msg_dhcp_start:    db "dhcp: requesting IP lease...", 10, 0
 msg_dhcp_ok:       db "dhcp: lease acquired.", 10, 0
 msg_dhcp_fail:     db "dhcp: no response - timed out waiting for an offer.", 10, 0
@@ -13903,6 +14116,21 @@ msg_tcp_sendfail:   db "tcp: failed to transmit (TX error - link/chip problem)."
 msg_tcp_sendfail_noreply: db "tcp: failed to transmit (no ARP reply - peer/gateway unreachable).", 10, 0
 msg_tcp_cancelled:  db 10, "tcp: cancelled.", 10, 0
 msg_tcp_reset:      db "tcp: connection reset by peer.", 10, 0
+msg_take_usage:     db "take: usage: take <url> <file>", 10, 0
+msg_take_badurl:    db "take: bad URL format. Use http://host[:port]/path", 10, 0
+msg_take_createfail: db "take: failed to create file.", 10, 0
+msg_take_saved:     db "take: saved to ", 0
+msg_take_getting:   db "take: getting ", 0
+msg_take_from:      db " from ", 0
+msg_take_badpath:   db "take: bad file path.", 10, 0
+msg_take_nobody:    db "take: no body in response.", 10, 0
+msg_give_usage:     db "give: usage give <url> <file>", 10, 0
+msg_give_posting:   db "give: posting ", 0
+msg_give_to:        db " to ", 0
+msg_give_nofile:    db "give: no such file.", 10, 0
+msg_give_noreply:   db "give: no reply body.", 10, 0
+msg_http_unresolved: db "http: cannot resolve host.", 10, 0
+msg_http_cancelled: db 10, "http: cancelled.", 10, 0
 icmp_data_pad:     db "ShellyForever ping payload 0123456789abcdef", 0
 
 ; --- SFFS disk / mount messages ---
@@ -14054,11 +14282,14 @@ help_text:
     db "  $                  comment line (lines starting with $ are skipped)", 10
     db "  netinfo            show NIC MAC address and IP/mask/gw/DNS", 10
     db "  net <ip|gw|dns>    change static network configuration", 10
+    db "  net on|off|reset   bring NIC up / shut down / restart", 10
     db "  dhcp               obtain IP address, gateway, and DNS via DHCP", 10
     db "  dns <host>         resolve a hostname via DNS", 10
     db "  bounce <host>      send a single ICMP echo (ping)", 10
     db "  monitor <host>     ping repeatedly until Esc", 10
     db "  tcp <host> <port>  open a TCP connection and exchange data", 10
+    db "  take <url> <file>  HTTP GET, save body to a file", 10
+    db "  give <url> <file>  HTTP POST, send a file to a server", 10
     db "  help <command>     show detailed help for one command", 10, 10, 0
 
 ; --- per-command detail text for "help <command>" (see help_lookup) ---
@@ -14212,6 +14443,21 @@ help_shelly:
     db "shelly", 10
     db "  Print the ShellyForever OS splash banner: a rainbow", 10
     db "  title, the developer credit, and the copyright line.", 10, 0
+
+help_take:
+    db "take <url> <file>", 10
+    db "  Download a file over HTTP/1.0 and save it locally. The", 10
+    db "  URL must use the http:// scheme, e.g. take http://", 10
+    db "  10.0.2.2:8080/notes.txt notes.txt. Parsed HTML headers;", 10
+    db "  the body is saved as a new (or overwritten) file in the", 10
+    db "  current directory. Esc cancels during the transfer.", 10, 0
+
+help_give:
+    db "give <url> <file>", 10
+    db "  Read a local file and POST its content over HTTP/1.0", 10
+    db "  to the given URL. The request includes Content-Type", 10
+    db "  and Content-Length headers. The server's reply is", 10
+    db "  printed. Esc cancels during the transfer.", 10, 0
 
 help_help:
     db "help | help <command>", 10
@@ -14531,6 +14777,14 @@ tcp_rx_prev:   dd 0          ; rx length at the previous idle-check tick
 tcp_dec_buf:   times 10 db 0
 tcp_rx_buf:    times TCP_PAYLOAD_MAX db 0
 tcp_tx_buf:    times TCP_PAYLOAD_MAX db 0
+
+; --- HTTP take / give buffers (Milestone D) ---
+http_host_buf:   times 64 db 0
+http_path_buf:   times 128 db 0
+http_port:       dw 0
+http_body_len:   dd 0
+http_tx_big:     times HTTP_TX_MAX db 0
+http_rx_buf:     times HTTP_RX_BUF_SIZE db 0
 
 ; Command list (1KB/port, must be 1KB-aligned), FIS receive area (256B/port,
 ; must be 256B-aligned), and command table (256B/port, must be 128B-aligned,

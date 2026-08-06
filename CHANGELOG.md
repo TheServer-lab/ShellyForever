@@ -4,6 +4,30 @@ All notable changes to ShellyForever are documented here. The format is
 loosely based on [Keep a Changelog](https://keepachangelog.com/); the
 project does not yet follow strict SemVer.
 
+## [0.1.5] - 2026-08-07
+
+### Added
+
+- **HTTP `take` / `give`** (`http.asm`) — `take <url> <file>` does an
+  HTTP/1.0 GET and saves the response body to a local file; `give <url>
+  <file>` reads a local file and POSTs its content to a server.
+  - URL parser handles `http://host[:port]/path`.
+  - DNS resolution, TCP handshake + send + receive + FIN close, all
+    Esc-cancelable.
+  - `take` strips HTTP response headers (CRLF-CRLF scan) and writes the
+    raw body via `fs_write_file` into the SFFS v3 chained-file system.
+  - `give` includes `Content-Type: text/plain` and `Content-Length`
+    headers.
+  - `http_rx_buf` (3072 bytes), `http_tx_big` (1200 bytes), URL scratch
+    buffers (`http_host_buf`, `http_path_buf`, `http_port`).
+- **`take` / `give` help text** and command-table entries.
+- **README coverage** for `take` / `give` with usage examples and QEMU
+  testing notes.
+
+### Changed
+
+- Banner bumped to `v0.1.5`.
+
 ## [0.1.4] - 2026-08-05
 
 ### Added
