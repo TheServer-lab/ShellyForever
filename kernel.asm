@@ -37,6 +37,7 @@ SCROLLBACK_LINES equ 100         ; extra off-screen rows kept for Ctrl+Up/Down
 HISTORY_MAX      equ 20          ; command history entries kept for Up/Down
 KEY_UP           equ 0x11        ; sentinel byte get_char returns for the Up arrow
 KEY_DOWN         equ 0x12        ; sentinel byte get_char returns for the Down arrow
+KEY_PASTE        equ 0x13        ; sentinel byte get_char returns for Ctrl+V
 
 MAX_VARS        equ 16
 VAR_NAME_LEN    equ 32
@@ -74,12 +75,12 @@ PIPE_CAP_MAX    equ 192       ; max bytes captured from a "~" pipe's left side
 ;  dscan probes all four ATA device slots for the magic, format writes
 ;  a fresh empty volume + label, and mount loads a volume's node table
 ;  into memory (remapping its parent indices) rooted at /<label>/.
-;  The kernel occupies LBA 1..440 (KERNEL_SECTORS in boot.asm) - the
-;  NIC/network stack (Milestone B) and TCP engine (Milestone C) grew the
-;  image well past 400 - so the filesystem region starts at LBA 460 to
-;  stay clear of it.
+;  The kernel occupies LBA 1..480 (KERNEL_SECTORS in boot.asm) - the
+;  NIC/network stack (Milestone B), TCP engine (Milestone C) and the
+;  browser (Milestone E) grew the image well past 460 - so the filesystem
+;  region starts at LBA 500 to stay clear of it.
 ; ------------------------------------------------------------------
-FS_LBA_START    equ 460
+FS_LBA_START    equ 500
 SFFS_VERSION    equ 3
 SFFS_VERSION_V2 equ 2               ; old format, still readable
 SUPER_LABEL_OFF equ 8               ; label lives at superblock offset 8..39
@@ -962,6 +963,18 @@ dispatch:
     call str_eq
     cmp al, 1
     je cmd_give
+
+    mov rsi, cmd_buf
+    mov rdi, str_browse
+    call str_eq
+    cmp al, 1
+    je cmd_browse
+
+    mov rsi, cmd_buf
+    mov rdi, str_mouse
+    call str_eq
+    cmp al, 1
+    je cmd_mouse
 
     ; --- user-defined alias? (see "ali <name> <commands>") ---
     mov rsi, cmd_buf
@@ -1936,6 +1949,18 @@ help_lookup:
     cmp al, 1
     je .h_give
 
+    mov rsi, arg1_buf
+    mov rdi, str_browse
+    call str_eq
+    cmp al, 1
+    je .h_browse
+
+    mov rsi, arg1_buf
+    mov rdi, str_mouse
+    call str_eq
+    cmp al, 1
+    je .h_mouse
+
     ; unknown command name
     mov rsi, msg_help_unknown1
     mov al, ATTR_ERROR
@@ -2073,6 +2098,14 @@ help_lookup:
 
 .h_give:
     mov rsi, help_give
+    jmp .h_print
+
+.h_browse:
+    mov rsi, help_browse
+    jmp .h_print
+
+.h_mouse:
+    mov rsi, help_mouse
     jmp .h_print
 
 .h_print:
@@ -4924,6 +4957,14 @@ kbd_poll:
     in al, 0x64
     test al, 1
     jz .no_key
+    test al, 0x20                  ; aux (mouse) byte waiting?
+    jz .kbd_byte
+    in al, 0x60
+    cmp byte [mouse_ena], 0
+    je .no_key
+    call mouse_byte
+    jmp .no_key
+.kbd_byte:
     in al, 0x60
     cmp al, 0x01                  ; Esc make code
     jne .no_key
@@ -12557,6 +12598,8 @@ cmd_shelly_rainbow:
 %include "party.asm"
 %include "tcp.asm"
 %include "http.asm"
+%include "browse.asm"
+%include "mouse.asm"
 
 ; print_prompt: prints "rush>" + current path + ": "
 print_prompt:
@@ -12730,6 +12773,8 @@ clear_screen:
     push rax
     push rcx
     push rdi
+    call mouse_hide
+    call mouse_sel_clear
     mov rdi, VGA_BASE
     mov rcx, VGA_COLS*VGA_ROWS
     mov ax, 0x0720           ; space, light grey
@@ -12740,6 +12785,7 @@ clear_screen:
     mov byte [cursor_row], 0
     mov byte [cursor_col], 0
     call update_cursor
+    call mouse_show
     pop rdi
     pop rcx
     pop rax
@@ -12905,6 +12951,7 @@ putchar:
 .useattr:
     mov [rdi+1], bl
 .advance:
+    call mouse_sel_putchar_check
     inc byte [cursor_col]
     cmp byte [cursor_col], VGA_COLS
     jne .maybe_scroll
@@ -12928,6 +12975,7 @@ putchar:
 .out:
     call update_cursor
     call serial_mirror
+    call mouse_show
     pop rdi
     pop rdx
     pop rcx
@@ -12940,7 +12988,9 @@ scroll_screen:
     push rcx
     push rsi
     push rdi
+    call mouse_hide
     call scrollback_capture_row      ; archive row 0 before it's shifted away
+    call mouse_sel_clear             ; the shift would otherwise invalidate the snapshot
     mov rsi, VGA_BASE + (VGA_COLS*2)
     mov rdi, VGA_BASE
     mov rcx, (VGA_ROWS-1)*VGA_COLS
@@ -12952,6 +13002,11 @@ scroll_screen:
     mov [rdi], ax
     add rdi, 2
     loop .clr
+    cmp byte [mouse_y], 0           ; content moved up: track the cursor up too
+    je .done
+    dec byte [mouse_y]
+.done:
+    call mouse_show
     pop rdi
     pop rsi
     pop rcx
@@ -13018,6 +13073,14 @@ get_char:
     in al, 0x64
     test al, 1
     jz .wait
+    test al, 0x20                  ; aux (mouse) byte waiting?
+    jz .kbd_byte
+    in al, 0x60
+    cmp byte [mouse_ena], 0
+    je .wait                       ; mouse off: just discard
+    call mouse_byte
+    jmp .wait
+.kbd_byte:
     in al, 0x60
     mov bl, al
 
@@ -13083,6 +13146,26 @@ get_char:
 .have:
     cmp al, 0
     je .wait
+    cmp byte [ctrl_state], 0
+    je .have_normal
+    ; Ctrl held: intercept copy/paste (case-insensitive, in case Shift is
+    ; also held). Ctrl+C copies the mouse selection into the clipboard and
+    ; is consumed; Ctrl+V returns the KEY_PASTE sentinel for read_line.
+    cmp al, 'c'
+    je .ctrl_c
+    cmp al, 'C'
+    je .ctrl_c
+    cmp al, 'v'
+    je .ctrl_v
+    cmp al, 'V'
+    je .ctrl_v
+.have_normal:
+    jmp .snap_and_return
+.ctrl_c:
+    call clip_copy
+    jmp .wait
+.ctrl_v:
+    mov al, KEY_PASTE
     jmp .snap_and_return
 .set_ext:
     mov byte [kbd_ext_flag], 1
@@ -13178,6 +13261,8 @@ scrollback_render:
     push r9
     push r10
 
+    call mouse_hide
+    call mouse_sel_clear
     movzx r9, byte [sb_count]
     movzx r8, al
     cmp r8, r9
@@ -13256,6 +13341,7 @@ scrollback_render:
     out dx, al
 
 .done:
+    call mouse_show
     pop r10
     pop r9
     pop r8
@@ -13330,6 +13416,8 @@ read_line:
     je .hist_up
     cmp al, KEY_DOWN
     je .hist_down
+    cmp al, KEY_PASTE
+    je .paste
     cmp r8, r10
     jae .loop
     mov [r9 + r8], al
@@ -13343,6 +13431,36 @@ read_line:
     dec r8
     call do_backspace
     jmp .loop
+
+.paste:
+    lea rsi, [clip_buf]
+.paste_loop:
+    mov al, [rsi]
+    cmp al, 0
+    je .loop
+    cmp r8, r10
+    jae .loop
+    cmp al, 10                ; strip newlines / carriage returns / backspaces
+    je .paste_next
+    cmp al, 13
+    je .paste_next
+    cmp al, 8
+    je .paste_next
+    cmp al, ' '
+    jb .paste_next            ; only paste printable characters
+    cmp al, '~'
+    ja .paste_next
+    mov [r9 + r8], al
+    inc r8
+    push rsi
+    push rbx
+    mov bl, [cur_normal_attr]
+    call putchar
+    pop rbx
+    pop rsi
+.paste_next:
+    inc rsi
+    jmp .paste_loop
 
 .tab:
     call complete_line
@@ -13835,7 +13953,7 @@ wig_str_buf:   times 16 db 0    ; scratch for the wig clock widget
 wig_last_sec:  db 0             ; last second the widget drew (redraw gate)
 
 banner:
-    db "ShellyForever v0.1.4 -- 'help' for commands", 10, 0
+    db "ShellyForever v0.1.6 -- 'help' for commands", 10, 0
 build_stamp:
     db "build 20260806c -- rtc_sec_now torn-read fix", 10, 0
 
@@ -13892,6 +14010,8 @@ str_dhcp:    db "dhcp", 0
 str_tcp:     db "tcp", 0
 str_take:    db "take", 0
 str_give:    db "give", 0
+str_browse:  db "browse", 0
+str_mouse:   db "mouse", 0
 str_net_ip:  db "ip", 0
 str_net_gw:  db "gw", 0
 str_net_dns:  db "dns", 0
@@ -14290,6 +14410,8 @@ help_text:
     db "  tcp <host> <port>  open a TCP connection and exchange data", 10
     db "  take <url> <file>  HTTP GET, save body to a file", 10
     db "  give <url> <file>  HTTP POST, send a file to a server", 10
+    db "  browse <url>       text-based web browser", 10
+    db "  mouse              toggle the PS/2 mouse cursor on/off", 10
     db "  help <command>     show detailed help for one command", 10, 10, 0
 
 ; --- per-command detail text for "help <command>" (see help_lookup) ---
@@ -14458,6 +14580,26 @@ help_give:
     db "  to the given URL. The request includes Content-Type", 10
     db "  and Content-Length headers. The server's reply is", 10
     db "  printed. Esc cancels during the transfer.", 10, 0
+
+help_browse:
+    db "browse <url>", 10
+    db "  Open the text-based web browser on a page. Renders", 10
+    db "  HTML as plain text with [N] markers on each link.", 10
+    db "  Keys: number+Enter follows a link, b/f back/forward,", 10
+    db "  a adds a bookmark, l lists bookmarks, t saves the", 10
+    db "  raw page to a file, j/k/space/p scroll, q quits.", 10, 0
+
+help_mouse:
+    db "mouse", 10
+    db "  Toggle the PS/2 mouse cursor on or off.", 10
+    db "  When on, the pointer follows the mouse and stays on", 10
+    db "  top of scrolling text and full-screen redraws. Type", 10
+    db "  'mouse' again to disable it.", 10
+    db "  Drag with the left button to select text (reverse-video", 10
+    db "  highlight); Ctrl+C copies the selection to the clipboard,", 10
+    db "  Ctrl+V pastes it at the prompt or into the browse URL field.", 10
+    db "  The wheel scrolls: the page in browse view, the terminal's", 10
+    db "  scrollback elsewhere (same as Ctrl+Up/Ctrl+Down).", 10, 0
 
 help_help:
     db "help | help <command>", 10
@@ -14758,7 +14900,8 @@ net_ip_str:      times 20 db 0
 
 ; --- minimal polled TCP engine state (Milestone C) ---
 tcp_state:     db 0          ; 0 idle, 1 syn_sent, 2 established, 3 closed
-tcp_retry:     db 0          ; 1 = already retransmitted in the current phase
+tcp_retry:     db 0          ; retransmit round count in the current phase (0..TCP_MAX_RETRIES)
+tcp_wait_ticks: db 0         ; whole-seconds left in the current wait round (see TCP_ROUND_SECS)
 tcp_rx_got:    db 0          ; 1 = peer payload landed in tcp_rx_buf
 tcp_fin_got:   db 0          ; 1 = peer sent FIN
 tcp_rst_got:   db 0          ; 1 = peer sent RST
@@ -14774,6 +14917,7 @@ tcp_my_port:   dw 0
 tcp_rx_len:    dd 0
 tcp_tx_len:    dd 0
 tcp_rx_prev:   dd 0          ; rx length at the previous idle-check tick
+tcp_err_msg:   dq 0          ; ptr to the last tcp/http error message (0 = none)
 tcp_dec_buf:   times 10 db 0
 tcp_rx_buf:    times TCP_PAYLOAD_MAX db 0
 tcp_tx_buf:    times TCP_PAYLOAD_MAX db 0

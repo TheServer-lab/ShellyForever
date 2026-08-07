@@ -368,6 +368,7 @@ tcp_do_exchange:
     mov byte [tcp_fin_got], 0
     mov byte [tcp_rx_got], 0
     mov byte [tcp_retry], 0
+    mov byte [tcp_wait_ticks], TCP_ROUND_SECS
     mov byte [tcp_state], 1
 
     ; send SYN
@@ -396,9 +397,13 @@ tcp_do_exchange:
     jne .de_rt_syn
     jmp .de_w1
 .de_rt_syn:
-    cmp byte [tcp_retry], 0
-    jne .de_timeout
-    mov byte [tcp_retry], 1
+    mov r14d, eax
+    dec byte [tcp_wait_ticks]
+    jns .de_w1                  ; still budget left this round - keep polling
+    cmp byte [tcp_retry], TCP_MAX_RETRIES
+    jae .de_timeout
+    inc byte [tcp_retry]
+    mov byte [tcp_wait_ticks], TCP_ROUND_SECS
     xor rsi, rsi
     xor ecx, ecx
     mov r8d, [tcp_peer_ip]
@@ -415,6 +420,7 @@ tcp_do_exchange:
     mov byte [tcp_rx_got], 0
     mov byte [tcp_fin_got], 0
     mov byte [tcp_retry], 0
+    mov byte [tcp_wait_ticks], TCP_ROUND_SECS
     mov dword [tcp_last_ack], 0
     mov dword [tcp_rx_len], 0
     mov dword [tcp_rx_prev], 0
@@ -451,10 +457,19 @@ tcp_do_exchange:
     je .de_reply
     mov eax, [tcp_rx_len]
     mov [tcp_rx_prev], eax
+    ; fresh data landed this tick - the peer is alive, so give it a full
+    ; new round of patience rather than counting this tick against a
+    ; budget that started before any of this data showed up.
+    mov byte [tcp_retry], 0
+    mov byte [tcp_wait_ticks], TCP_ROUND_SECS
+    jmp .de_w2
 .de_tick2_nodata:
-    cmp byte [tcp_retry], 0
-    jne .de_timeout
-    mov byte [tcp_retry], 1
+    dec byte [tcp_wait_ticks]
+    jns .de_w2                  ; still budget left this round - keep polling
+    cmp byte [tcp_retry], TCP_MAX_RETRIES
+    jae .de_timeout
+    inc byte [tcp_retry]
+    mov byte [tcp_wait_ticks], TCP_ROUND_SECS
     lea rsi, [tcp_tx_buf]
     mov ecx, r15d
     mov r8d, [tcp_peer_ip]
@@ -468,6 +483,7 @@ tcp_do_exchange:
     jmp .de_w2
 
 .de_reply:
+    mov qword [tcp_err_msg], 0
     ; advance seq + FIN
     mov eax, [tcp_cur_seq]
     add eax, r15d
@@ -486,18 +502,21 @@ tcp_do_exchange:
     cmp byte [nic_last_fail_reason], 1
     je .de_sendfail_noreply
     mov rsi, msg_tcp_sendfail
+    mov [tcp_err_msg], rsi
     mov al, ATTR_ERROR
     call print_string_attr
     stc
     jmp .de_out
 .de_sendfail_noreply:
     mov rsi, msg_tcp_sendfail_noreply
+    mov [tcp_err_msg], rsi
     mov al, ATTR_ERROR
     call print_string_attr
     stc
     jmp .de_out
 .de_unresolved:
     mov rsi, msg_http_unresolved
+    mov [tcp_err_msg], rsi
     mov al, ATTR_ERROR
     call print_string_attr
     stc
@@ -505,12 +524,14 @@ tcp_do_exchange:
 .de_cancel:
     mov byte [kill_flag], 0
     mov rsi, msg_http_cancelled
+    mov [tcp_err_msg], rsi
     mov al, [cur_normal_attr]
     call print_string_attr
     stc
     jmp .de_out
 .de_reset:
     mov rsi, msg_tcp_reset
+    mov [tcp_err_msg], rsi
     mov al, ATTR_ERROR
     call print_string_attr
     stc
@@ -519,6 +540,7 @@ tcp_do_exchange:
     cmp dword [tcp_rx_len], 0
     jne .de_reply
     mov rsi, msg_tcp_timeout
+    mov [tcp_err_msg], rsi
     mov al, ATTR_ERROR
     call print_string_attr
     stc

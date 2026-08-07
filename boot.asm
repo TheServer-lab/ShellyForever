@@ -24,14 +24,14 @@ jmp start
 
 KERNEL_LOAD_SEG   equ 0x0000
 KERNEL_LOAD_OFF   equ 0x8000
-KERNEL_SECTORS    equ 440         ; how many 512B sectors to load (225KB). Bumped from
-                                  ; 390 to 440 for the TCP engine (Milestone C, kernel.bin
-                                  ; now ~390 sectors) and room for HTTP (Milestone D) to
-                                  ; follow. The CHS fallback reads at most 18 sectors per
-                                  ; BIOS call (not limited by al directly - see the .loop
-                                  ; chunking below) and this total must stay clear of the
-                                  ; SFFS region at LBA 460 (see kernel.asm's FS_LBA_START)
-                                  ; and <= 2880 (media).
+KERNEL_SECTORS    equ 486         ; how many 512B sectors to load (248.6KB). Bumped from
+                                  ; 440 to 480 for the browser (Milestone E), then to 486
+                                  ; when the browse render/link-marker fixes grew it again.
+                                  ; The CHS fallback reads at most 18
+                                  ; sectors per BIOS call (not limited by al directly - see
+                                  ; the .loop chunking below) and this total must stay clear
+                                  ; of the SFFS region at LBA 500 (see kernel.asm's
+                                  ; FS_LBA_START) and <= 2880 (media).
 
 ; ---- on-screen checkpoint markers ----
 ; Each stage of the real->protected->long mode transition writes one

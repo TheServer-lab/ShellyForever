@@ -1,6 +1,6 @@
 # ShellyForever
 
-**Version:** 0.1.5
+**Version:** 0.1.6
 
 A 64-bit shell-based OS written entirely in x86-64 NASM assembly, from scratch —
 no C, no BIOS libraries beyond boot-time disk/keyboard calls, no existing kernel.

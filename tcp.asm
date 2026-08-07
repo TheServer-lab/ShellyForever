@@ -17,7 +17,18 @@
 ;  declared separately so the module here stays pure code.
 ; ============================================================
 
-TCP_PAYLOAD_MAX equ 1024     ; fits inside net_build_buf (2048 payload budget)
+TCP_PAYLOAD_MAX equ 1536     ; fits inside net_build_buf (4096 build area) and
+                              ; nic_tx_buf (2KB): frame = 34 + 20 + 1536 = 1590 < 2048
+; Wait budget for SYN-ACK / reply waits. A SYN (or a data segment) has to
+; make a real round trip to a host out past the gateway - unlike ARP/DHCP,
+; which only ever talk to something on the local segment. The old code gave
+; up after one whole-second tick plus a single immediate retransmit (~1-2s
+; total), which is nowhere near enough for a real WAN round trip and made
+; perfectly healthy connections report "timed out" before a reply had any
+; chance to arrive. Mirror nic_arp_resolve's fix: a multi-second budget per
+; round, several resend rounds before finally giving up.
+TCP_ROUND_SECS  equ 5         ; ~5-6s of continuous polling per round
+TCP_MAX_RETRIES equ 3         ; up to 3 retransmits (4 sends total) per phase
 TCP_FLAG_FIN    equ 0x01
 TCP_FLAG_SYN    equ 0x02
 TCP_FLAG_RST    equ 0x04
@@ -461,6 +472,7 @@ cmd_tcp:
     mov byte [tcp_fin_got], 0
     mov byte [tcp_rx_got], 0
     mov byte [tcp_retry], 0
+    mov byte [tcp_wait_ticks], TCP_ROUND_SECS
     mov byte [tcp_state], 1
     mov rsi, msg_tcp_connecting
     call print_string
@@ -497,9 +509,13 @@ cmd_tcp:
     jne .tc_tick
     jmp .tc_wait
 .tc_tick:
-    cmp byte [tcp_retry], 0
-    jne .tc_timeout
-    mov byte [tcp_retry], 1
+    mov r13, rax
+    dec byte [tcp_wait_ticks]
+    jns .tc_wait               ; still budget left this round - keep polling
+    cmp byte [tcp_retry], TCP_MAX_RETRIES
+    jae .tc_timeout
+    inc byte [tcp_retry]
+    mov byte [tcp_wait_ticks], TCP_ROUND_SECS
     xor rsi, rsi
     xor ecx, ecx
     mov r8d, [tcp_peer_ip]
@@ -544,6 +560,7 @@ cmd_tcp:
     mov byte [tcp_rx_got], 0
     mov byte [tcp_fin_got], 0
     mov byte [tcp_retry], 0
+    mov byte [tcp_wait_ticks], TCP_ROUND_SECS
     mov dword [tcp_last_ack], 0
     mov dword [tcp_rx_len], 0
     mov dword [tcp_rx_prev], 0
@@ -585,10 +602,19 @@ cmd_tcp:
     je .tc_reply
     mov eax, [tcp_rx_len]
     mov [tcp_rx_prev], eax
+    ; fresh data landed this tick - the peer is alive, so give it a full
+    ; new round of patience rather than counting this tick against a
+    ; budget that started before any of this data showed up.
+    mov byte [tcp_retry], 0
+    mov byte [tcp_wait_ticks], TCP_ROUND_SECS
+    jmp .tc_wait2
 .tc_tick2_nodata:
-    cmp byte [tcp_retry], 0
-    jne .tc_timeout
-    mov byte [tcp_retry], 1
+    dec byte [tcp_wait_ticks]
+    jns .tc_wait2               ; still budget left this round - keep polling
+    cmp byte [tcp_retry], TCP_MAX_RETRIES
+    jae .tc_timeout
+    inc byte [tcp_retry]
+    mov byte [tcp_wait_ticks], TCP_ROUND_SECS
     lea rsi, [tcp_tx_buf]
     mov ecx, [tcp_tx_len]
     mov r8d, [tcp_peer_ip]
