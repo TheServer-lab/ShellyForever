@@ -65,12 +65,19 @@ TOK_ERROR   equ 255
 ; ------------------------------------------------------------
 cmd_party:
     cmp byte [arg1_buf], 0
-    jne .have_arg
+    jne .check_compile
     mov rsi, msg_party_usage
     mov al, ATTR_ERROR
     call print_string_attr
     ret
-.have_arg:
+.check_compile:
+    mov rsi, arg1_buf
+    mov rdi, str_compile_flag
+    call str_eq
+    cmp al, 1
+    je .do_compile
+
+    ; Regular script execution: "party test.pa"
     mov rax, [cur_dir]
     mov rsi, arg1_buf
     mov rdi, leaf1_buf
@@ -94,9 +101,6 @@ cmd_party:
     cmp byte [party_lex_ok], 1
     jne .lex_failed
 
-    ; "party foo.pa -tokens" dumps the raw token stream instead of
-    ; running it - kept around from the lexer-only milestone, handy
-    ; for debugging the lexer/parser independently of each other.
     mov rsi, arg2_buf
     mov rdi, str_tokens_flag
     call str_eq
@@ -106,6 +110,42 @@ cmd_party:
     call party_exec
     cmp byte [party_exec_ok], 1
     jne .exec_failed
+    ret
+
+.do_compile:
+    ; "party compile test.pa"
+    cmp byte [arg2_buf], 0
+    jne .have_compile_arg
+    mov rsi, msg_party_usage
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+.have_compile_arg:
+    mov rax, [cur_dir]
+    mov rsi, arg2_buf
+    mov rdi, leaf1_buf
+    call fs_resolve_path
+    cmp rax, -1
+    je .not_found
+    mov r11, rax
+    mov rax, r11
+    mov rsi, leaf1_buf
+    mov r10, 2
+    call fs_find_child
+    cmp rax, -1
+    je .not_found
+
+    lea rdi, [fs_io_buf]
+    call fs_read_file
+
+    lea rsi, [fs_io_buf]
+    call party_lex
+
+    cmp byte [party_lex_ok], 1
+    jne .lex_failed
+
+    call derive_run_filename
+    call party_compile_to_run
     ret
 
 .want_tokens:
@@ -1044,6 +1084,7 @@ msg_party_lex_err:  db 'party: lex error near line ', 0
 msg_party_exec_err: db 'party: error near line ', 0
 msg_party_killed:   db 10, 'party: script killed (Esc)', 10, 0
 str_party:          db 'party', 0
+str_compile_flag:   db 'compile', 0
 str_tokens_flag:    db '-tokens', 0
 str_minus_char:     db '-', 0
 
@@ -1110,3 +1151,484 @@ party_text_buf:    times 64 db 0
 ALIGN 8
 party_token_count:  dw 0
 party_tokens:       times PARTY_MAX_TOKENS*8 db 0
+
+str_run_header_block:
+    db "[ShellyForever]", 10
+    db "[run 0.1]", 10
+    db "program = v1", 10, 0
+
+msg_party_compiled1: db "Compiled ", 0
+msg_party_compiled2: db " -> ", 0
+
+ALIGN 8
+party_run_out_filename: times 64 db 0
+party_run_bin_buf:      times 4096 db 0
+
+derive_run_filename:
+    push rsi
+    push rdi
+    push rcx
+    push rbx
+    mov rsi, arg2_buf
+    mov rdi, party_run_out_filename
+    call str_copy
+    mov rsi, party_run_out_filename
+.dr_len_loop:
+    cmp byte [rsi], 0
+    je .dr_found_end
+    inc rsi
+    jmp .dr_len_loop
+.dr_found_end:
+    sub rsi, 3
+    cmp rsi, party_run_out_filename
+    jl .dr_out
+    cmp byte [rsi], '.'
+    jne .dr_out
+    cmp byte [rsi+1], 'p'
+    jne .dr_out
+    cmp byte [rsi+2], 'a'
+    jne .dr_out
+    mov byte [rsi], '.'
+    mov byte [rsi+1], 'r'
+    mov byte [rsi+2], 'u'
+    mov byte [rsi+3], 'n'
+    mov byte [rsi+4], 0
+.dr_out:
+    pop rbx
+    pop rcx
+    pop rdi
+    pop rsi
+    ret
+
+; ------------------------------------------------------------
+; party_emit_lit_display: emits one compiled "display <literal>"
+; sequence (print text, then newline) into the .run code buffer,
+; followed by the literal's text itself.
+; In:  rdi = output cursor into party_run_bin_buf (the live codegen
+;            cursor - callers keep using rdi after this returns)
+;      rsi = pointer to the literal's raw text (no quotes, no minus)
+;      rcx = length of that text
+;      r11 = 1 to prepend a literal '-' before the text, 0 otherwise
+; Out: rdi advanced past the emitted instructions + text + NUL.
+; Clobbers: rax, rsi, rcx.
+; ------------------------------------------------------------
+party_emit_lit_display:
+    ; LEA RSI, [RIP+disp]   (runtime instruction, being written here)
+    ; disp must land exactly on the text bytes that follow the fixed
+    ; 15-byte call/mov/call/jmp tail below (3+4+3+5), plus 1 more byte if
+    ; a '-' is going to be written before the text.
+    mov byte [rdi], 0x48
+    mov byte [rdi+1], 0x8D
+    mov byte [rdi+2], 0x35
+    mov eax, 15                   ; was 10 - grew by 5 for the JMP added below
+    cmp r11, 1
+    jne .eld_disp_set
+    inc eax
+.eld_disp_set:
+    mov [rdi+3], eax
+    add rdi, 7
+
+    mov byte [rdi], 0xFF          ; call [table+0]  -> kernel print_string
+    mov byte [rdi+1], 0x57
+    mov byte [rdi+2], 0x00
+    add rdi, 3
+
+    mov byte [rdi], 0x48          ; mov rsi, [table+0x18] -> newline_str
+    mov byte [rdi+1], 0x8B
+    mov byte [rdi+2], 0x77
+    mov byte [rdi+3], 0x18
+    add rdi, 4
+
+    mov byte [rdi], 0xFF          ; call [table+0]  -> print the newline
+    mov byte [rdi+1], 0x57
+    mov byte [rdi+2], 0x00
+    add rdi, 3
+
+    ; JMP rel32, jumping over the embedded text literal that follows.
+    ; Without this, execution fell straight off the end of the call above
+    ; and started executing the raw text bytes as machine code - that was
+    ; the crash: any compiled program with a "display <literal>" line
+    ; would run fine right up until it hit the embedded text and then
+    ; jump into garbage/random opcodes.
+    mov byte [rdi], 0xE9
+    mov eax, ecx                  ; text length
+    cmp r11, 1
+    jne .eld_jmp_set
+    inc eax                       ; account for the leading '-' byte
+.eld_jmp_set:
+    inc eax                       ; account for the NUL terminator byte
+    mov [rdi+1], eax
+    add rdi, 5
+
+    cmp r11, 1
+    jne .eld_copy
+    mov byte [rdi], '-'
+    inc rdi
+.eld_copy:
+    rep movsb                     ; copies rcx bytes [rsi]->[rdi], advances both
+    mov byte [rdi], 0
+    inc rdi
+    ret
+
+party_compile_to_run:
+    lea rdi, [party_run_bin_buf]
+    mov rsi, str_run_header_block
+    call str_copy
+    lea rsi, [party_run_bin_buf]
+    call str_len
+    add rdi, rax
+
+    xor rbx, rbx
+.pc_loop:
+    cmp bx, [party_token_count]
+    jae .pc_done
+    mov rax, rbx
+    imul rax, 8
+    lea rsi, [party_tokens + rax]
+    movzx r8, byte [rsi]
+    cmp r8, TOK_DISPLAY
+    jne .pc_check_while
+
+    inc rbx
+    mov rax, rbx
+    imul rax, 8
+    lea rsi, [party_tokens + rax]
+    movzx r8, byte [rsi]
+
+    xor r11, r11                   ; r11 = 1 if a leading unary '-' precedes the literal
+    cmp r8, TOK_MINUS
+    jne .pc_disp_dispatch
+    mov r11, 1
+    inc rbx
+    mov rax, rbx
+    imul rax, 8
+    lea rsi, [party_tokens + rax]
+    movzx r8, byte [rsi]
+
+.pc_disp_dispatch:
+    cmp r8, TOK_STR
+    je .pc_disp_str
+    cmp r8, TOK_INT
+    je .pc_disp_num
+    cmp r8, TOK_FLOAT
+    je .pc_disp_num
+    cmp r8, TOK_TRUE
+    je .pc_disp_true
+    cmp r8, TOK_FALSE
+    je .pc_disp_false
+    jmp .pc_next                   ; not compilable yet (vars/expr/etc) - skip
+
+.pc_disp_str:
+    cmp r11, 1
+    je .pc_next                    ; "-"+string is invalid - skip, same as the interpreter
+    movzx rcx, word [rsi + 2]      ; length = content only (lexer already excludes the quotes)
+    mov eax, [rsi + 4]
+    lea rsi, [fs_io_buf]
+    add rsi, rax                   ; -> first content byte (no off-by-one skip needed)
+    call party_emit_lit_display
+    jmp .pc_next
+
+.pc_disp_num:
+    movzx rcx, word [rsi + 2]      ; length = full token span (digits, '.' for floats)
+    mov eax, [rsi + 4]
+    lea rsi, [fs_io_buf]
+    add rsi, rax
+    call party_emit_lit_display
+    jmp .pc_next
+
+.pc_disp_true:
+    cmp r11, 1
+    je .pc_next                    ; "-true" is invalid - skip
+    lea rsi, [kw_true]
+    mov rcx, 4
+    call party_emit_lit_display
+    jmp .pc_next
+
+.pc_disp_false:
+    cmp r11, 1
+    je .pc_next                    ; "-false" is invalid - skip
+    lea rsi, [kw_false]
+    mov rcx, 5
+    call party_emit_lit_display
+    jmp .pc_next
+
+; ------------------------------------------------------------
+; while (true|false) { ... } compilation.
+; Only a literal true/false condition is compilable right now - same
+; "literals only" rule party_emit_lit_display already applies to display.
+; A non-literal condition (a variable, comparison, etc.) falls through
+; to .pc_next just like an uncompilable display argument does, i.e. the
+; whole loop is silently skipped rather than crashing the compile.
+; Nested while/if blocks inside the body aren't compiled (their DISPLAY
+; statements still are, since brace tokens are otherwise just skipped),
+; but a while(true) loop nested inside this loop's body isn't supported -
+; only one loop level is tracked here.
+; ------------------------------------------------------------
+.pc_check_while:
+    cmp r8, TOK_WHILE
+    jne .pc_next
+    inc rbx                        ; consume WHILE, rbx -> should be LPAREN
+    cmp bx, [party_token_count]
+    jae .pc_done
+    mov rax, rbx
+    imul rax, 8
+    lea rsi, [party_tokens + rax]
+    movzx r8, byte [rsi]
+    cmp r8, TOK_LPAREN
+    jne .pc_next                   ; malformed - bail, resume normal scan here
+    inc rbx                        ; rbx -> condition token
+    cmp bx, [party_token_count]
+    jae .pc_done
+    mov rax, rbx
+    imul rax, 8
+    lea rsi, [party_tokens + rax]
+    movzx r8, byte [rsi]
+    mov r9, r8                     ; r9 = condition token type (TRUE/FALSE/other)
+    cmp r8, TOK_TRUE
+    je .pc_while_cond_ok
+    cmp r8, TOK_FALSE
+    je .pc_while_cond_ok
+    jmp .pc_next                   ; non-literal condition - not compilable yet
+.pc_while_cond_ok:
+    inc rbx                        ; rbx -> should be RPAREN
+    cmp bx, [party_token_count]
+    jae .pc_done
+    mov rax, rbx
+    imul rax, 8
+    lea rsi, [party_tokens + rax]
+    movzx r8, byte [rsi]
+    cmp r8, TOK_RPAREN
+    jne .pc_next
+    inc rbx                        ; rbx -> should be LBRACE
+    cmp bx, [party_token_count]
+    jae .pc_done
+    mov rax, rbx
+    imul rax, 8
+    lea rsi, [party_tokens + rax]
+    movzx r8, byte [rsi]
+    cmp r8, TOK_LBRACE
+    jne .pc_next
+    inc rbx                        ; rbx -> first token of the loop body
+
+    cmp r9, TOK_FALSE
+    jne .pc_while_true
+
+    ; while(false): dead code - skip the whole body without emitting it,
+    ; tracking brace depth so a nested { } inside doesn't end the skip early.
+    mov r14, 1
+.pc_while_skip:
+    cmp bx, [party_token_count]
+    jae .pc_done
+    mov rax, rbx
+    imul rax, 8
+    lea rsi, [party_tokens + rax]
+    movzx r8, byte [rsi]
+    inc rbx
+    cmp r8, TOK_LBRACE
+    jne .pc_ws_chkclose
+    inc r14
+    jmp .pc_while_skip
+.pc_ws_chkclose:
+    cmp r8, TOK_RBRACE
+    jne .pc_while_skip
+    dec r14
+    jnz .pc_while_skip
+    jmp .pc_loop                   ; matching close brace consumed - resume
+
+.pc_while_true:
+    ; while(true): r13 = address in the .run code buffer where the loop
+    ; body's compiled code starts, so the closing brace can jump back here.
+    mov r13, rdi
+
+    ; --- Esc/kill check, emitted once so it runs at the top of every
+    ; iteration (the backward JMP re-enters right here). Without this,
+    ; a while(true) loop can never be stopped, since this kernel has no
+    ; preemption - the .run binary just runs to completion (or forever)
+    ; once called. call [rdi_table+0x20] -> party_poll_kill_api, which
+    ; returns al=1 if Esc was pressed or 'prs kill <pid/name>' targeted
+    ; this process; if so, ret out of the compiled program entirely
+    ; instead of looping.
+    mov byte [rdi], 0xFF           ; call [rdi+0x20]
+    mov byte [rdi+1], 0x57
+    mov byte [rdi+2], 0x20
+    add rdi, 3
+    mov byte [rdi], 0x84           ; test al, al
+    mov byte [rdi+1], 0xC0
+    add rdi, 2
+    mov byte [rdi], 0x74           ; jz +1 (skip the ret below if al==0)
+    mov byte [rdi+1], 0x01
+    add rdi, 2
+    mov byte [rdi], 0xC3           ; ret (bail out of the whole .run program)
+    inc rdi
+
+    mov r14, 1                     ; brace depth
+.pc_while_body:
+    cmp bx, [party_token_count]
+    jae .pc_done                   ; unterminated body - stop compiling rather
+                                    ; than run off the end of the token array
+    mov rax, rbx
+    imul rax, 8
+    lea rsi, [party_tokens + rax]
+    movzx r8, byte [rsi]
+
+    cmp r8, TOK_LBRACE
+    jne .pc_wb_chkclose
+    inc r14
+    inc rbx
+    jmp .pc_while_body
+.pc_wb_chkclose:
+    cmp r8, TOK_RBRACE
+    jne .pc_wb_chkdisplay
+    inc rbx
+    dec r14
+    jnz .pc_while_body             ; still inside a nested block - keep scanning
+    ; this is the matching close brace for the loop - emit JMP rel32 back
+    ; to r13 and resume the outer scan right after it
+    mov byte [rdi], 0xE9
+    mov rax, r13
+    sub rax, rdi
+    sub rax, 5                     ; rel32 is relative to the end of this jmp
+    mov [rdi+1], eax
+    add rdi, 5
+    jmp .pc_loop
+.pc_wb_chkdisplay:
+    cmp r8, TOK_DISPLAY
+    jne .pc_wb_next
+    ; --- same literal-display compilation as the top-level handler above ---
+    inc rbx
+    mov rax, rbx
+    imul rax, 8
+    lea rsi, [party_tokens + rax]
+    movzx r8, byte [rsi]
+
+    xor r11, r11
+    cmp r8, TOK_MINUS
+    jne .pc_wb_disp_dispatch
+    mov r11, 1
+    inc rbx
+    mov rax, rbx
+    imul rax, 8
+    lea rsi, [party_tokens + rax]
+    movzx r8, byte [rsi]
+
+.pc_wb_disp_dispatch:
+    cmp r8, TOK_STR
+    je .pc_wb_disp_str
+    cmp r8, TOK_INT
+    je .pc_wb_disp_num
+    cmp r8, TOK_FLOAT
+    je .pc_wb_disp_num
+    cmp r8, TOK_TRUE
+    je .pc_wb_disp_true
+    cmp r8, TOK_FALSE
+    je .pc_wb_disp_false
+    jmp .pc_wb_next                ; not compilable yet - skip
+
+.pc_wb_disp_str:
+    cmp r11, 1
+    je .pc_wb_next
+    movzx rcx, word [rsi + 2]
+    mov eax, [rsi + 4]
+    lea rsi, [fs_io_buf]
+    add rsi, rax
+    call party_emit_lit_display
+    jmp .pc_wb_next
+
+.pc_wb_disp_num:
+    movzx rcx, word [rsi + 2]
+    mov eax, [rsi + 4]
+    lea rsi, [fs_io_buf]
+    add rsi, rax
+    call party_emit_lit_display
+    jmp .pc_wb_next
+
+.pc_wb_disp_true:
+    cmp r11, 1
+    je .pc_wb_next
+    lea rsi, [kw_true]
+    mov rcx, 4
+    call party_emit_lit_display
+    jmp .pc_wb_next
+
+.pc_wb_disp_false:
+    cmp r11, 1
+    je .pc_wb_next
+    lea rsi, [kw_false]
+    mov rcx, 5
+    call party_emit_lit_display
+    jmp .pc_wb_next
+
+.pc_wb_next:
+    inc rbx
+    jmp .pc_while_body
+
+.pc_next:
+    inc rbx
+    jmp .pc_loop
+
+.pc_done:
+    mov byte [rdi], 0xC3
+    inc rdi
+    mov byte [rdi], 0
+
+    push rdi
+    mov rax, [cur_dir]
+    lea rsi, [party_run_out_filename]
+    mov rdi, leaf1_buf
+    call fs_resolve_path
+    cmp rax, -1
+    je .pc_create_parent
+    mov r11, rax
+    jmp .pc_found_parent
+.pc_create_parent:
+    mov r11, [cur_dir]
+.pc_found_parent:
+    mov rax, r11
+    mov rsi, leaf1_buf
+    mov r10, -1
+    call fs_find_child
+    cmp rax, -1
+    jne .pc_overwrite_file
+
+    mov rax, r11
+    mov rsi, leaf1_buf
+    mov r10, 2
+    call fs_create_node
+    cmp rax, -1
+    je party_compile_fail
+    mov r12, rax
+    jmp .pc_do_write
+
+.pc_overwrite_file:
+    mov r12, rax
+
+.pc_do_write:
+    mov rax, r12
+    lea rsi, [party_run_bin_buf]
+    mov rcx, rdi
+    sub rcx, rsi
+    call fs_write_binary_file
+    call maybe_auto_sync
+
+    mov rsi, msg_party_compiled1
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    lea rsi, [arg2_buf]
+    call print_string
+    mov rsi, msg_party_compiled2
+    call print_string
+    lea rsi, [party_run_out_filename]
+    call print_string
+    mov rsi, newline_str
+    call print_string
+    pop rdi
+    ret
+
+msg_compile_fail: db "compile: error: failed to create node or write file", 10, 0
+
+party_compile_fail:
+    pop rdi
+    mov rsi, msg_compile_fail
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret

@@ -1,6 +1,6 @@
 # ShellyForever
 
-**Version:** 0.1.7
+**Version:** 0.1.8
 
 A 64-bit shell-based OS written entirely in x86-64 NASM assembly, from scratch —
 no C, no BIOS libraries beyond boot-time disk/keyboard calls, no existing kernel.
@@ -31,6 +31,14 @@ no C, no BIOS libraries beyond boot-time disk/keyboard calls, no existing kernel
   - A text-based web browser (`browse`) that fetches HTTP pages, strips
     the HTML to readable text, and follows links. See "The browser:
     `browse`" below.
+  - A `/sys` system folder, auto-seeded on a fresh filesystem, holding
+    `alias.sly` (aliases) and `sysconfig.sly` (system settings) — both
+    persist across `sync`/`rboot`/`sdown` like any other file. See
+    "System configuration: `sysconfig.sly`" below.
+  - A compiled executable format (`.run`) — `run <file.run>` loads a
+    small headered binary, hands it a kernel API table (print, input,
+    kill-check), and tracks it in the process table like a script. See
+    "Compiled programs: `run`" below.
 
 ## Commands implemented
 
@@ -61,6 +69,7 @@ no C, no BIOS libraries beyond boot-time disk/keyboard calls, no existing kernel
 | `shelly` | `shelly` | print the splash banner: a rainbow ShellyForever OS title, the developer credit, and the copyright line |
 | `write` | `show hi ~ write file.txt` | write text to a file (creates it, or overwrites); handy as a `~` pipe target |
 | `rr` | `rr script.rsh` | run a rush script file (`$` = comment line) |
+| `run` | `run hello.run` | run a compiled ShellyForever `RUN 0.1` executable; typing a bare `name.run` does the same |
 | `party` | `party hello.pa` | run a program in **Party** (`.pa`), a small built-in scripting language — own variables, expressions, `if`/`else`, `while`, `func`/`return`, and `display` output. See "Party" below and `PARTY_SPEC.md` |
 | `prs` | `prs`, `prs kill 1`, `prs kill rushrun` | list processes, or kill by PID or name |
 | `auth` | `auth sdown`, `auth vars rmv all` | elevate privileges for one dangerous command |
@@ -307,6 +316,40 @@ What's in there:
 `party foo.pa -tokens` dumps the raw token stream instead of executing, and
 **Esc** interrupts a running script.
 
+### Compiled programs: `run` and the `.run` format
+
+`run <file.run>` loads and executes a compiled ShellyForever **RUN 0.1**
+binary — machine code, not a script. Typing a bare `name.run` at the
+prompt does the same thing, so a `.run` file can double as its own
+command.
+
+A `.run` file starts with a plain-text three-line header, and the
+executable code follows immediately after it:
+
+```
+[ShellyForever]
+[run 0.1]
+program = v1
+<raw x86-64 machine code from here to end of file>
+```
+
+`run` reads the whole file into memory, checks the three header lines
+line-by-line, and — if they match — jumps straight into the code that
+follows. Before jumping in, it:
+
+- **Allocates a process slot**, so the running program shows up in `prs`
+  (as `run`) and can be stopped with `prs kill <pid>` / `prs kill run`,
+  the same as an `rr` script.
+- **Builds a small kernel API table** (function pointers for
+  `print_string`, `print_string_attr`, `get_char`, a newline-string
+  pointer, and a kill-check poll routine) and passes its address in
+  `rdi`, so the compiled program can print, read input, and cooperate
+  with Esc/`prs kill` without linking against the kernel directly.
+
+An unrecognized or missing header prints `run: error: invalid or missing
+RUN 0.1 header` rather than jumping into arbitrary bytes; a missing file
+or missing argument fail the same way `rr`/`party` do.
+
 ### The RTC clock: `date`, `time`, and `wig time`
 
 The kernel reads the MC146818 RTC/CMOS clock chip (ports `0x70`/`0x71`,
@@ -479,6 +522,38 @@ rush>/home: mkfl big.txt "..." ; view big.txt
 ```
 behaves exactly the same whether `big.txt` fits in one node or spans a
 dozen — the chaining is invisible from the shell.
+
+### System configuration: `sysconfig.sly`
+
+Every fresh filesystem gets a `/sys` folder (the same one aliases already
+lived in) seeded with two files:
+
+- **`alias.sly`** — the serialized alias table (unchanged from earlier
+  versions; see `ali`/`alis` above).
+- **`sysconfig.sly`** — a plain `key = value` settings file, seeded with:
+
+  ```
+  mouse = off
+  internet = on
+  auto_sync = on
+  ```
+
+Like everything else in the filesystem, `/sys/sysconfig.sly` is just a
+regular (chained) file: `view /sys/sysconfig.sly` reads it, `edit` or
+`owrite` change it, and it survives `sync`/`rboot`/`sdown` and reloads
+on the next boot exactly like your `/home` documents do — no separate
+save path to remember. `ensure_sys_folder` only *creates* the default
+copy once, on a brand-new (or freshly `fmt`'d) filesystem; loading an
+existing one restores whatever `/sys` already had on disk, seeded or
+hand-edited.
+
+Note: unlike `alias.sly` (which `aliases_load` actively re-parses at
+boot to rebuild the alias table), `sysconfig.sly` isn't read back to
+*apply* its settings yet — `mouse`, `net on`/`net off`, and `sync`'s
+auto-sync toggle are still separate live commands. Right now the file
+gives you one persistent place to keep track of your preferred
+settings; wiring it up to actually configure the corresponding toggles
+at boot is a natural next step (see below).
 
 ### One boot drive, up to two mounted drives
 
@@ -772,9 +847,25 @@ message and then nothing, which is your cue to power off manually.
    instead of fixed slot counts.
 5. **Password-based auth** instead of the current one-shot `auth` flag, so
    elevated sessions can span multiple commands without re-authenticating.
+6. **Apply `sysconfig.sly` at boot** — the file persists (see "System
+   configuration" above) but isn't parsed back into the live `mouse`/
+   `net`/auto-sync toggles yet; boot could read it the way `aliases_load`
+   already re-parses `alias.sly`.
 
 ## What's new
 
+- **Compiled `.run` executables (v0.1.8)** — `run <file.run>` (or typing a
+  bare `name.run`) loads a compiled ShellyForever `RUN 0.1` binary, checks
+  its three-line text header, allocates a process slot (visible in `prs`,
+  killable by `prs kill`), and jumps into the machine code that follows,
+  passing it a kernel API table (print/input/kill-check) in `rdi`. See
+  "Compiled programs: `run`" above.
+- **System configuration persistence (v0.1.8)** — a `/sys` folder is now
+  seeded with `sysconfig.sly` (`mouse`/`internet`/`auto_sync` settings)
+  alongside the existing `alias.sly`. It's a normal chained file, so it
+  survives `sync`/`rboot`/`sdown` like anything else in `/home`; it isn't
+  auto-applied at boot yet. See "System configuration: `sysconfig.sly`"
+  above.
 - **`browse <url>` — a text-based web browser (v0.1.7)** — fetches an HTTP
   page, strips the HTML to readable text, and renders links as `[N]`
   markers you can follow with a digit or keypad digit + Enter. Back/forward

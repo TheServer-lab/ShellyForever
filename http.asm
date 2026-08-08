@@ -670,6 +670,9 @@ cmd_take:
     cmp rax, -1
     je .bad_path
     mov r11, rax                 ; parent folder
+    call check_target_sys_auth
+    cmp rax, 1
+    je .done
 
     ; check if file already exists
     mov rax, r11
@@ -703,6 +706,7 @@ cmd_take:
     mov rax, r12
     lea rsi, [http_rx_buf]
     call fs_write_file
+    call maybe_auto_sync
     mov rsi, msg_take_saved
     call print_string
     mov rsi, arg2_buf

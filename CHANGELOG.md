@@ -4,6 +4,44 @@ All notable changes to ShellyForever are documented here. The format is
 loosely based on [Keep a Changelog](https://keepachangelog.com/); the
 project does not yet follow strict SemVer.
 
+## [0.1.8] - 2026-08-09
+
+### Added
+
+- **Compiled executable format — `run <file.run>`**. `run` (and a bare
+  `name.run` typed at the prompt) loads a compiled ShellyForever
+  `RUN 0.1` binary: a three-line plain-text header (`[ShellyForever]` /
+  `[run 0.1]` / `program = v1`) followed immediately by raw x86-64
+  machine code. `cmd_run` reads the file, validates the header line by
+  line, allocates a process slot so the program shows up in `prs` and
+  can be stopped with `prs kill`, builds a small kernel API table
+  (`print_string`, `print_string_attr`, `get_char`, a newline pointer,
+  and a kill-check poll routine) in `rdi`, and jumps into the code. An
+  invalid/missing header or missing file both fail cleanly with an
+  error message instead of jumping into arbitrary bytes.
+- **System configuration persistence — `/sys/sysconfig.sly`**.
+  `ensure_sys_folder` now seeds a `/sys` folder (already home to
+  `alias.sly`) with a second file, `sysconfig.sly`, holding default
+  `mouse = off`, `internet = on`, `auto_sync = on` settings. Like every
+  other file, it's stored as a normal (chained) SFFS node, so it
+  persists across `sync`/`rboot`/`sdown` and reloads with the rest of
+  the filesystem on the next boot — no separate save/load path needed.
+  Seeding only happens once, on a fresh (or freshly `fmt`'d) filesystem;
+  an existing volume's `/sys` loads as-is, seeded or hand-edited.
+
+### Changed
+
+- Banner and build stamp bumped to `v0.1.8` (`kernel.asm`).
+- README updated with a `run` command-table entry, a "Compiled programs:
+  `run`" section, and a "System configuration: `sysconfig.sly`" section.
+
+### Known limitations
+
+- `sysconfig.sly` is persisted but not yet parsed back into the live
+  `mouse`/`net`/auto-sync toggles at boot — unlike `alias.sly`, which
+  `aliases_load` actively re-applies. Wiring that up is tracked as a
+  natural next step in the README.
+
 ## [0.1.7] - 2026-08-08
 
 ### Added

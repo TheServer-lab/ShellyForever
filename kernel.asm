@@ -153,6 +153,7 @@ kernel_entry:
 
     call clear_screen
     call fs_load                ; loads persisted fs from disk, or fs_init's a fresh one
+    call aliases_load           ; restore aliases saved to /home/sys/alias.sly, if any
 
     mov rsi, banner
     mov al, [cur_normal_attr]
@@ -905,6 +906,18 @@ dispatch:
     je cmd_shelly
 
     mov rsi, cmd_buf
+    mov rdi, str_run
+    call str_eq
+    cmp al, 1
+    je cmd_run
+
+    mov rsi, cmd_buf
+    mov rdi, str_autosync
+    call str_eq
+    cmp al, 1
+    je cmd_autosync
+
+    mov rsi, cmd_buf
     mov rdi, str_party
     call str_eq
     cmp al, 1
@@ -976,6 +989,34 @@ dispatch:
     cmp al, 1
     je cmd_mouse
 
+    ; --- typed a bare "<name>.run" filename directly? treat it the
+    ; same as "run <name>.run" so scripts double as executables ---
+    lea rax, [cmd_buf]
+    mov rsi, rax
+.dbr_len_loop:
+    cmp byte [rsi], 0
+    je .dbr_len_done
+    inc rsi
+    jmp .dbr_len_loop
+.dbr_len_done:
+    sub rsi, 4
+    cmp rsi, rax
+    jl .not_bare_run            ; cmd_buf shorter than ".run" itself
+    cmp byte [rsi], '.'
+    jne .not_bare_run
+    cmp byte [rsi+1], 'r'
+    jne .not_bare_run
+    cmp byte [rsi+2], 'u'
+    jne .not_bare_run
+    cmp byte [rsi+3], 'n'
+    jne .not_bare_run
+
+    mov rsi, cmd_buf
+    mov rdi, arg1_buf
+    call str_copy
+    jmp cmd_run
+.not_bare_run:
+
     ; --- user-defined alias? (see "ali <name> <commands>") ---
     mov rsi, cmd_buf
     call alias_lookup
@@ -1037,6 +1078,9 @@ cmd_mkf:
     cmp rax, -1
     je .bad_path
     mov r11, rax                ; parent dir the new folder goes in
+    call check_target_sys_auth
+    cmp rax, 1
+    je .bad_path
     mov rax, r11
     mov rsi, leaf1_buf
     mov r10, -1                ; any type counts as "exists"
@@ -1049,6 +1093,7 @@ cmd_mkf:
     call fs_create_node
     cmp rax, -1
     je .full
+    call maybe_auto_sync
     ret
 .exists:
     mov rsi, msg_exists
@@ -1127,6 +1172,9 @@ cmd_mkfl:
     cmp rax, -1
     je .bad_path
     mov r11, rax                 ; parent dir the new file goes in
+    call check_target_sys_auth
+    cmp rax, 1
+    je .mkfl_done
     mov rax, r11
     mov rsi, leaf1_buf
     mov r10, -1
@@ -1145,6 +1193,7 @@ cmd_mkfl:
     mov rbx, rax
     lea rsi, [arg2_buf]
     call fs_write_file
+    call maybe_auto_sync
 
     ; Check -info flag
     mov rsi, arg3_buf
@@ -1244,6 +1293,7 @@ cmd_mkfl:
     mov rax, rbx
     lea rsi, [arg2_buf]
     call fs_write_file
+    call maybe_auto_sync
 
     ; Check -info flag
     mov rsi, arg3_buf
@@ -1488,6 +1538,21 @@ cmd_edit:
     je .ce_not_found
     push r15
     mov r15, rax
+    push rax
+    mov rax, r15
+    call check_node_in_sys
+    cmp al, 1
+    jne .ce_auth_ok
+    cmp byte [auth_valid], 1
+    je .ce_auth_ok
+    mov rsi, msg_auth_required
+    mov al, ATTR_ERROR
+    call print_string_attr
+    pop rax
+    pop r15
+    ret
+.ce_auth_ok:
+    pop rax
 
     lea rdi, [fs_io_buf]
     call fs_read_file
@@ -1574,6 +1639,7 @@ cmd_edit:
     mov rax, r15
     lea rsi, [fs_io_buf]
     call fs_write_file
+    call maybe_auto_sync
     call clear_screen
     mov rsi, msg_saved
     mov al, [cur_normal_attr]
@@ -2127,6 +2193,240 @@ cmd_sync:
     mov rsi, msg_sync_failed
     mov al, ATTR_ERROR
     call print_string_attr
+    ret
+
+; ------------------------------------------------------------
+cmd_autosync:
+    mov rsi, arg1_buf
+    mov rdi, str_on
+    call str_eq
+    cmp al, 1
+    je .as_on
+    mov rsi, arg1_buf
+    mov rdi, str_off
+    call str_eq
+    cmp al, 1
+    je .as_off
+    mov rsi, msg_autosync_status
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    cmp byte [auto_sync_enabled], 1
+    je .as_print_on
+    mov rsi, str_off
+    call print_string
+    jmp .as_newline
+.as_print_on:
+    mov rsi, str_on
+    call print_string
+.as_newline:
+    mov rsi, newline_str
+    call print_string
+    ret
+.as_on:
+    mov byte [auto_sync_enabled], 1
+    mov rsi, msg_autosync_enabled
+    call print_string
+    ret
+.as_off:
+    mov byte [auto_sync_enabled], 0
+    mov rsi, msg_autosync_disabled
+    call print_string
+    ret
+
+maybe_auto_sync:
+    cmp byte [auto_sync_enabled], 1
+    jne .mas_no
+    call fs_save
+.mas_no:
+    ret
+
+; ------------------------------------------------------------
+; cmd_run: "run <file.run>"
+; Executes a compiled ShellyForever RUN 0.1 binary.
+; ------------------------------------------------------------
+cmd_run:
+    cmp byte [arg1_buf], 0
+    jne .cr_have_arg
+    mov rsi, msg_run_usage
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+.cr_have_arg:
+    mov rax, [cur_dir]
+    mov rsi, arg1_buf
+    mov rdi, leaf1_buf
+    call fs_resolve_path
+    cmp rax, -1
+    je .cr_not_found
+    mov r11, rax
+    mov rax, r11
+    mov rsi, leaf1_buf
+    mov r10, 2
+    call fs_find_child
+    cmp rax, -1
+    je .cr_not_found
+
+    lea rdi, [fs_io_buf]
+    call fs_read_binary_file
+
+    lea rsi, [fs_io_buf]
+    mov rdi, str_run_magic1
+    call str_line_eq
+    cmp al, 1
+    jne .cr_bad_header
+
+    call str_next_line
+    mov rdi, str_run_magic2
+    call str_line_eq
+    cmp al, 1
+    jne .cr_bad_header
+
+    call str_next_line
+    mov rdi, str_run_magic3
+    call str_line_eq
+    cmp al, 1
+    jne .cr_bad_header
+
+    call str_next_line
+    mov r12, rsi
+
+    ; Allocate a process slot so this run shows up in 'prs' and can be
+    ; stopped by name/pid via 'prs kill', same as rr scripts.
+    call proc_alloc
+    cmp rax, -1
+    je .cr_toomany
+
+    movzx rax, byte [proc_cur_slot]
+    imul rax, 32
+    lea rdi, [proc_name + rax]
+    mov rsi, str_run_procname
+    call str_copy
+
+    mov byte [kill_flag], 0
+
+    mov rsi, msg_run_running
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    mov rsi, arg1_buf
+    call print_string
+    movzx rax, byte [proc_cur_slot]
+    movzx rax, word [proc_id + rax*2]
+    lea rdi, [show_num_buf]
+    call int_to_str
+    mov rsi, msg_rr_pid1
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    mov rsi, show_num_buf
+    call print_string
+    mov rsi, msg_rr_pid2
+    call print_string
+
+    lea rdi, [kernel_api_table]
+    mov qword [rdi + 0], print_string
+    mov qword [rdi + 8], print_string_attr
+    mov qword [rdi + 16], get_char
+    mov qword [rdi + 24], newline_str
+    mov qword [rdi + 32], party_poll_kill_api
+
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+
+    mov rdi, kernel_api_table
+    call r12
+
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+
+    movzx rax, byte [proc_cur_slot]
+    mov rdi, rax
+    call proc_free_slot
+
+    cmp byte [kill_flag], 0
+    je .cr_out
+    mov rsi, msg_rr_killed
+    mov al, ATTR_ERROR
+    call print_string_attr
+.cr_out:
+    ret
+
+.cr_toomany:
+    mov rsi, msg_run_toomany
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+
+.cr_bad_header:
+    mov rsi, msg_run_badheader
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+
+.cr_not_found:
+    mov rsi, msg_no_file
+    mov al, ATTR_ERROR
+    call print_string_attr
+    mov rsi, arg1_buf
+    call print_string
+    mov rsi, newline_str
+    call print_string
+    ret
+
+str_line_eq:
+    push rsi
+    push rdi
+    push rdx
+.sle_loop:
+    mov al, [rdi]
+    mov dl, [rsi]
+    cmp dl, 10
+    je .sle_check_term
+    cmp dl, 13
+    je .sle_check_term
+    cmp dl, 0
+    je .sle_check_term
+    cmp al, dl
+    jne .sle_ne
+    inc rsi
+    inc rdi
+    jmp .sle_loop
+.sle_check_term:
+    cmp byte [rdi], 0
+    je .sle_eq
+.sle_ne:
+    xor al, al
+    jmp .sle_out
+.sle_eq:
+    mov al, 1
+.sle_out:
+    pop rdx
+    pop rdi
+    pop rsi
+    ret
+
+str_next_line:
+.snl_loop:
+    mov al, [rsi]
+    cmp al, 0
+    je .snl_out
+    inc rsi
+    cmp al, 10
+    je .snl_out
+    cmp al, 13
+    je .snl_cr_check
+    jmp .snl_loop
+.snl_cr_check:
+    cmp byte [rsi], 10
+    jne .snl_out
+    inc rsi
+.snl_out:
     ret
 
 ; ------------------------------------------------------------
@@ -4181,6 +4481,7 @@ cmd_del:
     je .not_found
     mov r14, rax
     call fs_delete_tree          ; recurses for folders, deletes a single node for files
+    call maybe_auto_sync
     ; if we just deleted a mounted volume's root, drop that mount slot too
     xor r13, r13
 .clear_mount_loop:
@@ -4278,6 +4579,7 @@ cmd_rmv:
     je .rmv_ali_not_found
     mov rcx, rax
     mov byte [alias_used + rcx], 0
+    call aliases_persist
     ret
 .rmv_ali_not_found:
     mov rsi, msg_no_alias
@@ -4299,6 +4601,7 @@ cmd_rmv:
 .rmv_ali_all_ok:
     mov byte [auth_valid], 0
     call aliases_clear_all
+    call aliases_persist
     mov rsi, msg_aliases_cleared
     mov al, [cur_normal_attr]
     call print_string_attr
@@ -4736,6 +5039,7 @@ cmd_rname:
     lea rdi, [node_name + rdi]
     mov rsi, arg2_buf
     call str_copy
+    call maybe_auto_sync
     ret
 .exists:
     mov rsi, msg_exists
@@ -4824,6 +5128,7 @@ cmd_cpy:
     mov al, ATTR_ERROR
     call print_string_attr
 .ret_ok:
+    call maybe_auto_sync
     ret
 .toolong:
     mov rsi, msg_name_too_long
@@ -4915,6 +5220,7 @@ cmd_mov:
     je .failed
     mov rax, r14
     call fs_delete_tree
+    call maybe_auto_sync
     ret
 .failed:
     cmp byte [fs_name_too_long], 1
@@ -4970,6 +5276,46 @@ kbd_poll:
     jne .no_key
     mov byte [kill_flag], 1
 .no_key:
+    ret
+
+; party_poll_kill_api: exposed to compiled .run programs at
+; [kernel_api_table+0x20]. Called once per while(true) iteration so an
+; otherwise-unbreakable loop can be stopped from outside it.
+; Compiled .run code keeps its only persistent state in rdi (the api
+; table pointer), so this preserves every register except rax rather
+; than trusting kbd_poll's (and mouse_byte's) clobber list to stay rdi/
+; rsi-safe forever.
+; Out: al = 1 if the running program should stop (Esc pressed, or
+;      killed via 'prs kill <pid/name>'), 0 to keep going.
+party_poll_kill_api:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    call kbd_poll
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    movzx eax, byte [kill_flag]
     ret
 
 ; ============================================================
@@ -5194,7 +5540,9 @@ cmd_rr:
 ;  Usage:
 ;    prs                  - list processes
 ;    prs kill <id>        - kill process by PID
-;    prs kill rushrun     - kill the rushrun process
+;    prs kill <name>      - kill process by its name in 'prs' (e.g.
+;                            "run" for a running .run program), or
+;                            "rushrun" for an rr script (legacy alias)
 ; ============================================================
 cmd_prs:
     ; Check if arg1 is "kill"
@@ -5220,7 +5568,7 @@ cmd_prs:
     mov rsi, arg2_buf
     call parse_int
     cmp cl, 1
-    jne .bad_kill_arg
+    jne .kill_by_name
 
     ; Search for process with this PID
     mov r12, rax                    ; target PID
@@ -5274,6 +5622,39 @@ cmd_prs:
     mov al, [cur_normal_attr]
     call print_string_attr
     mov rsi, str_rushrun
+    call print_string
+    mov rsi, newline_str
+    call print_string
+    ret
+
+.kill_by_name:
+    ; arg2 wasn't "rushrun" and isn't a PID - try matching it against
+    ; any currently-running process's actual stored name (e.g. "run",
+    ; the process a compiled .run program registers).
+    cmp byte [arg2_buf], 0
+    je .bad_kill_arg
+    xor r13, r13
+.prs_find_name:
+    cmp r13, MAX_PROCESSES
+    jae .kill_not_found
+    cmp byte [proc_state + r13], 0
+    je .name_next
+    mov rax, r13
+    imul rax, 32
+    lea rdi, [proc_name + rax]
+    mov rsi, arg2_buf
+    call str_eq
+    cmp al, 1
+    je .kill_found_name
+.name_next:
+    inc r13
+    jmp .prs_find_name
+.kill_found_name:
+    mov byte [kill_flag], 1
+    mov rsi, msg_prs_killed
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    mov rsi, arg2_buf
     call print_string
     mov rsi, newline_str
     call print_string
@@ -5648,6 +6029,10 @@ alias_store:
     mov rsi, ali_body_tmp
     call str_copy
 
+    cmp byte [alias_loading], 1
+    je .as_ret                ; being restored from alias.sly at boot - don't re-write it
+    call aliases_persist
+
 .as_ret:
     pop rdi
     pop rsi
@@ -5847,6 +6232,156 @@ aliases_clear_all:
     pop r8
     pop rdi
     pop rcx
+    pop rax
+    ret
+
+; aliases_persist: serializes every currently-defined alias as a plain
+; text "ali <name> <commands>" line (the exact syntax that defines it -
+; so the file doubles as a script alias_load can just re-parse) into
+; /home/sys/alias.sly, creating the file if it doesn't exist yet.
+; Writing to a node only updates the in-memory filesystem tree; the
+; actual disk write still goes through maybe_auto_sync/fs_save like
+; everything else, so this respects the 'autosync off' setting too.
+aliases_persist:
+    push rax
+    push rbx
+    push rcx
+    push rsi
+    push rdi
+    push r13
+
+    mov byte [alias_sly_buf], 0
+    xor r13, r13
+.ap_loop:
+    cmp r13, MAX_ALIASES
+    jae .ap_built
+    cmp byte [alias_used + r13], 0
+    je .ap_next
+    lea rdi, [alias_sly_buf]
+    mov rsi, str_ali_line_prefix   ; "ali "
+    call str_append
+    mov rax, r13
+    imul rax, ALIAS_NAME_LEN
+    lea rsi, [alias_names + rax]
+    lea rdi, [alias_sly_buf]
+    call str_append
+    lea rdi, [alias_sly_buf]
+    mov rsi, str_single_space
+    call str_append
+    mov rax, r13
+    imul rax, ALIAS_BODY_LEN
+    lea rsi, [alias_bodies + rax]
+    lea rdi, [alias_sly_buf]
+    call str_append
+    lea rdi, [alias_sly_buf]
+    mov rsi, newline_str
+    call str_append
+.ap_next:
+    inc r13
+    jmp .ap_loop
+.ap_built:
+    xor rax, rax
+    mov rsi, str_sys_name
+    mov r10, 1
+    call fs_find_child
+    cmp rax, -1
+    je .ap_out                      ; no /home/sys somehow - nothing to write to
+    mov rbx, rax
+    mov rax, rbx
+    mov rsi, str_alias_sly_name
+    mov r10, 2
+    call fs_find_child
+    cmp rax, -1
+    jne .ap_have_node
+    mov rax, rbx
+    mov rsi, str_alias_sly_name
+    mov r10, 2
+    call fs_create_node
+    cmp rax, -1
+    je .ap_out
+.ap_have_node:
+    lea rsi, [alias_sly_buf]
+    call fs_write_file
+    call maybe_auto_sync
+.ap_out:
+    pop r13
+    pop rdi
+    pop rsi
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; aliases_load: called once at boot (after the filesystem is available)
+; to restore aliases saved by aliases_persist in a previous session.
+; Reads /home/sys/alias.sly and feeds each line through the same
+; try_handle_ali_line parser interactive "ali ..." typing uses, so the
+; on-disk format and the live command can never drift apart. Sets
+; alias_loading so alias_store doesn't immediately re-persist every
+; single line it's busy restoring.
+aliases_load:
+    push rax
+    push rbx
+    push rcx
+    push rsi
+    push rdi
+    push r12
+
+    xor rax, rax
+    mov rsi, str_sys_name
+    mov r10, 1
+    call fs_find_child
+    cmp rax, -1
+    je .al_out
+    mov rbx, rax
+    mov rax, rbx
+    mov rsi, str_alias_sly_name
+    mov r10, 2
+    call fs_find_child
+    cmp rax, -1
+    je .al_out
+
+    lea rdi, [alias_sly_buf]
+    call fs_read_file
+
+    mov byte [alias_loading], 1
+    lea r12, [alias_sly_buf]
+.al_line_loop:
+    cmp byte [r12], 0
+    je .al_done
+    mov rdi, line_buf
+    xor rcx, rcx
+.al_copy_loop:
+    mov al, [r12]
+    cmp al, 0
+    je .al_line_end
+    cmp al, 10
+    je .al_line_end
+    cmp rcx, LINE_MAX-1
+    jae .al_line_end
+    mov [rdi], al
+    inc rdi
+    inc rcx
+    inc r12
+    jmp .al_copy_loop
+.al_line_end:
+    mov byte [rdi], 0
+    cmp byte [r12], 10
+    jne .al_no_nl
+    inc r12
+.al_no_nl:
+    cmp byte [line_buf], 0
+    je .al_line_loop
+    call try_handle_ali_line
+    jmp .al_line_loop
+.al_done:
+    mov byte [alias_loading], 0
+.al_out:
+    pop r12
+    pop rdi
+    pop rsi
+    pop rcx
+    pop rbx
     pop rax
     ret
 
@@ -6130,6 +6665,135 @@ fs_init:
     mov rcx, MAX_MOUNTS*32
     xor al, al
     rep stosb
+    call ensure_sys_folder
+    ret
+
+ensure_sys_folder:
+    push rax
+    push rbx
+    push rsi
+    push rdi
+    push r10
+    mov rax, 0
+    mov rsi, str_sys_name
+    mov r10, 1
+    call fs_find_child
+    cmp rax, -1
+    jne .sys_exists
+    mov rax, 0
+    mov rsi, str_sys_name
+    mov r10, 1
+    call fs_create_node
+    cmp rax, -1
+    je .done
+    mov rbx, rax
+    jmp .create_files
+.sys_exists:
+    mov rbx, rax
+.create_files:
+    mov rax, rbx
+    mov rsi, str_alias_sly_name
+    mov r10, 2
+    call fs_find_child
+    cmp rax, -1
+    jne .check_sysconfig
+    mov rax, rbx
+    mov rsi, str_alias_sly_name
+    mov r10, 2
+    call fs_create_node
+    cmp rax, -1
+    je .check_sysconfig
+    mov rax, rax
+    mov rsi, str_alias_sly_content
+    call fs_write_file
+.check_sysconfig:
+    mov rax, rbx
+    mov rsi, str_sysconfig_name
+    mov r10, 2
+    call fs_find_child
+    cmp rax, -1
+    jne .done
+    mov rax, rbx
+    mov rsi, str_sysconfig_name
+    mov r10, 2
+    call fs_create_node
+    cmp rax, -1
+    je .done
+    mov rax, rax
+    mov rsi, str_sysconfig_content
+    call fs_write_file
+.done:
+    pop r10
+    pop rdi
+    pop rsi
+    pop rbx
+    pop rax
+    ret
+
+check_node_in_sys:
+    push rbx
+    push rcx
+    push rdx
+    push rax
+    mov rax, 0
+    mov rsi, str_sys_name
+    mov r10, 1
+    call fs_find_child
+    mov rdx, rax
+    pop rax
+    cmp rdx, -1
+    je .not_in_sys
+.walk_loop:
+    cmp rax, 0xFFFF
+    je .not_in_sys
+    cmp rax, 0
+    je .not_in_sys
+    cmp rax, rdx
+    je .in_sys
+    movzx rax, word [node_parent + rax*2]
+    jmp .walk_loop
+.in_sys:
+    mov al, 1
+    jmp .out
+.not_in_sys:
+    xor al, al
+.out:
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+check_target_sys_auth:
+    push rax
+    push rsi
+    push rdi
+    push rbx
+    mov rax, r11
+    call check_node_in_sys
+    cmp al, 1
+    je .check_auth_flag
+    cmp r11, 0
+    jne .allowed
+    mov rsi, leaf1_buf
+    mov rdi, str_sys_name
+    call str_eq
+    cmp al, 1
+    jne .allowed
+.check_auth_flag:
+    cmp byte [auth_valid], 1
+    je .allowed
+    mov rsi, msg_auth_required
+    mov al, ATTR_ERROR
+    call print_string_attr
+    mov rax, 1
+    jmp .out
+.allowed:
+    xor rax, rax
+.out:
+    pop rbx
+    pop rdi
+    pop rsi
+    pop rax
     ret
 
 ; fs_find_child: rax=parent_idx, rsi=name, r10=type filter (-1 = any)
@@ -6408,6 +7072,137 @@ fs_write_file:
     pop rcx
     pop rbx
     pop rax
+    ret
+
+; fs_write_binary_file: rax = file node index, rsi = buffer ptr, rcx = length in bytes.
+; Writes arbitrary binary data across the file's chain.
+fs_write_binary_file:
+    mov [node_bin_len + rax*4], ecx
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push r8
+    push r9
+    mov rbx, rax
+    mov r8, rsi
+    mov r9, rcx
+.wb_loop:
+    test r9, r9
+    jle .wb_finish
+    mov rdi, rbx
+    imul rdi, CONTENT_LEN
+    lea rdi, [node_content + rdi]
+    xor rcx, rcx
+.wb_copy_byte:
+    test r9, r9
+    jle .wb_chunk_done
+    cmp rcx, CONTENT_LEN - 1
+    jae .wb_need_next
+    mov al, [r8]
+    mov [rdi + rcx], al
+    inc r8
+    dec r9
+    inc rcx
+    jmp .wb_copy_byte
+.wb_chunk_done:
+    mov byte [rdi + rcx], 0
+    jmp .wb_finish
+.wb_need_next:
+    mov byte [rdi + rcx], 0
+    movzx rdx, word [node_next + rbx*2]
+    cmp rdx, 0xFFFF
+    jne .wb_use_next
+    push rsi
+    push r8
+    push r9
+    mov rax, rbx
+    mov rsi, empty_str
+    mov r10, NODE_TYPE_CHAIN
+    call fs_create_node
+    pop r9
+    pop r8
+    pop rsi
+    cmp rax, -1
+    je .wb_no_space
+    mov rdx, rax
+    mov [node_next + rbx*2], dx
+.wb_use_next:
+    mov rbx, rdx
+    jmp .wb_loop
+.wb_finish:
+    movzx rcx, word [node_next + rbx*2]
+    cmp rcx, 0xFFFF
+    je .wb_clean
+    mov [node_next + rbx*2], word 0xFFFF
+    mov rax, rcx
+    call fs_free_chain
+.wb_clean:
+    clc
+    jmp .wb_out
+.wb_no_space:
+    stc
+.wb_out:
+    pop r9
+    pop r8
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; fs_read_binary_file: rax = file node index, rdi = destination buffer.
+; Binary-safe counterpart to fs_read_file: copies back the exact byte
+; count fs_write_binary_file recorded for this node, instead of stopping
+; at the first 0x00 byte - real binary content (e.g. a compiled .run
+; program) contains plenty of those and isn't just a C string.
+; Out: rax = number of bytes copied. Destination buffer must hold that
+; many bytes (same buffers already sized for fs_read_file are fine -
+; compiled programs are far smaller than fs_io_buf/EDIT_MAX).
+fs_read_binary_file:
+    push rbx
+    push rcx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    mov r8d, [node_bin_len + rax*4]   ; r8 = bytes remaining to copy
+    mov r9, r8                        ; r9 = total, for the return value
+    mov rbx, rax                      ; current node
+.rb_loop:
+    test r8, r8
+    jle .rb_done
+    mov rsi, rbx
+    imul rsi, CONTENT_LEN
+    lea rsi, [node_content + rsi]
+    xor rcx, rcx
+.rb_copy_byte:
+    test r8, r8
+    jle .rb_done
+    cmp rcx, CONTENT_LEN - 1
+    jae .rb_next_node
+    mov al, [rsi + rcx]
+    mov [rdi], al
+    inc rdi
+    inc rcx
+    dec r8
+    jmp .rb_copy_byte
+.rb_next_node:
+    movzx rax, word [node_next + rbx*2]
+    cmp rax, 0xFFFF
+    je .rb_done                       ; chain ended early - shouldn't happen
+    mov rbx, rax
+    jmp .rb_loop
+.rb_done:
+    mov rax, r9
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rcx
+    pop rbx
     ret
 
 ; fs_free_chain: rax = node index. Frees every continuation node linked after
@@ -12398,6 +13193,9 @@ cmd_write:
     cmp rax, -1
     je .cw_bad_path
     mov r11, rax                  ; parent dir the file goes in
+    call check_target_sys_auth
+    cmp rax, 1
+    je .cw_bad_path
     ; an existing FILE by that name gets its content overwritten
     mov rax, r11
     mov rsi, leaf1_buf
@@ -12420,11 +13218,13 @@ cmd_write:
     je .cw_full
     lea rsi, [arg2_buf]
     call fs_write_file
+    call maybe_auto_sync
     ret
 .cw_overwrite:
     ; rax = existing file node index, replace its content
     lea rsi, [arg2_buf]
     call fs_write_file
+    call maybe_auto_sync
     ret
 .cw_exists:
     mov rsi, msg_exists
@@ -13977,9 +14777,9 @@ wig_str_buf:   times 16 db 0    ; scratch for the wig clock widget
 wig_last_sec:  db 0             ; last second the widget drew (redraw gate)
 
 banner:
-    db "ShellyForever v0.1.7 -- 'help' for commands", 10, 0
+    db "ShellyForever v0.1.8 -- 'help' for commands", 10, 0
 build_stamp:
-    db "build 20260808a -- browse links + keypad support", 10, 0
+    db "build 20260809a -- sysconfig persistence + .run executables", 10, 0
 
 prompt_head: db "rush>", 0
 prompt_tail: db ": ", 0
@@ -14000,6 +14800,25 @@ str_clear:  db "wipe", 0
 str_help:   db "help", 0
 str_reboot: db "rboot", 0
 str_sync:   db "sync", 0
+str_autosync: db "autosync", 0
+str_on:     db "on", 0
+str_off:    db "off", 0
+auto_sync_enabled: db 1
+msg_autosync_status: db "auto-sync: ", 0
+msg_autosync_enabled: db "auto-sync enabled.", 10, 0
+msg_autosync_disabled: db "auto-sync disabled.", 10, 0
+str_run:    db "run", 0
+str_run_magic1: db "[ShellyForever]", 0
+str_run_magic2: db "[run 0.1]", 0
+str_run_magic3: db "program = v1", 0
+msg_run_usage: db "run: usage: run <file.run>", 10, 0
+msg_run_badheader: db "run: error: invalid or missing RUN 0.1 header", 10, 0
+msg_run_running: db "run ", 0
+msg_run_toomany: db "run: too many processes running", 10, 0
+str_run_procname: db "run", 0
+
+ALIGN 8
+kernel_api_table: times 40 db 0    ; slot 4 (offset 0x20) = party_poll_kill_api
 str_calc:   db "calc", 0
 str_edit:   db "edit", 0
 str_del:    db "del", 0
@@ -14015,6 +14834,11 @@ str_cpy:    db "cpy", 0
 str_mov:    db "mov", 0
 str_eq_sign: db "=", 0
 str_home_name: db "home", 0
+str_sys_name:   db "sys", 0
+str_alias_sly_name: db "alias.sly", 0
+str_alias_sly_content: db 0
+str_sysconfig_name: db "sysconfig.sly", 0
+str_sysconfig_content: db "mouse = off", 10, "internet = on", 10, "auto_sync = on", 10, 0
 str_auth:   db "auth", 0
 str_vars:   db "vars", 0
 str_ali:    db "ali", 0
@@ -14746,6 +15570,14 @@ node_parent:  times MAX_NODES dw 0
 node_name:    times MAX_NODES*NAME_LEN db 0
 node_content: times MAX_NODES*CONTENT_LEN db 0
 node_next:    times MAX_NODES dw 0xFFFF   ; 0xFFFF = end of chain (or no chain)
+; node_bin_len: exact byte count for files written via fs_write_binary_file,
+; recorded on the file's head node only. Lets fs_read_binary_file copy back
+; the precise length instead of guessing from NUL bytes (which real binary
+; content - e.g. compiled .run programs - can legitimately contain).
+; NOTE: not part of the on-disk SFFS format yet, so this resets on
+; remount/reboot - a freshly compiled .run works immediately, but won't
+; survive a reboot until this is added to the persisted layout too.
+node_bin_len: times MAX_NODES dd 0
 
 fs_loaded_from_disk: db 0
 fs_disk_available:   db 1     ; optimistic default; cleared on first ATA failure
@@ -15011,6 +15843,11 @@ ali_name_tmp: times ALIAS_NAME_LEN db 0   ; scratch: name parsed by try_handle_a
 ali_body_tmp: times ALIAS_BODY_LEN db 0   ; scratch: body parsed by try_handle_ali_line
 alias_match_idx: db 0                     ; set by dispatch before jmp cmd_alias_invoke
 alias_depth:     db 0                     ; nested alias-invocation depth (recursion guard)
+alias_loading:   db 0                     ; 1 while aliases_load is restoring from alias.sly
+ALIGN 8
+alias_sly_buf: times MAX_ALIASES*(ALIAS_NAME_LEN+ALIAS_BODY_LEN+8) db 0   ; serialized alias.sly content
+str_ali_line_prefix: db "ali ", 0
+str_single_space:    db " ", 0
 
 ; --- calc evaluator scratch ---
 ALIGN 8
