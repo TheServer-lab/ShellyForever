@@ -121,15 +121,31 @@ Milestone D - HTTP take / give                       -> DONE
    Assembled cleanly with nasm -f bin and the full image (build.sh)
    builds without error.
 
+Milestone E - Text web browser (browse)                 -> DONE
+   browse <url> is a Lynx-style plain-text browser built on the
+   Milestone D http/tcp stack. Fetches an HTTP page, strips the HTML
+   to readable text (staged via http_rx_buf, compacted in-place into
+   tcp_rx_buf), collects <a href> links, and renders each as an [N]
+   marker. A digit (or keypad digit) + Enter follows that link; [b]ack
+   / [f]wd walk a session history (16 pages), [a]dd-bm / [l]ist-bm are
+   session bookmarks, [t]save writes the current page's raw body to a
+   file, [q]uit returns to the shell. BROWSE_LINKS_MAX=64 links/page,
+   BROWSE_PAGE_MAX ~1.5 KB of page text.
+
+   Verified end-to-end in QEMU (WHPX, slirp user networking) against
+   Python's http.server: browse a page with links, press a number +
+   Enter, land on the target page. Keypad digits + keypad Enter work
+   throughout the browser (keypad scancode support added for this).
+
 Budget, actual vs planned:
    Planned: KERNEL_SECTORS 260 -> 290, FS_LBA_START stays 300.
-   Actual: KERNEL_SECTORS is at 404 (Milestone B's NIC/stack code ran
-   well past the 290 estimate and C grew it further) and FS_LBA_START
-   is at 460 (bumped from 400). Still comfortably inside a 2 MB
-   image.
+   Actual: KERNEL_SECTORS is at 486 (Milestones B/C grew it past the
+   estimate, D pushed it further, and E's browser code bumped it from
+   440 -> 480 -> 486) and FS_LBA_START is at 500 (bumped from 400).
+   Still comfortably inside a 2 MB image.
 
-README.md has been updated to document Milestones A, B, and C as
-shipped. D (take/give) stays out of the README until it's real.
+README.md has been updated to document Milestones A, B, C, D, and E
+as shipped.
 =====================================================================
 
 Final Plan: Multi-block files + networking + HTTP get/put (v0.2.0)

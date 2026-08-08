@@ -4,6 +4,63 @@ All notable changes to ShellyForever are documented here. The format is
 loosely based on [Keep a Changelog](https://keepachangelog.com/); the
 project does not yet follow strict SemVer.
 
+## [0.1.7] - 2026-08-08
+
+### Added
+
+- **`browse <url>` — a text-based web browser (`browse.asm`)**. A
+  Lynx-style plain-text browser built on the Milestone D http/tcp stack:
+  fetches an HTTP page, strips the HTML to readable text (in-place,
+  staged via `http_rx_buf`), collects `<a href>` links, and renders them
+  as `[N]` markers in the text. Pressing a number follows that link;
+  `[b]ack` / `[f]wd` move through a session history, `[a]dd-bm` /
+  `[l]ist-bm` handle session bookmarks, `[t]save` saves the current
+  page's raw body to a file, `[q]uit` returns to the shell. Page text
+  lives in `tcp_rx_buf` (up to `BROWSE_PAGE_MAX`).
+- **Keypad scancode support** — the number-pad digits `0`-`9`
+  (scancodes 0x47-0x53) now map to their ASCII digits in both `kbd_unshift`
+  and `kbd_shift`, and the `0xE0`-prefixed extended keypad keys work too:
+  keypad Enter, keypad `/`, `-`, and `+` are translated and returned
+  through the normal keyboard path. This makes `browse` fully usable from
+  the keypad (digits + Enter follow links).
+- **Browse-aware Ctrl+Up / Ctrl+Down routing** — while `browse` is the
+  active input loop (`browse_active` set), Ctrl+Up/Down no longer hijack
+  the keys for scrollback; the browser keeps them. Scrollback Ctrl+Up/Down
+  still works outside the browser.
+- **`browse` help text** — listed in the command table and `help <cmd>`.
+
+### Changed
+
+- Banner bumped to `v0.1.7`.
+- `KERNEL_SECTORS` bumped 440 → 480 for the browser (Milestone E), then
+  to 486 when the browse render/link-marker fixes grew it again (`boot.asm`).
+
+### Fixed
+
+- **Browser link navigation** — following a numbered link now
+  navigates correctly (buffer pointers are advanced on the same register
+  the caller keeps using, so the fetched page isn't written over the URL
+  being resolved). Link-following verified end-to-end in QEMU: browsing a
+  page with links and pressing a number + Enter lands on the target page.
+
+## [0.1.6] - 2026-08-06
+
+### Fixed
+
+- **`rtc_sec_now` torn-read fix** — the RTC seconds read was neither
+  guarded against a mid-update transition (an update could start between
+  address-select and data-read, returning a torn byte) nor converted from
+  BCD, so elapsed-time math in the network wait-loop error paths could
+  come out wrong once a start/end reading straddled a tens-digit boundary
+  (a real ~5-6s wait was reported as `elapsed: 0`). Now it double-reads
+  with a UIP guard around each read and retries when the two disagree,
+  and converts BCD exactly like `rtc_update` (only when status register B
+  bit 2 is actually clear).
+
+### Changed
+
+- Banner bumped to `v0.1.6`.
+
 ## [0.1.5] - 2026-08-07
 
 ### Added

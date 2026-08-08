@@ -433,43 +433,55 @@ browse_strip_html:
     mov r11, rsi
     inc r11                     ; r11 = position after ';'
     lea rsi, [browse_tag_buf]
+    push rdi
     lea rdi, [ent_amp]
     call str_eq
+    pop rdi
     cmp al, 1
     jne .ent_t_lt
     mov al, '&'
     jmp .ent_have
 .ent_t_lt:
+    push rdi
     lea rdi, [ent_lt]
     call str_eq
+    pop rdi
     cmp al, 1
     jne .ent_t_gt
     mov al, '<'
     jmp .ent_have
 .ent_t_gt:
+    push rdi
     lea rdi, [ent_gt]
     call str_eq
+    pop rdi
     cmp al, 1
     jne .ent_t_quot
     mov al, '>'
     jmp .ent_have
 .ent_t_quot:
+    push rdi
     lea rdi, [ent_quot]
     call str_eq
+    pop rdi
     cmp al, 1
     jne .ent_t_apos
     mov al, '"'
     jmp .ent_have
 .ent_t_apos:
+    push rdi
     lea rdi, [ent_apos]
     call str_eq
+    pop rdi
     cmp al, 1
     jne .ent_t_nbsp
     mov al, 39
     jmp .ent_have
 .ent_t_nbsp:
+    push rdi
     lea rdi, [ent_nbsp]
     call str_eq
+    pop rdi
     cmp al, 1
     jne .ent_t_num
     mov al, ' '
@@ -573,19 +585,25 @@ browse_strip_html:
     mov r12, rsi
     ; script / style -> skip raw content until the matching close tag
     lea rsi, [browse_tag_buf]
+    push rdi
     lea rdi, [str_script]
     call str_eq
+    pop rdi
     cmp al, 1
     je .skip_raw
     lea rsi, [browse_tag_buf]
+    push rdi
     lea rdi, [str_style]
     call str_eq
+    pop rdi
     cmp al, 1
     je .skip_raw
     ; anchor?
     lea rsi, [browse_tag_buf]
+    push rdi
     lea rdi, [str_a]
     call str_eq
+    pop rdi
     cmp al, 1
     je .anchor_tag
     ; block tag?
@@ -670,8 +688,10 @@ browse_strip_html:
     cmp r13d, eax
     jne .skip_raw_cand_no
     lea rsi, [browse_tag_buf2]
+    push rdi
     lea rdi, [browse_tag_buf]
     call str_eq
+    pop rdi
     cmp al, 1
     jne .skip_raw_cand_no
     pop rdx                     ; discard saved rsi - resume after the close tag name

@@ -1,6 +1,6 @@
 # ShellyForever
 
-**Version:** 0.1.6
+**Version:** 0.1.7
 
 A 64-bit shell-based OS written entirely in x86-64 NASM assembly, from scratch —
 no C, no BIOS libraries beyond boot-time disk/keyboard calls, no existing kernel.
@@ -28,6 +28,9 @@ no C, no BIOS libraries beyond boot-time disk/keyboard calls, no existing kernel
     (legacy), Intel e1000, and Realtek RTL8168/8169/8161 ("PCIe GBE
     Family Controller") NICs, plus Ethernet II + ARP + IPv4 + ICMP echo +
     UDP + a DNS client. See "Networking" below.
+  - A text-based web browser (`browse`) that fetches HTTP pages, strips
+    the HTML to readable text, and follows links. See "The browser:
+    `browse`" below.
 
 ## Commands implemented
 
@@ -85,6 +88,7 @@ no C, no BIOS libraries beyond boot-time disk/keyboard calls, no existing kernel
 | `tcp` | `tcp 10.0.2.2 8000` | open a TCP connection, send a payload, and print the reply |
 | `take` | `take http://10.0.2.2:8000/notes.txt notes.txt` | HTTP GET a file from a server, save to local file |
 | `give` | `give http://10.0.2.2:8000/upload notes.txt` | HTTP POST a local file to a server endpoint |
+| `browse` | `browse http://10.0.2.2:8000/` | fetch a page over HTTP, strip HTML to text, follow `[N]` links, back/forward/bookmarks (see below) |
 
 ### Line editing: history, tab completion, and scrollback
 
@@ -660,6 +664,49 @@ Only plain HTTP is supported (no HTTPS). The response body is extracted
 by scanning for the blank line (`\r\n\r\n`) after the HTTP response headers,
 so it works with most HTTP/1.0 and HTTP/1.1 servers.
 
+### The browser: `browse`
+
+`browse <url>` opens a Lynx-style text web browser. It fetches the page
+over HTTP (the Milestone D http/tcp stack), strips the HTML to readable
+text, and collects every `<a href>` link, rendered as `[N]` markers inline.
+Keys while viewing a page:
+
+- **a digit** (`1`-`9`, also the keypad) — follow link `[N]`
+- **Enter** — follow the selected/first link
+- **`b`** — back (session history, up to `BROWSE_HIST_MAX` pages)
+- **`f`** — forward
+- **`a`** — add the current page to session bookmarks
+- **`l`** — list bookmarks (a number follows one)
+- **`t`** — save the current page's raw body to a file (take-style)
+- **`q`** — quit back to the shell
+
+```
+rush>/home: browse http://10.0.2.2:8000/
+  ShellyForever Browser    URL:
+Welcome
+
+Welcome to the ShellyForever test site.
+
+[1]About
+
+[b]ack [f]wd [a]dd-bm [l]ist-bm [t]save [q]uit
+```
+
+The keypad digits and keypad Enter work too, so the whole browser is
+usable from the number pad. Page text is capped at `BROWSE_PAGE_MAX`
+(~1.5 KB, the `tcp_rx_buf`); up to `BROWSE_LINKS_MAX` (64) links per
+page and 16 history/bookmark entries.
+
+To test locally:
+
+```bash
+# host:
+python -m http.server 8000 --bind 127.0.0.1
+
+# ShellyForever (QEMU):
+browse http://10.0.2.2:8000/
+```
+
 ## Shutdown (`sdown`)
 
 There's no ACPI table parsing in this kernel, so `sdown` doesn't negotiate a
@@ -702,22 +749,21 @@ message and then nothing, which is your cue to power off manually.
 - Persistence is whole-table snapshotting (like a save file), not an
   incremental/journaled on-disk format — simple and robust for this scale,
   but a `sync` rewrites the whole reserved region every time.
-- `kernel.bin` occupies LBA 1..404 — `KERNEL_SECTORS` in `boot.asm` has
-  already been bumped twice, from its original 199, to make room for the
-  filesystem chaining and networking code. If you add enough new code to
-  cross that budget again, bump `KERNEL_SECTORS` once more — it's a
-  one-line change, but the bootloader will silently load a truncated kernel
-  if you forget, which looks like an unrelated crash. (The on-disk SFFS
-  region now starts at LBA 400 — bumped from 200 for the same reason — so
+- `kernel.bin` occupies LBA 1..486 — `KERNEL_SECTORS` in `boot.asm` has
+  already been bumped several times, from its original 199, to make room
+  for the filesystem chaining, networking, and browser code. If you add
+  enough new code to cross that budget again, bump `KERNEL_SECTORS` once
+  more — it's a one-line change, but the bootloader will silently load a
+  truncated kernel if you forget, which looks like an unrelated crash.
+  (The on-disk SFFS region now starts at LBA 500 — bumped from 400 — so
   keep the kernel's reserved region clear of that.)
 
 ## Natural next steps, in order of payoff
 
-1. **`take`/`give` (HTTP get/put)** — the raw `tcp` command already does a
-   real client exchange end-to-end; wrapping it in `take http://host/path
-   <file>` and `give http://host/upload <file>` (HTTP/1.0 GET/POST with
-   content-length and response-header parsing) would let you actually move
-   files over the network. See `milestones.txt` for the in-progress plan.
+1. **Browser polish** — the `browse` command already fetches pages and
+   follows links; session-only bookmarks could become persistent files,
+   and a larger page buffer (currently ~1.5 KB, capped by `tcp_rx_buf`)
+   would render longer pages.
 2. **Path arguments** for `cf`/`cpy`/`mov`/`rname` (e.g. `cpy docs/notes.txt ..`)
    instead of current-folder-only operations.
 3. **Autosave on mutation** instead of requiring explicit `sync`/`rboot`/`sdown`,
@@ -729,6 +775,12 @@ message and then nothing, which is your cue to power off manually.
 
 ## What's new
 
+- **`browse <url>` — a text-based web browser (v0.1.7)** — fetches an HTTP
+  page, strips the HTML to readable text, and renders links as `[N]`
+  markers you can follow with a digit or keypad digit + Enter. Back/forward
+  history, session bookmarks (`[a]dd-bm` / `[l]ist-bm`), `[t]save` (writes
+  the raw page body to a file), and `[q]uit`. Keypad digits / keypad Enter
+  work throughout the browser. See "The browser: `browse`" above.
 - **HTTP `take` / `give` (v0.1.5)** — `take <url> <file>` does an HTTP/1.0
   GET and saves the response body to a local file in the current directory;
   `give <url> <file>` reads a local file and POSTs it to the URL. Both

@@ -13096,7 +13096,27 @@ get_char:
     je .ext_down
     cmp bl, 0x1D                 ; right Ctrl make
     je .ext_ctrl_make
+    cmp bl, 0x1C                 ; keypad Enter
+    je .ext_kp_enter
+    cmp bl, 0x35                 ; keypad /
+    je .ext_kp_slash
+    cmp bl, 0x4A                 ; keypad -
+    je .ext_kp_minus
+    cmp bl, 0x4E                 ; keypad +
+    je .ext_kp_plus
     jmp .wait                    ; ignore any other extended key
+.ext_kp_enter:
+    mov al, 13
+    jmp .snap_and_return
+.ext_kp_slash:
+    mov al, '/'
+    jmp .snap_and_return
+.ext_kp_minus:
+    mov al, '-'
+    jmp .snap_and_return
+.ext_kp_plus:
+    mov al, '+'
+    jmp .snap_and_return
 .ext_break:
     and bl, 0x7F
     cmp bl, 0x1D
@@ -13111,11 +13131,15 @@ get_char:
 .ext_up:
     cmp byte [ctrl_state], 0
     je .return_up
+    cmp byte [browse_active], 0
+    jne .return_up
     call scrollback_view_up
     jmp .wait
 .ext_down:
     cmp byte [ctrl_state], 0
     je .return_down
+    cmp byte [browse_active], 0
+    jne .return_down
     call scrollback_view_down
     jmp .wait
 .return_up:
@@ -13953,9 +13977,9 @@ wig_str_buf:   times 16 db 0    ; scratch for the wig clock widget
 wig_last_sec:  db 0             ; last second the widget drew (redraw gate)
 
 banner:
-    db "ShellyForever v0.1.6 -- 'help' for commands", 10, 0
+    db "ShellyForever v0.1.7 -- 'help' for commands", 10, 0
 build_stamp:
-    db "build 20260806c -- rtc_sec_now torn-read fix", 10, 0
+    db "build 20260808a -- browse links + keypad support", 10, 0
 
 prompt_head: db "rush>", 0
 prompt_tail: db ": ", 0
@@ -14667,7 +14691,7 @@ help_dollar:
     db "  interactive prompt and when running an rr script.", 10, 0
 
 
-; --- scancode set 1 -> ascii tables (index = scancode, 0..0x39) ---
+; --- scancode set 1 -> ascii tables (index = scancode, 0..0x53) ---
 ALIGN 8
 kbd_unshift:
     db 0,27,'1','2','3','4','5','6','7','8'      ; 0x00-0x09
@@ -14678,6 +14702,8 @@ kbd_unshift:
     db 39,'`',0,'\'                                ; 0x28-0x2B
     db 'z','x','c','v','b','n','m',',','.','/'    ; 0x2C-0x35
     db 0,'*',0,' '                                 ; 0x36-0x39
+    times 0x47-0x3A db 0                           ; 0x3A-0x46 unused
+    db '7','8','9','-','4','5','6','+','1','2','3','0','.'  ; 0x47-0x53 keypad
 
 kbd_shift:
     db 0,27,'!','@','#','$','%','^','&','*'       ; 0x00-0x09
@@ -14688,6 +14714,8 @@ kbd_shift:
     db 34,'~',0,'|'                                ; 0x28-0x2B
     db 'Z','X','C','V','B','N','M','<','>','?'    ; 0x2C-0x35
     db 0,'*',0,' '                                 ; 0x36-0x39
+    times 0x47-0x3A db 0                           ; 0x3A-0x46 unused
+    db '7','8','9','-','4','5','6','+','1','2','3','0','.'  ; 0x47-0x53 keypad
 
 ; --- filesystem storage ---
 ; One flat node table shared by every mounted volume. The OS volume lives
