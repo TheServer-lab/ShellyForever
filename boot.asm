@@ -24,14 +24,22 @@ jmp start
 
 KERNEL_LOAD_SEG   equ 0x0000
 KERNEL_LOAD_OFF   equ 0x8000
-KERNEL_SECTORS    equ 486         ; how many 512B sectors to load (248.6KB). Bumped from
-                                  ; 440 to 480 for the browser (Milestone E), then to 486
-                                  ; when the browse render/link-marker fixes grew it again.
+KERNEL_SECTORS    equ 900         ; how many 512B sectors to load (450KB). Bumped from
+                                  ; 560 - the real kernel.bin (with party/tcp/http/browse/
+                                  ; mouse folded in) had grown to 842 sectors, so most of
+                                  ; boot.asm's load was silently truncating the kernel's
+                                  ; own tail data (including ata_port_base/ata_drive_sel/
+                                  ; fs_disk_available, which all landed around sector 616)
+                                  ; - those never got copied off disk, so the ATA driver
+                                  ; ran with a zeroed port base and "No disk detected"
+                                  ; even though the drive was fine. 900 gives real headroom
+                                  ; past the current 842-sector size.
                                   ; The CHS fallback reads at most 18
                                   ; sectors per BIOS call (not limited by al directly - see
                                   ; the .loop chunking below) and this total must stay clear
-                                  ; of the SFFS region at LBA 500 (see kernel.asm's
-                                  ; FS_LBA_START) and <= 2880 (media).
+                                  ; of the SFFS region - see kernel.asm's FS_LBA_START, and
+                                  ; leave real margin, not just enough for today's build -
+                                  ; and <= 2880 (media).
 
 ; ---- on-screen checkpoint markers ----
 ; Each stage of the real->protected->long mode transition writes one

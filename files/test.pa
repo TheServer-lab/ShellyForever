@@ -1,0 +1,18 @@
+vars x = 10
+vars y = 5
+
+func add(a, b) {
+return a + b
+}
+vars result = add (x, y)
+display "Party test"
+display result
+
+if (result >10) {
+display "result is grater than 10"
+} else {
+display "result is 10 or less"
+}
+while (false) {
+display "this should not appear"
+}

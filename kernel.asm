@@ -17,7 +17,14 @@ ATTR_PROMPT     equ 0x0E          ; yellow
 ATTR_ERROR      equ 0x0C          ; red
 ATTR_WIG        equ 0x0B          ; light cyan - used by the wig clock widget
 
-OS_NODES        equ 64              ; nodes per volume (each drive holds its own 64-node table)
+; SFFS v4 raises this from 64 to 256 (see the SFFS v4 block below) - the
+; old 64-node table was shared by folders, files, AND every chain
+; continuation node a file needed once its content passed 159 bytes, so a
+; handful of ordinary-sized files could exhaust it well before the disk
+; itself was anywhere near full ("error: filesystem is full" with tons of
+; free space left). v2/v3 disks (still readable) keep working exactly as
+; before; a sync upgrades them to v4 in place - see fs_layout_ver.
+OS_NODES        equ 256             ; nodes per volume (each drive holds its own node table)
 MAX_MOUNTS      equ 2               ; how many extra drives can be mounted at once
 
 ; AHCI (SATA) support: device ids 0-3 are still the legacy ATA PIO slots
@@ -28,7 +35,7 @@ MAX_MOUNTS      equ 2               ; how many extra drives can be mounted at on
 AHCI_MAX_PORTS  equ 4
 TOTAL_DEVICES   equ 4 + AHCI_MAX_PORTS
 VOL_NODES       equ OS_NODES        ; every volume, OS or mounted, is the same size
-MAX_NODES       equ OS_NODES * (1 + MAX_MOUNTS)   ; 192 = OS volume + 2 mounts
+MAX_NODES       equ OS_NODES * (1 + MAX_MOUNTS)   ; 768 = OS volume + 2 mounts
 NAME_LEN        equ 32
 CONTENT_LEN     equ 160
 LINE_MAX        equ 220
@@ -51,7 +58,7 @@ ALIAS_MAX_DEPTH equ 8          ; guards against an alias (in)directly invoking i
 PIPE_CAP_MAX    equ 192       ; max bytes captured from a "~" pipe's left side
 
 ; ------------------------------------------------------------------
-;  SFFS v3 -- ShellyForever File Storage format (on-disk layout).
+;  SFFS v4 -- ShellyForever File Storage format (on-disk layout).
 ;  Every drive (OS boot drive and any data drives) uses the same
 ;  fixed layout so any drive can be scanned, formatted, and mounted:
 ;
@@ -60,17 +67,41 @@ PIPE_CAP_MAX    equ 192       ; max bytes captured from a "~" pipe's left side
 ;    LBA  FS_LBA_START+1   : node_type[VOL_NODES]  (1 sector, padded)
 ;    LBA  FS_LBA_START+2   : node_parent[VOL_NODES] (1 sector, padded)
 ;    LBA  FS_LBA_START+3   : node_next[VOL_NODES]  (1 sector; 0xFFFF = no
-;                             continuation). v3 only - v2 has no next sector.
-;    LBA  FS_LBA_START+4.. : node_name[VOL_NODES*NAME_LEN] (4 sectors)
-;    LBA  FS_LBA_START+8.. : node_content[VOL_NODES*CONTENT_LEN] (20)
+;                             continuation). v3+ only - v2 has no next sector.
+;    LBA  FS_LBA_START+4.. : node_name[VOL_NODES*NAME_LEN]    (NAME_SECTORS)
+;    LBA  ..after name..   : node_content[VOL_NODES*CONTENT_LEN] (CONTENT_SECTORS)
 ;
 ;  A file whose content exceeds one 159-byte slot is stored as a chain:
 ;  the file's own node holds the first chunk, and its node_next points at
 ;  NODE_TYPE_CHAIN (type-3) continuation nodes, each holding the next 159
 ;  bytes and linked through their own node_next (0xFFFF terminates). Chain
 ;  nodes are invisible to path lookup, listing, and the allocator, and are
-;  freed along with the file. v2 volumes (no node_next sector, name LBA at
-;  +3 / content at +7) still load and read fine; a sync upgrades them to v3.
+;  freed along with the file.
+;
+;  *** Why v4 exists ***
+;  v2/v3 volumes had a hard VOL_NODES=64 ceiling, and that table was
+;  shared by folders, files, AND every chain continuation node. A single
+;  file bigger than 159 bytes already burns 2+ node slots, so it took
+;  surprisingly few real files (e.g. a compiler test fixture) to trip
+;  "error: filesystem is full" while the disk itself still had plenty of
+;  free sectors - the node *table*, not the disk, was what ran out.
+;  v4 keeps the exact same chain-of-nodes design (so all the code above
+;  that walks node_next doesn't change) and simply widens VOL_NODES to
+;  256, which needs bigger NAME/CONTENT regions - CONTENT_LBA is now
+;  computed from NAME_LBA+NAME_SECTORS instead of being hardcoded, so
+;  the two regions can never overlap as VOL_NODES changes again later.
+;  It also nudges EDIT_MAX (one file's max size) up from ~10KB to ~40KB
+;  as a side effect, since that's just VOL_NODES*CONTENT_LEN.
+;
+;  *** Backward compatibility ***
+;  v2 volumes (no node_next sector, name LBA at SUPER_LBA+3 / content at
+;  SUPER_LBA+7, 64 nodes) and v3 volumes (has node_next, but still the old
+;  64-node-sized name/content regions at OLD_NAME_LBA/OLD_CONTENT_LBA)
+;  both still load and read fine - see fs_layout_ver in vol_read. Loading
+;  either one leaves nodes 64..255 of that volume's slice explicitly
+;  cleared (free), so the moment you mkfl/mkf/edit again you're already
+;  using the bigger table; a sync then writes the volume back out in the
+;  current (v4) layout, upgrading it on disk permanently.
 ;
 ;  dscan probes all four ATA device slots for the magic, format writes
 ;  a fresh empty volume + label, and mount loads a volume's node table
@@ -78,22 +109,36 @@ PIPE_CAP_MAX    equ 192       ; max bytes captured from a "~" pipe's left side
 ;  The kernel occupies LBA 1..480 (KERNEL_SECTORS in boot.asm) - the
 ;  NIC/network stack (Milestone B), TCP engine (Milestone C) and the
 ;  browser (Milestone E) grew the image well past 460 - so the filesystem
-;  region starts at LBA 500 to stay clear of it.
+;  region starts at LBA 500 to stay clear of it. v4's bigger name/content
+;  regions need ~100 sectors per volume (was ~28) - make sure each disk
+;  image you build/attach has enough room past LBA 500 for that.
 ; ------------------------------------------------------------------
 FS_LBA_START    equ 500
-SFFS_VERSION    equ 3
-SFFS_VERSION_V2 equ 2               ; old format, still readable
+SFFS_VERSION    equ 4               ; current on-disk format (256-node volumes)
+SFFS_VERSION_V3 equ 3               ; old format (64-node volumes, has node_next) - still readable
+SFFS_VERSION_V2 equ 2               ; old, single-block format - still readable
 SUPER_LABEL_OFF equ 8               ; label lives at superblock offset 8..39
 SUPER_LBA       equ FS_LBA_START
 TYPE_LBA        equ SUPER_LBA + 1
 PARENT_LBA      equ SUPER_LBA + 2
 NEXT_LBA        equ SUPER_LBA + 3
 NAME_LBA        equ SUPER_LBA + 4
-CONTENT_LBA     equ SUPER_LBA + 8
-NAME_SECTORS    equ (VOL_NODES * NAME_LEN) / 512          ; 4
-CONTENT_SECTORS equ (VOL_NODES * CONTENT_LEN) / 512       ; 20
+NAME_SECTORS    equ (VOL_NODES * NAME_LEN) / 512          ; 16 (256 nodes * 32B / 512)
+CONTENT_LBA     equ NAME_LBA + NAME_SECTORS                ; computed, not hardcoded - see above
+CONTENT_SECTORS equ (VOL_NODES * CONTENT_LEN) / 512       ; 80 (256 nodes * 160B / 512)
 NODE_TYPE_CHAIN equ 3               ; continuation node in a file's content chain
-EDIT_MAX        equ VOL_NODES * CONTENT_LEN   ; max bytes one file can hold (64*160)
+
+; --- legacy v3 (64-node) on-disk geometry, needed only so vol_read can
+; still locate an old volume's name/content regions at their old fixed
+; offsets before it gets upgraded to v4 on the next sync. Do not use these
+; anywhere else - VOL_NODES/NAME_LBA/CONTENT_LBA above are the live ones. ---
+OLD_VOL_NODES       equ 64
+OLD_NAME_SECTORS    equ (OLD_VOL_NODES * NAME_LEN) / 512      ; 4
+OLD_CONTENT_SECTORS equ (OLD_VOL_NODES * CONTENT_LEN) / 512   ; 20
+OLD_NAME_LBA        equ SUPER_LBA + 4
+OLD_CONTENT_LBA     equ SUPER_LBA + 8
+
+EDIT_MAX        equ VOL_NODES * CONTENT_LEN   ; max bytes one file can hold (256*160)
 
 ; ============================================================
 kernel_entry:
@@ -742,6 +787,12 @@ dispatch:
     call str_eq
     cmp al, 1
     je cmd_cat
+
+    mov rsi, cmd_buf
+    mov rdi, str_about
+    call str_eq
+    cmp al, 1
+    je cmd_about
 
     mov rsi, cmd_buf
     mov rdi, str_pwd
@@ -1749,6 +1800,171 @@ cmd_cat:
     ret
 
 ; ------------------------------------------------------------
+; cmd_about: "about <path>" - print type, size, and node-usage info for
+; a file or folder without printing its content (unlike "view"). Handy
+; for seeing exactly how many chain nodes a file is eating out of the
+; volume's node table - the resource "error: filesystem is full" is
+; actually about (see fs_create_node/vol_read comments above).
+cmd_about:
+    cmp byte [arg1_buf], 0
+    jne .have_arg
+    mov rsi, msg_need_name
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+.have_arg:
+    mov rax, [cur_dir]
+    mov rsi, arg1_buf
+    mov rdi, leaf1_buf
+    call fs_resolve_path
+    cmp rax, -1
+    je .bad_path
+    mov r11, rax
+    mov rax, r11
+    mov rsi, leaf1_buf
+    mov r10, -1                  ; any type - about works on files and folders
+    call fs_find_child
+    cmp rax, -1
+    je .not_found
+    mov r12, rax                 ; r12 = the node we're describing
+
+    ; --- header: about: '<path as given>' ---
+    mov rsi, msg_about_hdr1
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    mov rsi, arg1_buf
+    call print_string
+    mov rsi, msg_about_hdr2
+    call print_string
+
+    ; --- node id ---
+    mov rsi, msg_about_nodeid
+    call print_string
+    mov rax, r12
+    lea rdi, [show_num_buf]
+    call int_to_str
+    mov rsi, show_num_buf
+    call print_string
+    mov rsi, newline_str
+    call print_string
+
+    movzx rax, byte [node_type + r12]
+    cmp rax, 1
+    je .is_folder
+
+    ; --- file: type, size, blocks ---
+    mov rsi, msg_about_type
+    call print_string
+    mov rsi, msg_type_file
+    call print_string
+
+    mov rax, r12
+    lea rdi, [fs_io_buf]
+    call fs_read_file
+    lea rsi, [fs_io_buf]
+    call str_len                 ; rax = content length in bytes
+    mov r13, rax
+
+    mov rsi, msg_about_size
+    call print_string
+    mov rax, r13
+    lea rdi, [show_num_buf]
+    call int_to_str
+    mov rsi, show_num_buf
+    call print_string
+    mov rsi, msg_about_bytes
+    call print_string
+
+    ; count how many nodes (head + chain continuations) this file occupies
+    mov r13, 1
+    movzx rax, word [node_next + r12*2]
+.count_loop:
+    cmp rax, 0xFFFF
+    je .count_done
+    inc r13
+    movzx rax, word [node_next + rax*2]
+    jmp .count_loop
+.count_done:
+    mov rsi, msg_about_blocks
+    call print_string
+    mov rax, r13
+    lea rdi, [show_num_buf]
+    call int_to_str
+    mov rsi, show_num_buf
+    call print_string
+    cmp r13, 1
+    je .block_singular
+    mov rsi, msg_about_blocks_plural
+    call print_string
+    jmp .done
+.block_singular:
+    mov rsi, msg_about_blocks_singular
+    call print_string
+    jmp .done
+
+.is_folder:
+    mov rsi, msg_about_type
+    call print_string
+    mov rsi, msg_type_folder
+    call print_string
+
+    ; count direct children (files/folders whose parent is this node)
+    xor r13, r13
+    xor rcx, rcx
+.folder_loop:
+    cmp rcx, MAX_NODES
+    jae .folder_done
+    cmp byte [node_type + rcx], 0
+    je .folder_next
+    cmp byte [node_type + rcx], NODE_TYPE_CHAIN
+    je .folder_next
+    movzx rax, word [node_parent + rcx*2]
+    cmp rax, r12
+    jne .folder_next
+    inc r13
+.folder_next:
+    inc rcx
+    jmp .folder_loop
+.folder_done:
+    mov rsi, msg_about_items
+    call print_string
+    mov rax, r13
+    lea rdi, [show_num_buf]
+    call int_to_str
+    mov rsi, show_num_buf
+    call print_string
+    cmp r13, 1
+    je .item_singular
+    mov rsi, msg_about_items_plural
+    call print_string
+    jmp .done
+.item_singular:
+    mov rsi, msg_about_items_singular
+    call print_string
+    jmp .done
+
+.done:
+    ret
+.not_found:
+    mov rsi, msg_no_entry
+    mov al, ATTR_ERROR
+    call print_string_attr
+    mov rsi, arg1_buf
+    call print_string
+    mov rsi, newline_str
+    call print_string
+    ret
+.bad_path:
+    mov rsi, msg_bad_path
+    mov al, ATTR_ERROR
+    call print_string_attr
+    mov rsi, arg1_buf
+    call print_string
+    mov rsi, newline_str
+    call print_string
+    ret
+
+; ------------------------------------------------------------
 cmd_clear:
     call clear_screen
     ret
@@ -1804,6 +2020,12 @@ help_lookup:
     call str_eq
     cmp al, 1
     je .h_cat
+
+    mov rsi, arg1_buf
+    mov rdi, str_about
+    call str_eq
+    cmp al, 1
+    je .h_about
 
     mov rsi, arg1_buf
     mov rdi, str_edit
@@ -2056,6 +2278,9 @@ help_lookup:
     jmp .h_print
 .h_cat:
     mov rsi, help_cat
+    jmp .h_print
+.h_about:
+    mov rsi, help_about
     jmp .h_print
 .h_edit:
     mov rsi, help_edit
@@ -2322,11 +2547,40 @@ cmd_run:
     call print_string
 
     lea rdi, [kernel_api_table]
-    mov qword [rdi + 0], print_string
-    mov qword [rdi + 8], print_string_attr
-    mov qword [rdi + 16], get_char
-    mov qword [rdi + 24], newline_str
-    mov qword [rdi + 32], party_poll_kill_api
+    mov qword [rdi + KAPI_PRINT_STRING], print_string
+    mov qword [rdi + KAPI_PRINT_STRING_ATTR], print_string_attr
+    mov qword [rdi + KAPI_GET_CHAR], get_char
+    mov qword [rdi + KAPI_NEWLINE_STR], newline_str
+    mov qword [rdi + KAPI_POLL_KILL], party_poll_kill_api
+    mov qword [rdi + KAPI_PUSH_VAL], party_push_val
+    mov qword [rdi + KAPI_POP_VAL], party_pop_val
+    mov qword [rdi + KAPI_VAL_SET_INT], party_val_set_int
+    mov qword [rdi + KAPI_VAL_SET_STR], party_val_set_str
+    mov qword [rdi + KAPI_VAL_SET_BOOL_TRUE], party_val_set_bool_true
+    mov qword [rdi + KAPI_VAL_SET_BOOL_FALSE], party_val_set_bool_false
+    mov qword [rdi + KAPI_VAL_SET_NONE], party_val_set_none
+    mov qword [rdi + KAPI_OP_BIN], party_op_bin
+    mov qword [rdi + KAPI_OP_EQ], party_op_eq
+    mov qword [rdi + KAPI_OP_NEQ], party_op_neq
+    mov qword [rdi + KAPI_OP_REL], party_op_rel
+    mov qword [rdi + KAPI_TRUTHY], party_truthy
+    mov qword [rdi + KAPI_PRINT_VALUE], party_print_value
+    mov qword [rdi + KAPI_VAR_DECLARE], party_var_declare
+    mov qword [rdi + KAPI_VAR_ASSIGN], party_var_assign
+    mov qword [rdi + KAPI_VAR_GET_PTR], party_var_get_ptr
+    mov qword [rdi + KAPI_VAL_COPY], party_val_copy
+    mov qword [rdi + KAPI_INVOKE_FUNC], party_invoke_func
+    mov qword [rdi + KAPI_FUNC_FIND], party_func_find
+    mov qword [rdi + KAPI_NEG_TOP], party_neg_top
+    mov qword [rdi + KAPI_LEX], party_lex
+    mov qword [rdi + KAPI_COLLECT_FUNCS], party_collect_funcs
+    mov qword [rdi + KAPI_VAL_SET_FLOAT], party_val_set_float
+
+    ; A compiled .run program shares the SAME global interpreter state
+    ; (value stack, variable table, function table, call depth) as the
+    ; tree-walking interpreter above, in case a previous "party foo.pa"
+    ; or "run bar.run" left it dirty. Reset it fresh for every run.
+    call party_reset_runtime
 
     push rbx
     push r12
@@ -8279,6 +8533,7 @@ vol_read:
     push rdi
     push r8
     push r9
+    push r10
     mov r8, rdi                 ; r8 = base node index
     call disk_select_device
     mov rax, SUPER_LBA
@@ -8293,18 +8548,25 @@ vol_read:
     jne .fail
     cmp byte [fs_super_buf+3], 'S'
     jne .fail
-    ; accept both v3 (current) and v2 (old single-block) formats
-    mov byte [fs_layout_v3], 0
+    ; accept v4 (current, 256-node), legacy v3 (64-node), and v2 (old
+    ; single-block) formats. fs_layout_ver records which one so the
+    ; name/content sections below know which LBAs/sector counts to use;
+    ; the node_next section below still just needs "does this format even
+    ; have a chain sector" (true for v3 and v4, false for v2).
+    mov byte [fs_layout_ver], 0
     cmp byte [fs_super_buf+4], SFFS_VERSION
-    je .version_ok
+    je .is_v4
+    cmp byte [fs_super_buf+4], SFFS_VERSION_V3
+    je .is_v3
     cmp byte [fs_super_buf+4], SFFS_VERSION_V2
-    jne .fail
+    je .version_ok
+    jmp .fail
+.is_v4:
+    mov byte [fs_layout_ver], 2
     jmp .version_ok
+.is_v3:
+    mov byte [fs_layout_ver], 1
 .version_ok:
-    cmp byte [fs_super_buf+4], SFFS_VERSION
-    jne .version_v2
-    mov byte [fs_layout_v3], 1
-.version_v2:
     ; node_type
     mov rax, TYPE_LBA
     lea rdi, [node_type]
@@ -8342,8 +8604,8 @@ vol_read:
     inc r9
     jmp .remap
 .remap_done:
-    ; node_next (v3 only) - a v2 volume gets a fresh no-chain slice instead
-    cmp byte [fs_layout_v3], 0
+    ; node_next (v3/v4 only) - a v2 volume gets a fresh no-chain slice instead
+    cmp byte [fs_layout_ver], 0
     je .next_v2
     mov rax, NEXT_LBA
     lea rdi, [fs_next_scratch]
@@ -8360,15 +8622,23 @@ vol_read:
     mov ax, 0xFFFF
     rep stosw
 .next_loaded:
-    ; node_name (LBA differs between v2 and v3)
-    cmp byte [fs_layout_v3], 0
-    jne .name_v3
+    ; node_name: LBA/sector-count depends on layout version
+    cmp byte [fs_layout_ver], 0
+    jne .name_not_v2
     mov rax, SUPER_LBA + 3
+    mov r10, 1                   ; v2 packed all names into a single sector
     jmp .name_go
-.name_v3:
+.name_not_v2:
+    cmp byte [fs_layout_ver], 1
+    jne .name_v4
+    mov rax, OLD_NAME_LBA
+    mov r10, OLD_NAME_SECTORS
+    jmp .name_go
+.name_v4:
     mov rax, NAME_LBA
+    mov r10, NAME_SECTORS
 .name_go:
-    mov rcx, NAME_SECTORS
+    mov rcx, r10
     lea rdi, [node_name]
     mov r9, r8
     imul r9, NAME_LEN
@@ -8385,15 +8655,23 @@ vol_read:
     add rdi, 512
     inc rax
     loop .name_loop
-    ; node_content
-    cmp byte [fs_layout_v3], 0
-    jne .content_v3
+    ; node_content: LBA/sector-count depends on layout version
+    cmp byte [fs_layout_ver], 0
+    jne .content_not_v2
     mov rax, SUPER_LBA + 7
+    mov r10, 1
     jmp .content_go
-.content_v3:
+.content_not_v2:
+    cmp byte [fs_layout_ver], 1
+    jne .content_v4
+    mov rax, OLD_CONTENT_LBA
+    mov r10, OLD_CONTENT_SECTORS
+    jmp .content_go
+.content_v4:
     mov rax, CONTENT_LBA
+    mov r10, CONTENT_SECTORS
 .content_go:
-    mov rcx, CONTENT_SECTORS
+    mov rcx, r10
     lea rdi, [node_content]
     mov r9, r8
     imul r9, CONTENT_LEN
@@ -8410,6 +8688,42 @@ vol_read:
     add rdi, 512
     inc rax
     loop .content_loop
+    ; v2/v3 volumes only ever had OLD_VOL_NODES(64) real slots on disk -
+    ; explicitly free the newly-available 64..255 range for this volume
+    ; instead of trusting whatever bytes happened to land there, so the
+    ; extra v4 capacity is guaranteed clean rather than full of stale
+    ; leftovers from disk. A v4 volume already has all 256 slots valid
+    ; as read, so this is skipped for it.
+    cmp byte [fs_layout_ver], 2
+    je .no_extend
+    mov rcx, OLD_VOL_NODES
+.extend_loop:
+    cmp rcx, VOL_NODES
+    jae .no_extend
+    mov r9, r8
+    add r9, rcx
+    mov byte [node_type + r9], 0
+    mov word [node_parent + r9*2], 0
+    mov word [node_next + r9*2], 0xFFFF
+    mov rdi, r9
+    imul rdi, NAME_LEN
+    lea rdi, [node_name + rdi]
+    push rcx
+    mov rcx, NAME_LEN
+    xor al, al
+    rep stosb
+    pop rcx
+    mov rdi, r9
+    imul rdi, CONTENT_LEN
+    lea rdi, [node_content + rdi]
+    push rcx
+    mov rcx, CONTENT_LEN
+    xor al, al
+    rep stosb
+    pop rcx
+    inc rcx
+    jmp .extend_loop
+.no_extend:
     xor rax, rax
     jmp .done
 .nodisk:
@@ -8417,6 +8731,7 @@ vol_read:
 .fail:
     mov rax, -1
 .done:
+    pop r10
     pop r9
     pop r8
     pop rdi
@@ -14777,9 +15092,9 @@ wig_str_buf:   times 16 db 0    ; scratch for the wig clock widget
 wig_last_sec:  db 0             ; last second the widget drew (redraw gate)
 
 banner:
-    db "ShellyForever v0.1.8 -- 'help' for commands", 10, 0
+    db "ShellyForever v0.1.9 -- 'help' for commands", 10, 0
 build_stamp:
-    db "build 20260809a -- sysconfig persistence + .run executables", 10, 0
+    db "build 20260809b -- Party expansion + SFFS V4", 10, 0
 
 prompt_head: db "rush>", 0
 prompt_tail: db ": ", 0
@@ -14795,6 +15110,7 @@ str_mkfl:   db "mkfl", 0
 str_show:   db "show", 0
 str_ls:     db "list", 0
 str_cat:    db "view", 0
+str_about:  db "about", 0
 str_pwd:    db "current", 0
 str_clear:  db "wipe", 0
 str_help:   db "help", 0
@@ -14817,8 +15133,49 @@ msg_run_running: db "run ", 0
 msg_run_toomany: db "run: too many processes running", 10, 0
 str_run_procname: db "run", 0
 
+; ------------------------------------------------------------
+; kernel_api_table slot layout (each slot = 8 bytes, offset shown
+; is the byte offset used by "call [r11+offset]" from compiled .run
+; code). Slots 0x00-0x20 are the original v0.1 ABI (print/read/kill);
+; 0x28 onward were added for the "party compile" native-codegen
+; backend (see party.asm: party_compile_to_run) so compiled programs
+; can call the SAME tested interpreter primitives (value stack,
+; operators, variable table, function invocation) instead of each
+; compiled program re-implementing them. Two slots (0x18, 0xE0) hold
+; DATA pointers, not code - everything else is a function pointer.
+; ------------------------------------------------------------
+KAPI_PRINT_STRING       equ 0x00
+KAPI_PRINT_STRING_ATTR  equ 0x08
+KAPI_GET_CHAR           equ 0x10
+KAPI_NEWLINE_STR        equ 0x18   ; data: pointer to newline_str
+KAPI_POLL_KILL          equ 0x20
+KAPI_PUSH_VAL           equ 0x28
+KAPI_POP_VAL            equ 0x30
+KAPI_VAL_SET_INT        equ 0x38
+KAPI_VAL_SET_STR        equ 0x40
+KAPI_VAL_SET_BOOL_TRUE  equ 0x48
+KAPI_VAL_SET_BOOL_FALSE equ 0x50
+KAPI_VAL_SET_NONE       equ 0x58
+KAPI_OP_BIN             equ 0x60
+KAPI_OP_EQ              equ 0x68
+KAPI_OP_NEQ             equ 0x70
+KAPI_OP_REL             equ 0x78
+KAPI_TRUTHY             equ 0x80
+KAPI_PRINT_VALUE        equ 0x88
+KAPI_VAR_DECLARE        equ 0x90
+KAPI_VAR_ASSIGN         equ 0x98
+KAPI_VAR_GET_PTR        equ 0xA0
+KAPI_VAL_COPY           equ 0xA8
+KAPI_INVOKE_FUNC        equ 0xB0
+KAPI_FUNC_FIND          equ 0xB8
+KAPI_NEG_TOP            equ 0xC0
+KAPI_LEX                equ 0xC8
+KAPI_COLLECT_FUNCS      equ 0xD0
+KAPI_VAL_SET_FLOAT      equ 0xD8
+KAPI_TABLE_SIZE         equ 0xE0   ; total bytes
+
 ALIGN 8
-kernel_api_table: times 40 db 0    ; slot 4 (offset 0x20) = party_poll_kill_api
+kernel_api_table: times KAPI_TABLE_SIZE db 0
 str_calc:   db "calc", 0
 str_edit:   db "edit", 0
 str_del:    db "del", 0
@@ -14947,6 +15304,7 @@ completion_cmds:
     dq str_show
     dq str_ls
     dq str_cat
+    dq str_about
     dq str_pwd
     dq str_clear
     dq str_help
@@ -14993,6 +15351,20 @@ msg_exists:    db "error: that name already exists here", 10, 0
 msg_full:      db "error: filesystem is full", 10, 0
 msg_name_too_long: db "error: name too long (max 31 characters)", 10, 0
 msg_copy_failed: db "error: name already exists at destination, or filesystem is full", 10, 0
+msg_about_hdr1:  db "about: '", 0
+msg_about_hdr2:  db "'", 10, 0
+msg_about_nodeid: db "  node id:  ", 0
+msg_about_type:   db "  type:     ", 0
+msg_type_file:    db "file", 10, 0
+msg_type_folder:  db "folder", 10, 0
+msg_about_size:   db "  size:     ", 0
+msg_about_bytes:  db " bytes", 10, 0
+msg_about_blocks: db "  blocks:   ", 0
+msg_about_blocks_singular: db " node (this file fits with no chain continuations)", 10, 0
+msg_about_blocks_plural:   db " nodes (1 head + chain continuations - each ~159 bytes)", 10, 0
+msg_about_items:  db "  items:    ", 0
+msg_about_items_singular: db " entry", 10, 0
+msg_about_items_plural:   db " entries", 10, 0
 msg_shutting_down: db "Shutting down...", 10, 0
 msg_empty:     db "(empty)", 10, 0
 msg_synced:     db "Filesystem synced to disk.", 10, 0
@@ -15209,6 +15581,7 @@ help_text:
     db '  show "text"        print a message (or a variable to show its value)', 10
     db "  list               list contents of current folder", 10
     db "  view <path>        print a file's content", 10
+    db "  about <path>       show type/size/node-usage info for a file or folder", 10
     db "  edit <name>        open the built-in editor for a file", 10
     db "  del <path>         delete a file (requires auth)", 10
     db "  rname <path> <new> rename a file or folder (new name stays in same folder)", 10
@@ -15300,6 +15673,14 @@ help_ls:
 help_cat:
     db "view <path>", 10
     db "  Print a file's content.", 10, 0
+
+help_about:
+    db "about <path>", 10
+    db "  Show info about a file or folder without printing its content:", 10
+    db "  node id, type, and either its size in bytes + how many nodes", 10
+    db "  in the volume's node table it occupies (a file over ~159 bytes", 10
+    db "  needs more than one), or, for a folder, how many entries it has.", 10
+    db "  e.g. about compilertest.pa      about docs", 10, 0
 
 help_edit:
     db "edit <path>", 10
@@ -15562,9 +15943,10 @@ fs_parent_scratch: times 512 db 0     ; staging for one full parent sector (512B
 mount_label:   times MAX_MOUNTS*32 db 0     ; label of each mounted volume
 mount_device:  times MAX_MOUNTS db 0        ; device id each volume came from
 mount_used:    times MAX_MOUNTS db 0        ; 1 = slot in use
-; type sector = 512B per volume (base 0/64/128), so this must span the max
-; extent of a sector write: base + 512. node indices still index it by node
-; (1 byte per node); the per-volume padding holds whatever the sector has.
+; type sector = 512B per volume (base 0/256/512 with VOL_NODES=256), so this
+; must span the max extent of a sector write: base + 512. node indices still
+; index it by node (1 byte per node); the per-volume padding holds whatever
+; the sector has. 512*(1+MAX_MOUNTS) stays comfortably >= MAX_NODES either way.
 node_type:    times 512 * (1 + MAX_MOUNTS) db 0
 node_parent:  times MAX_NODES dw 0
 node_name:    times MAX_NODES*NAME_LEN db 0
@@ -15586,7 +15968,7 @@ boot_device:         db 0     ; device id holding the OS volume - normally 0
                                ; this to an AHCI slot (4+) when device 0 never
                                ; responds and a SATA disk was found instead
 fs_name_too_long:    db 0     ; set by fs_create_node when a name won't fit
-fs_layout_v3:        db 0     ; set by vol_read: 1 = on-disk v3 (has node_next sector)
+fs_layout_ver:       db 0     ; set by vol_read: 0=v2, 1=legacy v3 (64-node), 2=v4 (256-node)
 
 mkfl_test_flag:      db 0     ; set by cmd_mkfl when -test appears in arg2/3/4
 ALIGN 8
@@ -15870,7 +16252,7 @@ proc_cur_slot: db 0                         ; slot index of currently running sc
 kill_flag:     db 0                         ; set by Esc key or prs kill
 rr_content_ptr: dq 0                         ; cursor into script file content
 
-; --- large staging buffers. A file can span a whole 64-node volume slice, so
+; --- large staging buffers. A file can span a whole VOL_NODES-node volume slice, so
 ; these are sized to hold a full file's content (EDIT_MAX). Declared at the
 ; very end of the file, after all code, so any growth doesn't move anything. ---
 fs_next_scratch: times 512 db 0     ; staging for one full node_next sector
