@@ -873,6 +873,12 @@ dispatch:
     je cmd_prs
 
     mov rsi, cmd_buf
+    mov rdi, str_syscmd
+    call str_eq
+    cmp al, 1
+    je cmd_sys
+
+    mov rsi, cmd_buf
     mov rdi, str_auth
     call str_eq
     cmp al, 1
@@ -2106,6 +2112,12 @@ help_lookup:
     je .h_prs
 
     mov rsi, arg1_buf
+    mov rdi, str_syscmd
+    call str_eq
+    cmp al, 1
+    je .h_sys
+
+    mov rsi, arg1_buf
     mov rdi, str_auth
     call str_eq
     cmp al, 1
@@ -2356,6 +2368,9 @@ help_lookup:
     jmp .h_print
 .h_sdown:
     mov rsi, help_sdown
+    jmp .h_print
+.h_sys:
+    mov rsi, help_sys
     jmp .h_print
 .h_semicolon:
     mov rsi, help_semicolon
@@ -4893,6 +4908,117 @@ cmd_sdown:
     cli
     hlt
     jmp .hang
+
+; ------------------------------------------------------------
+; cmd_sys: "sys reset" - a factory reset for when a user's system is
+; broken/full/messed up. Wipes every file and folder on the OS volume
+; (nodes 0..OS_NODES-1 - mounted external drives are untouched), clears
+; the in-memory variables and aliases, recreates the default system
+; files (sys/, alias.sly, sysconfig - see ensure_sys_folder), and saves
+; the result to disk immediately. Requires auth: "auth sys reset".
+cmd_sys:
+    cmp byte [arg1_buf], 0
+    jne .have_arg
+    mov rsi, msg_sys_usage
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+.have_arg:
+    mov rsi, arg1_buf
+    mov rdi, str_sys_reset
+    call str_eq
+    cmp al, 1
+    je .sys_reset
+    mov rsi, msg_sys_usage
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+.sys_reset:
+    cmp byte [auth_valid], 0
+    jne .reset_ok
+    mov rsi, msg_auth_required
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+.reset_ok:
+    mov byte [auth_valid], 0
+    call sys_do_reset
+    mov rsi, msg_sys_reset_done
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    ret
+
+; sys_do_reset: the actual factory-reset work for "sys reset". Keeps the
+; OS volume's existing label (so the drive/system identity doesn't
+; change), but wipes every node in its slice (nodes 0..OS_NODES-1) back
+; to a single empty root folder, drops all session variables and
+; aliases, recreates the default sys/ files, and persists it all to
+; disk. Mounted external drives live in nodes OS_NODES..MAX_NODES-1 and
+; are left completely untouched.
+sys_do_reset:
+    push rax
+    push rcx
+    push rsi
+    push rdi
+
+    ; remember the current label (root node's name) so the reset system
+    ; keeps its identity instead of reverting to a generic default
+    lea rsi, [node_name]
+    lea rdi, [sys_reset_label_tmp]
+    call str_copy
+
+    ; wipe node_type/node_parent/node_next/node_name/node_content for
+    ; just the OS volume's slice of nodes
+    mov rdi, node_type
+    mov rcx, OS_NODES
+    xor al, al
+    rep stosb
+
+    mov rdi, node_parent
+    mov rcx, OS_NODES
+    xor ax, ax
+    rep stosw
+
+    mov rdi, node_next
+    mov rcx, OS_NODES
+    mov ax, 0xFFFF
+    rep stosw
+
+    mov rdi, node_name
+    mov rcx, OS_NODES * NAME_LEN
+    xor al, al
+    rep stosb
+
+    mov rdi, node_content
+    mov rcx, OS_NODES * CONTENT_LEN
+    xor al, al
+    rep stosb
+
+    ; recreate node 0 as an empty root folder under its old label
+    mov byte [node_type], 1
+    mov word [node_parent], 0xFFFF
+    lea rsi, [sys_reset_label_tmp]
+    lea rdi, [node_name]
+    call str_copy
+
+    ; back to the root of the freshly-wiped volume
+    mov qword [cur_dir], 0
+
+    ; this is a factory reset - drop session variables and aliases too
+    call vars_clear_all
+    call aliases_clear_all
+
+    ; recreate sys/, alias.sly, sysconfig with their default content
+    call ensure_sys_folder
+
+    ; persist the reset system to disk right away
+    call fs_save
+
+    pop rdi
+    pop rsi
+    pop rcx
+    pop rax
+    ret
 
 ; ------------------------------------------------------------
 ; acpi_shutdown: real ACPI power-off, the mechanism real hardware
@@ -15285,6 +15411,8 @@ str_silent: db "-silent", 0
 str_info:   db "-info", 0
 str_test:   db "-test", 0
 empty_str:  db 0
+str_syscmd:    db "sys", 0        ; the "sys" command word (sys reset)
+str_sys_reset: db "reset", 0
 str_dscan:  db "dscan", 0
 str_format: db "fmt", 0
 str_mount:  db "mount", 0
@@ -15333,6 +15461,7 @@ completion_cmds:
     dq str_write
     dq str_wig
     dq str_shelly
+    dq str_syscmd
     dq 0
 comp_matches: times 96 dw 0
 
@@ -15553,6 +15682,8 @@ prs_spaces:      db "   ", 0
 ; --- auth / vars / flags messages ---
 msg_auth_required: db "error: this command requires authentication. Use 'auth <command>' first.", 10, 0
 msg_auth_granted:  db "Authentication granted.", 10, 0
+msg_sys_usage:      db "sys: use 'auth sys reset' to factory-reset this system", 10, 0
+msg_sys_reset_done: db "System reset complete. All files and variables were wiped and default system files recreated.", 10, 0
 msg_vars_header:   db "Variables:", 10, 0
 msg_vars_sep:     db " = ", 0
 msg_vars_cleared:  db "All variables cleared.", 10, 0
@@ -15618,6 +15749,8 @@ help_text:
     db "  label <old> <new>  rename a formatted drive without touching its data", 10
     db "  rboot              save to disk, then restart (requires auth)", 10
     db "  sdown              shut down (requires auth)", 10
+    db "  sys reset          factory-reset: wipe all files/vars and recreate", 10
+    db "                      default system files (requires auth)", 10
     db "  ;                  chain commands, e.g. show hi ; show bye", 10
     db "  ~                  pipe output, e.g. calc 1+2*3 ~ = a ; show a", 10
     db "  $                  comment line (lines starting with $ are skipped)", 10
@@ -15876,6 +16009,15 @@ help_sdown:
     db "sdown", 10
     db "  Save to disk, then shut down. Requires auth: auth sdown", 10, 0
 
+help_sys:
+    db "sys reset", 10
+    db "  Factory-reset this system - use if something is badly wrong and", 10
+    db "  you want a clean slate. Deletes every file and folder, clears all", 10
+    db "  variables and aliases, then recreates the default system files", 10
+    db "  (sys/, alias.sly, sysconfig) and saves to disk. Mounted external", 10
+    db "  drives are not touched. This cannot be undone.", 10
+    db "  Requires auth: auth sys reset", 10, 0
+
 help_semicolon:
     db "; (command chaining)", 10
     db "  Run multiple commands on one line, e.g. show hi ; show bye.", 10
@@ -15937,6 +16079,7 @@ kbd_shift:
 ALIGN 8
 fs_super_buf:   times 512 db 0        ; scratch for reading/building superblocks
 fmt_new_label:      times 40 db 0     ; label being applied by the current 'fmt'
+sys_reset_label_tmp: times 40 db 0    ; root label preserved across 'sys reset'
 orig_label_buf:      times 40 db 0    ; scratch: a device's generated "diskN" label
 orig_label_num_tmp:  times 12 db 0    ; scratch: decimal digits for gen_orig_label
 fs_parent_scratch: times 512 db 0     ; staging for one full parent sector (512B)

@@ -9,6 +9,18 @@ Invoked from the shell as:
 party foo.pa
 ```
 
+As of ShellyForever 0.1.9, the same source can also be compiled straight
+to a `.run` executable instead of interpreted:
+
+```
+party compile foo.pa
+```
+
+writes `foo.run` alongside `foo.pa`; `run foo.run` (or a bare `foo.run`
+at the prompt) then runs it. The full grammar below compiles, not just a
+subset — this section is a language spec, and everything in it applies
+whether a program is interpreted or compiled.
+
 ---
 
 ## 1. Lexical rules

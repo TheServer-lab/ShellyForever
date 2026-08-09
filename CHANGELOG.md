@@ -4,6 +4,53 @@ All notable changes to ShellyForever are documented here. The format is
 loosely based on [Keep a Changelog](https://keepachangelog.com/); the
 project does not yet follow strict SemVer.
 
+## [0.1.9] - 2026-08-09
+
+### Added
+
+- **Party compiler — `party compile <file.pa>`**. Compiles a Party
+  script straight to a ShellyForever `RUN 0.1` executable (writing
+  `<file>.run` alongside the source) instead of only interpreting it.
+  The compiled binary uses the same three-line header and kernel API
+  table (`print_string`, `print_string_attr`, `get_char`, kill-check)
+  as a hand-assembled `.run` file, so it runs with plain `run
+  <file>.run` (or a bare `name.run`), shows up in `prs`, and is
+  killable with `prs kill` exactly like any other compiled program.
+  The full v0.1 language compiles — variables, all operators,
+  `if`/`else if`/`else`, `while`, `func`/`return` with recursion — not
+  just a subset.
+- **SFFS v4 — 256 nodes per volume**. `OS_NODES` raised from 64 to
+  256; `NAME_LBA`/`CONTENT_LBA` are now computed from the node count
+  instead of hardcoded, so the two regions can't collide as it changes
+  again later. Raises the practical per-file cap from ~10 KB to 40 KB
+  (`EDIT_MAX = VOL_NODES * CONTENT_LEN`). v2 and v3 volumes (64-node,
+  at their old fixed offsets) still load and read fine; a `sync`
+  upgrades them to v4 in place, first clearing nodes 64..255 of that
+  volume's slice so the bigger table is already in use the moment you
+  next `mkfl`/`mkf`/`edit`. Each volume now needs ~100 sectors past
+  `FS_LBA_START` (was ~28). See "SFFS v4 on-disk format" in the
+  README.
+- **`sys reset` — factory reset (requires auth)**. `auth sys reset`
+  wipes every file and folder on the OS volume back to an empty root
+  (keeping the volume's existing label), clears all session variables
+  and aliases, recreates the default `/sys` files (`alias.sly`,
+  `sysconfig.sly`), and saves the result to disk immediately. Mounted
+  external drives are left untouched. Meant as a clean-slate recovery
+  path for when a system's state is badly wrong. This cannot be
+  undone.
+
+### Changed
+
+- **Party interpreter completed** — the interpreter now fully
+  implements every feature in the v0.1 language spec
+  (`PARTY_SPEC.md`) end-to-end. The grammar and semantics in
+  `PARTY_SPEC.md` are unchanged; this is completion of the
+  implementation against that existing spec, not a new feature set.
+- Banner and build stamp bumped to `v0.1.9` (`kernel.asm`).
+- README updated: the SFFS v3 section is replaced with SFFS v4,
+  `sys reset` is documented under the elevation system and in its own
+  section, and `party compile` is documented alongside `party`.
+
 ## [0.1.8] - 2026-08-09
 
 ### Added

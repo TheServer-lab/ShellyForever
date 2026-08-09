@@ -1,6 +1,6 @@
 # ShellyForever
 
-**Version:** 0.1.8
+**Version:** 0.1.9
 
 A 64-bit shell-based OS written entirely in x86-64 NASM assembly, from scratch —
 no C, no BIOS libraries beyond boot-time disk/keyboard calls, no existing kernel.
@@ -21,9 +21,11 @@ no C, no BIOS libraries beyond boot-time disk/keyboard calls, no existing kernel
     recursive copy/move/delete of whole subtrees.
   - A simple `name = value` variable table (int64), reused by `calc`.
   - A built-in line editor for file content (`edit`).
-  - Multi-block (chained) files — a single file can span multiple
-    filesystem nodes, so it's no longer capped at one node's content size.
-    See "Multi-block files (SFFS v3)" below.
+  - Multi-block (chained) files on a 256-node **SFFS v4** volume — a
+    single file can span multiple filesystem nodes, up to ~40 KB, and
+    isn't capped at one node's content size. Older v2/v3 volumes still
+    load fine and are upgraded in place on the next `sync`. See
+    "SFFS v4 on-disk format" below.
   - A polled networking stack: hand-written drivers for the RTL8139
     (legacy), Intel e1000, and Realtek RTL8168/8169/8161 ("PCIe GBE
     Family Controller") NICs, plus Ethernet II + ARP + IPv4 + ICMP echo +
@@ -39,6 +41,17 @@ no C, no BIOS libraries beyond boot-time disk/keyboard calls, no existing kernel
     small headered binary, hands it a kernel API table (print, input,
     kill-check), and tracks it in the process table like a script. See
     "Compiled programs: `run`" below.
+  - **Party**, a small built-in scripting language (`.pa` files) with
+    its own variables, expressions, control flow, and functions — the
+    interpreter now implements the full v0.1 spec end-to-end.
+    `party compile <file.pa>` compiles a script straight to a `.run`
+    executable instead of only interpreting it. See "Party" below and
+    `PARTY_SPEC.md`.
+  - A factory-reset command, `sys reset` (requires auth) — wipes the
+    OS volume back to an empty filesystem, clears variables/aliases,
+    and recreates the default `/sys` files, for when a system's state
+    is badly wrong and you want a clean slate. See "Factory reset:
+    `sys reset`" below.
 
 ## Commands implemented
 
@@ -71,8 +84,10 @@ no C, no BIOS libraries beyond boot-time disk/keyboard calls, no existing kernel
 | `rr` | `rr script.rsh` | run a rush script file (`$` = comment line) |
 | `run` | `run hello.run` | run a compiled ShellyForever `RUN 0.1` executable; typing a bare `name.run` does the same |
 | `party` | `party hello.pa` | run a program in **Party** (`.pa`), a small built-in scripting language — own variables, expressions, `if`/`else`, `while`, `func`/`return`, and `display` output. See "Party" below and `PARTY_SPEC.md` |
+| `party compile` | `party compile hello.pa` | compile a Party script straight to a `hello.run` executable instead of interpreting it |
 | `prs` | `prs`, `prs kill 1`, `prs kill rushrun` | list processes, or kill by PID or name |
 | `auth` | `auth sdown`, `auth vars rmv all` | elevate privileges for one dangerous command |
+| `sys reset` | `auth sys reset` | factory-reset the OS volume: wipe every file and variable, recreate default system files (requires auth) |
 | `current` | `current` | print current path |
 | `wipe` | `wipe` | clear the screen |
 | `help` | `help` | list commands |
@@ -206,8 +221,9 @@ hi
 
 ### Elevation system (auth)
 
-Dangerous commands — `sdown`, `rboot`, `del`, `vars rmv all`, and `rmv ali
-all` — require authentication. Prefix the command with `auth` (like `sudo`):
+Dangerous commands — `sdown`, `rboot`, `del`, `vars rmv all`, `rmv ali
+all`, and `sys reset` — require authentication. Prefix the command with
+`auth` (like `sudo`):
 
 ```
 rush>/home: sdown
@@ -225,6 +241,37 @@ rush>/home: auth del notes.txt ; show "done"
 Authentication granted.
 done
 ```
+
+### Factory reset: `sys reset`
+
+`auth sys reset` wipes the OS volume back to a clean, empty system —
+meant as a recovery path for when something is badly wrong (a corrupted
+or cluttered filesystem, a config that's fighting you, or you just want
+to start over) rather than reformatting the whole drive by hand.
+
+```
+rush>/home: sys reset
+error: this command requires authentication. Use 'auth <command>' first.
+rush>/home: auth sys reset
+Authentication granted.
+System reset complete. All files and variables were wiped and default system files recreated.
+```
+
+What it does:
+
+- Deletes every file and folder on the OS volume (nodes `0..OS_NODES-1`),
+  restoring a single empty root — but **keeps the volume's existing
+  label**, so the system's identity doesn't change.
+- Clears every session variable and alias.
+- Recreates the default `/sys` files (`alias.sly`, `sysconfig.sly`) with
+  their seed content, the same as a brand-new filesystem gets.
+- Saves the result to disk immediately — there's no separate `sync`
+  step required afterwards.
+- Leaves any mounted external drives (nodes `OS_NODES..MAX_NODES-1`)
+  completely untouched; `sys reset` only ever wipes the boot/OS volume.
+
+This is destructive and cannot be undone — there's no `-force`-style
+confirmation beyond the `auth` gate itself, same as `sdown`/`rboot`/`del`.
 
 ### Flags: `-force`, `-silent`, `-info`, `-test`
 
@@ -281,6 +328,7 @@ with `owrite: no such file: <path>` otherwise) and never creates one.
 `party <file.pa>` runs a program in **Party**, a small scripting language
 with its own variables, expression evaluator, and control flow — no shell
 command access from inside a script. The full spec is in `PARTY_SPEC.md`.
+As of 0.1.9 the interpreter implements the entire v0.1 spec end-to-end.
 
 ```
 vars a = "hi"
@@ -315,6 +363,25 @@ What's in there:
 
 `party foo.pa -tokens` dumps the raw token stream instead of executing, and
 **Esc** interrupts a running script.
+
+#### Compiling: `party compile`
+
+`party compile <file.pa>` compiles a Party script straight to a
+ShellyForever `RUN 0.1` executable (`<file>.run`, written alongside the
+source) instead of interpreting it. The full v0.1 language compiles —
+not a subset — so any script that runs under `party foo.pa` compiles
+under `party compile foo.pa` too.
+
+```
+rush>/home: party compile foo.pa
+rush>/home: run foo.run
+```
+
+The resulting `.run` file uses the same three-line header and kernel
+API table (print/input/kill-check) as any other compiled program — see
+"Compiled programs: `run`" below — so it's a normal `prs`-visible,
+`prs kill`-able process, and a bare `foo.run` at the prompt runs it
+too, exactly like a hand-assembled `.run` file.
 
 ### Compiled programs: `run` and the `.run` format
 
@@ -484,24 +551,41 @@ which device the OS volume lives on for `sync`/`rboot`/`sdown` to write back
 to. Without this, a real machine whose only disk is SATA would report "No
 disk detected" forever even though `dscan` could see the drive just fine.
 
-### SFFS v3 on-disk format
+### SFFS v4 on-disk format
 
-Each disk volume is self-contained and starts at sector (LBA) 400 — well
-clear of the boot sector and the kernel's own sectors (the kernel has grown
-enough, mostly from the networking stack, that the filesystem region moved
-up from LBA 200 to stay clear of it):
+Each disk volume is self-contained and starts at sector (LBA) 500 — well
+clear of the boot sector and the kernel's own sectors (the filesystem
+region has moved up twice as the kernel grew, most recently from LBA 400
+to make room for the browser):
 
 - **Superblock** (1 sector): `SFFS` magic, version byte, then a 32-byte
   label.
 - **Type / parent / next / name / content** sectors: one node table per
-  volume (`node_type`, `node_parent`, `node_next`, 4 name sectors, 20
-  content sectors), scoped per volume with *relative* parent indices
-  (`0xFFFF` = volume root), so the same layout works on any drive.
+  volume (`node_type`, `node_parent`, `node_next`, 16 name sectors, 80
+  content sectors — 256 nodes per volume as of v4, up from 64), scoped
+  per volume with *relative* parent indices (`0xFFFF` = volume root), so
+  the same layout works on any drive. `CONTENT_LBA` is computed from
+  `NAME_LBA + NAME_SECTORS` rather than hardcoded, so the two regions
+  can't collide if the node count changes again later. A volume now
+  needs ~100 sectors past `FS_LBA_START` (was ~28 under the old 64-node
+  layout).
 - **Older v2 volumes** (no `node_next` sector; content starts one sector
-  earlier) still load and read fine — a `sync` upgrades them to v3 in
-  place.
+  earlier, 64 nodes) and **v3 volumes** (has `node_next`, but still the
+  old 64-node-sized name/content regions) both still load and read fine
+  — a `sync` upgrades either one to v4 in place, first clearing nodes
+  64..255 of that volume's slice so the bigger table is already in use
+  the moment you next `mkfl`/`mkf`/`edit`.
 
-### Multi-block files (SFFS v3)
+v4 exists because the old 64-node table was shared by folders, files,
+*and* every chain-continuation node a file needed once its content
+passed ~159 bytes — so a handful of ordinary-sized files could exhaust
+the table well before the disk itself was anywhere near full ("error:
+filesystem is full" with plenty of free sectors left). Widening
+`VOL_NODES` to 256 keeps the exact same chain-of-nodes design (nothing
+that walks `node_next` had to change) and buys a lot more headroom
+before that happens.
+
+### Multi-block files (SFFS v4)
 
 A file's content used to be capped at a single node's ~160-byte slot. Now a
 file whose content is longer than that is stored as a chain: its own node
@@ -511,11 +595,11 @@ holds the next ~159 bytes, and so on until `node_next` is `0xFFFF`. Deleting
 a file frees every node in its chain.
 
 This raises the practical cap on a single file's size from ~160 bytes to
-~10 KB (a lone big file can use the volume's entire 64-node table if
-nothing else needs a node) — plenty for text, notes, and config files.
-`view`, `show`, `lookfor`, `find`, `edit`, `owrite`, and `del` all work
-transparently across chained files; nothing about how you use those
-commands changes.
+40 KB under SFFS v4's 256-node table (a lone big file can use the volume's
+entire node table if nothing else needs a node) — plenty for text, notes,
+and config files. `view`, `show`, `lookfor`, `find`, `edit`, `owrite`, and
+`del` all work transparently across chained files; nothing about how you
+use those commands changes.
 
 ```
 rush>/home: mkfl big.txt "..." ; view big.txt
@@ -732,7 +816,7 @@ take http://10.0.2.2:8000/somefile.txt somefile.txt
 view somefile.txt
 ```
 
-Files larger than ~160 bytes are fine — the SFFS v3 chained-file system
+Files larger than ~160 bytes are fine — the SFFS v4 chained-file system
 stores them across multiple filesystem nodes.
 
 Only plain HTTP is supported (no HTTPS). The response body is extracted
@@ -801,13 +885,14 @@ message and then nothing, which is your cue to power off manually.
   kernel this size, would need a real allocator to grow much further.
 - No ACPI — `sdown` relies on emulator-specific legacy ports rather than a
   negotiated ACPI shutdown (see above).
-- 64 nodes per volume, with the in-memory node table sized for the boot
-  volume plus up to `MAX_MOUNTS` (2) mounted volumes — 192 nodes total in
-  memory. File/folder names capped at 32 bytes, a single node still holds
-  ~160 bytes but files now chain across nodes (see "Multi-block files"
-  above) up to ~10 KB, line input capped at ~220 chars — easy to bump, just
-  constants at the top of `kernel.asm` (the on-disk format size adjusts
-  automatically since it's computed from those same constants).
+- 256 nodes per volume (SFFS v4), with the in-memory node table sized for
+  the boot volume plus up to `MAX_MOUNTS` (2) mounted volumes — 768 nodes
+  total in memory. File/folder names capped at 32 bytes, a single node
+  still holds ~160 bytes but files now chain across nodes (see
+  "Multi-block files" above) up to 40 KB, line input capped at ~220
+  chars — easy to bump, just constants at the top of `kernel.asm` (the
+  on-disk format size adjusts automatically since it's computed from
+  those same constants).
   Worth knowing: `mkfl`/`rname`/`cpy`/`mov` don't currently check that a
   destination name is short enough to fit in that 32-byte slot before
   copying it in.
@@ -854,6 +939,20 @@ message and then nothing, which is your cue to power off manually.
 
 ## What's new
 
+- **`sys reset` — factory reset (v0.1.9)** — `auth sys reset` wipes the
+  OS volume back to an empty filesystem (keeping its label), clears all
+  variables and aliases, recreates the default `/sys` files, and saves
+  immediately. Mounted external drives are untouched. See "Factory
+  reset: `sys reset`" above.
+- **SFFS v4 — 256 nodes per volume (v0.1.9)** — `OS_NODES` raised from
+  64 to 256, raising the practical per-file cap from ~10 KB to 40 KB.
+  Older v2/v3 volumes still load fine and upgrade to v4 in place on the
+  next `sync`. See "SFFS v4 on-disk format" above.
+- **Party compiler (v0.1.9)** — `party compile <file.pa>` compiles a
+  Party script straight to a `.run` executable instead of only
+  interpreting it; the full v0.1 language compiles, not just a subset.
+  The interpreter itself now also implements the complete v0.1 spec
+  end-to-end. See "Party" above.
 - **Compiled `.run` executables (v0.1.8)** — `run <file.run>` (or typing a
   bare `name.run`) loads a compiled ShellyForever `RUN 0.1` binary, checks
   its three-line text header, allocates a process slot (visible in `prs`,
