@@ -1,13 +1,20 @@
 ; ============================================================
 ;  ShellyForever  --  kernel.asm
-;  Loaded flat at physical address 0x8000 by boot.asm, already
-;  running in 64-bit long mode with the first 2MB identity
-;  mapped. No IDT/interrupts are set up - keyboard is polled.
+;  Loaded flat at physical address 0x8000 by boot.asm. boot.asm hands off
+;  here WHILE STILL IN REAL MODE (see splash_stub right below) so BIOS
+;  video/keyboard calls are still available for a boot splash; splash_stub
+;  then does the A20/GDT/protected-mode/long-mode transition itself (moved
+;  here from boot.asm - see boot.asm's read_done for why) and falls into
+;  kernel_entry, which is where actual 64-bit long-mode execution used to
+;  begin directly. No IDT/interrupts are set up - keyboard is polled.
 ; ============================================================
 
 BITS 64
 ORG 0x8000
 
+%include "splash.asm"
+
+BITS 64
 ; ---------------- constants ----------------
 VGA_BASE        equ 0xB8000
 VGA_COLS        equ 80
@@ -16,6 +23,13 @@ ATTR_NORMAL     equ 0x0A          ; bright green on black
 ATTR_PROMPT     equ 0x0E          ; yellow
 ATTR_ERROR      equ 0x0C          ; red
 ATTR_WIG        equ 0x0B          ; light cyan - used by the wig clock widget
+
+; cmd_edit redraws its whole viewport from scratch on every keystroke (see
+; cmd_edit below); the first EDIT_HEADER_ROWS screen rows are always the
+; "-- editing <name> ... --" banner and a blank line, so the scrollable
+; body only gets VGA_ROWS-EDIT_HEADER_ROWS rows. Must match the number of
+; newlines msg_edit_header1+msg_edit_header2 print before file content.
+EDIT_HEADER_ROWS equ 2
 
 ; SFFS v4 raises this from 64 to 256 (see the SFFS v4 block below) - the
 ; old 64-node table was shared by folders, files, AND every chain
@@ -45,6 +59,11 @@ HISTORY_MAX      equ 20          ; command history entries kept for Up/Down
 KEY_UP           equ 0x11        ; sentinel byte get_char returns for the Up arrow
 KEY_DOWN         equ 0x12        ; sentinel byte get_char returns for the Down arrow
 KEY_PASTE        equ 0x13        ; sentinel byte get_char returns for Ctrl+V
+KEY_LEFT         equ 0x14        ; sentinel byte get_char returns for the Left arrow
+KEY_RIGHT        equ 0x15        ; sentinel byte get_char returns for the Right arrow
+KEY_HOME         equ 0x16        ; sentinel byte get_char returns for Home
+KEY_END          equ 0x17        ; sentinel byte get_char returns for End
+KEY_DELETE       equ 0x18        ; sentinel byte get_char returns for Delete
 
 MAX_VARS        equ 16
 VAR_NAME_LEN    equ 32
@@ -106,14 +125,23 @@ PIPE_CAP_MAX    equ 192       ; max bytes captured from a "~" pipe's left side
 ;  dscan probes all four ATA device slots for the magic, format writes
 ;  a fresh empty volume + label, and mount loads a volume's node table
 ;  into memory (remapping its parent indices) rooted at /<label>/.
-;  The kernel occupies LBA 1..480 (KERNEL_SECTORS in boot.asm) - the
+;  The kernel occupies LBA 1..900 (KERNEL_SECTORS in boot.asm; the real
+;  kernel.bin is currently 842 sectors, so 900 leaves some slack) - the
 ;  NIC/network stack (Milestone B), TCP engine (Milestone C) and the
-;  browser (Milestone E) grew the image well past 460 - so the filesystem
-;  region starts at LBA 500 to stay clear of it. v4's bigger name/content
-;  regions need ~100 sectors per volume (was ~28) - make sure each disk
-;  image you build/attach has enough room past LBA 500 for that.
+;  browser (Milestone E) grew the image well past 460, which is why
+;  KERNEL_SECTORS itself was bumped from 560 to 900 (see boot.asm). The
+;  filesystem region must start clear of KERNEL_SECTORS, with real
+;  margin for the kernel to keep growing - not just enough for today's
+;  build - so it starts at LBA 1000. v4's bigger name/content regions
+;  need ~100 sectors per volume (was ~28) - make sure each disk image
+;  you build/attach has enough room past LBA 1000 for that.
 ; ------------------------------------------------------------------
-FS_LBA_START    equ 500
+FS_LBA_START    equ 1150            ; bumped from 1000 - see boot.asm's KERNEL_SECTORS
+                                     ; (now 1100) for why. *** BREAKING CHANGE: any disk
+                                     ; image with a filesystem already written at the old
+                                     ; FS_LBA_START=1000 needs to be reformatted (dscan/fmt)
+                                     ; after this change, or that data is effectively at the
+                                     ; wrong LBA and won't be found. ***
 SFFS_VERSION    equ 4               ; current on-disk format (256-node volumes)
 SFFS_VERSION_V3 equ 3               ; old format (64-node volumes, has node_next) - still readable
 SFFS_VERSION_V2 equ 2               ; old, single-block format - still readable
@@ -1576,9 +1604,30 @@ cmd_calc:
     ret
 
 ; ------------------------------------------------------------
-; cmd_edit: opens the built-in editor on an existing file. Types over
-; a copy of the file's content (backspace erases, Enter adds a newline),
-; ESC ends editing and asks whether to save (y) or discard (n).
+; cmd_edit: opens the built-in editor on an existing file. Edits a copy of
+; the file's content in place (typed chars/Enter insert at the cursor,
+; Backspace/Delete remove around it, Left/Right/Home/End move it - all
+; newline-aware), ESC ends editing and asks whether to save (y) or
+; discard (n).
+;
+; Loop state (kept in registers across the whole edit session, same
+; convention as cur_dir-style code elsewhere - callees here are all
+; expected to preserve r12-r15):
+;   r15 = node id being edited
+;   r14 = content length (bytes used in fs_io_buf)
+;   r13 = cursor index into fs_io_buf (0..r14)
+;   r12 = "top row" - the 0-based row number (counting both embedded
+;         newlines and 80-col wraps from the start of the buffer) that
+;         .ce_render currently shows at the top of the scrollable body.
+;
+; Unlike read_line (which only ever holds one un-wrapped line, so it can
+; patch the screen in place with cursor_step_left/right), fs_io_buf here
+; contains real embedded newlines, and putchar forces column->0 on those
+; regardless of the current column - so column-wrap-only cursor stepping
+; would desync from the real screen layout on any line short of 80 cols.
+; Simpler and robust: every navigation or edit fully redraws the visible
+; page from a recomputed buffer offset (.ce_render below), rather than
+; trying to patch deltas.
 cmd_edit:
     cmp byte [arg1_buf], 0
     jne .ce_have_arg
@@ -1614,25 +1663,18 @@ cmd_edit:
     lea rdi, [fs_io_buf]
     call fs_read_file
 
-    call clear_screen
-    mov rsi, msg_edit_header1
-    mov al, ATTR_PROMPT
-    call print_string_attr
-    mov rsi, arg1_buf
-    mov al, ATTR_PROMPT
-    call print_string_attr
-    mov rsi, msg_edit_header2
-    mov al, ATTR_PROMPT
-    call print_string_attr
-
-    lea rsi, [fs_io_buf]
-    mov al, [cur_normal_attr]
-    call print_string_attr
-
     lea rsi, [fs_io_buf]
     call str_len
+    push r12
+    push r13
     push r14
-    mov r14, rax
+    mov r14, rax                     ; content length
+    mov r13, r14                     ; cursor starts at end (append point),
+                                      ; matching the old typewriter behavior
+    xor r12, r12                     ; top row starts at 0
+    mov byte [edit_active], 1        ; makes get_char treat plain Up/Down as
+                                      ; "scroll the view", not shell history
+    call .ce_render                  ; initial draw (header + content + cursor)
 .ce_loop:
     call get_char
     cmp al, 27
@@ -1641,41 +1683,80 @@ cmd_edit:
     je .ce_newline
     cmp al, 8
     je .ce_bksp
-    cmp al, KEY_UP
-    je .ce_loop                  ; no history/scrollback editing here, ignore
-    cmp al, KEY_DOWN
+    cmp al, KEY_UP                   ; edit_active makes get_char consume Up/Down
+    je .ce_loop                      ; itself to scroll - these are just a safety net
+    cmp al, KEY_DOWN                 ; in case a sentinel ever slips through anyway
     je .ce_loop
-    cmp r14, EDIT_MAX-1
-    jae .ce_loop
-    lea rdi, [fs_io_buf]
-    mov [rdi + r14], al
-    inc r14
-    mov byte [rdi + r14], 0
-    push rbx
-    mov bl, [cur_normal_attr]
-    call putchar
-    pop rbx
+    cmp al, KEY_PASTE                ; paste isn't wired up in the editor yet -
+    je .ce_loop                      ; ignore rather than insert the raw sentinel byte
+    cmp al, KEY_LEFT
+    je .ce_left
+    cmp al, KEY_RIGHT
+    je .ce_right
+    cmp al, KEY_HOME
+    je .ce_home
+    cmp al, KEY_END
+    je .ce_end
+    cmp al, KEY_DELETE
+    je .ce_delete
+    call .ce_insert_at
+    call .ce_render
     jmp .ce_loop
 .ce_newline:
-    cmp r14, EDIT_MAX-1
-    jae .ce_loop
-    lea rdi, [fs_io_buf]
-    mov byte [rdi + r14], 10
-    inc r14
-    mov byte [rdi + r14], 0
     mov al, 0x0A
-    push rbx
-    xor bl, bl
-    call putchar
-    pop rbx
+    call .ce_insert_at
+    call .ce_render
     jmp .ce_loop
 .ce_bksp:
-    cmp r14, 0
+    cmp r13, 0
     je .ce_loop
-    dec r14
-    lea rdi, [fs_io_buf]
-    mov byte [rdi + r14], 0
-    call do_backspace
+    dec r13
+    mov rdx, r13
+    call .ce_delete_at
+    call .ce_render
+    jmp .ce_loop
+.ce_delete:
+    cmp r13, r14
+    jae .ce_loop
+    mov rdx, r13
+    call .ce_delete_at
+    call .ce_render
+    jmp .ce_loop
+.ce_left:
+    cmp r13, 0
+    je .ce_loop
+    dec r13
+    call .ce_render
+    jmp .ce_loop
+.ce_right:
+    cmp r13, r14
+    jae .ce_loop
+    inc r13
+    call .ce_render
+    jmp .ce_loop
+.ce_home:
+    lea rsi, [fs_io_buf]
+.ceh_scan:
+    cmp r13, 0
+    je .ceh_done
+    cmp byte [rsi + r13 - 1], 10
+    je .ceh_done
+    dec r13
+    jmp .ceh_scan
+.ceh_done:
+    call .ce_render
+    jmp .ce_loop
+.ce_end:
+    lea rsi, [fs_io_buf]
+.cee_scan:
+    cmp r13, r14
+    jae .cee_done
+    cmp byte [rsi + r13], 10
+    je .cee_done
+    inc r13
+    jmp .cee_scan
+.cee_done:
+    call .ce_render
     jmp .ce_loop
 .ce_finish:
     mov rsi, msg_save_prompt
@@ -1693,6 +1774,7 @@ cmd_edit:
     je .ce_discard
     jmp .ce_wait_key
 .ce_save:
+    mov byte [edit_active], 0
     mov rax, r15
     lea rsi, [fs_io_buf]
     call fs_write_file
@@ -1702,14 +1784,19 @@ cmd_edit:
     mov al, [cur_normal_attr]
     call print_string_attr
     pop r14
+    pop r13
+    pop r12
     pop r15
     ret
 .ce_discard:
+    mov byte [edit_active], 0
     call clear_screen
     mov rsi, msg_discarded
     mov al, [cur_normal_attr]
     call print_string_attr
     pop r14
+    pop r13
+    pop r12
     pop r15
     ret
 .ce_not_found:
@@ -1720,6 +1807,233 @@ cmd_edit:
     call print_string
     mov rsi, newline_str
     call print_string
+    ret
+
+; .ce_insert_at (in: al = char to insert at the cursor). Shifts
+; fs_io_buf[r13..r14-1] right by one, stores al at r13, and advances
+; r13/r14 past it. No-op if the file is already at EDIT_MAX. Mirrors
+; read_line's .insert_char, but against the persistent file buffer
+; instead of a stack line buffer. Clobbers rax/rbx/rcx/rsi.
+.ce_insert_at:
+    cmp r14, EDIT_MAX-1
+    jae .cei_ret
+    push rbx
+    push rcx
+    push rsi
+    mov bl, al                       ; stash the typed char - the shift below uses al as scratch
+    lea rsi, [fs_io_buf]
+    mov rcx, r14                     ; walk from the end down to r13
+.cei_shift:
+    cmp rcx, r13
+    je .cei_place
+    mov al, [rsi + rcx - 1]
+    mov [rsi + rcx], al
+    dec rcx
+    jmp .cei_shift
+.cei_place:
+    mov [rsi + r13], bl
+    inc r14
+    mov byte [rsi + r14], 0
+    inc r13
+    pop rsi
+    pop rcx
+    pop rbx
+.cei_ret:
+    ret
+
+; .ce_delete_at (in: rdx = buffer index to remove). Shifts
+; fs_io_buf[rdx+1..r14-1] left by one and decrements r14. Does not touch
+; r13 - callers position the cursor (e.g. Backspace decrements r13 first,
+; forward-Delete leaves it alone) before calling. Clobbers rax/rbx/rsi.
+.ce_delete_at:
+    push rax
+    push rbx
+    push rsi
+    lea rsi, [fs_io_buf]
+    mov rbx, rdx
+.cda_loop:
+    lea rax, [rbx+1]
+    cmp rax, r14
+    jae .cda_done
+    mov al, [rsi + rax]
+    mov [rsi + rbx], al
+    inc rbx
+    jmp .cda_loop
+.cda_done:
+    dec r14
+    mov byte [rsi + r14], 0
+    pop rsi
+    pop rbx
+    pop rax
+    ret
+
+; .ce_row_of (in: rcx = a buffer index). Scans fs_io_buf[0..rcx-1] applying
+; the same row-break rules putchar does (embedded newline, or column wrap
+; at VGA_COLS) -> out: rax = the 0-based row number that index rcx falls
+; on. Clobbers rax/rbx/rsi/r8/r9/r10.
+.ce_row_of:
+    push rbx
+    push rsi
+    push r8
+    push r9
+    push r10
+    xor r8, r8                       ; row
+    xor r9, r9                       ; col
+    xor r10, r10                     ; i
+    lea rsi, [fs_io_buf]
+.cro_loop:
+    cmp r10, rcx
+    jae .cro_done
+    movzx ebx, byte [rsi + r10]
+    cmp bl, 10
+    je .cro_nl
+    inc r9
+    cmp r9, VGA_COLS
+    jne .cro_next
+    xor r9, r9
+    inc r8
+    jmp .cro_next
+.cro_nl:
+    xor r9, r9
+    inc r8
+.cro_next:
+    inc r10
+    jmp .cro_loop
+.cro_done:
+    mov rax, r8
+    pop r10
+    pop r9
+    pop r8
+    pop rsi
+    pop rbx
+    ret
+
+; .ce_offset_of_row (in: rcx = a target row number, uses r14 = content
+; length). Runs the same row simulation forward from the start of the
+; buffer until the row counter reaches rcx -> out: rax = the buffer index
+; of the first character of that row (clamped to r14 if the buffer ends
+; first). Clobbers rax/rbx/rsi/r8/r9/r10.
+.ce_offset_of_row:
+    push rbx
+    push rsi
+    push r8
+    push r9
+    push r10
+    xor r8, r8                       ; row
+    xor r9, r9                       ; col
+    xor r10, r10                     ; i
+    lea rsi, [fs_io_buf]
+.cor_loop:
+    cmp r8, rcx
+    jae .cor_found
+    cmp r10, r14
+    jae .cor_found
+    movzx ebx, byte [rsi + r10]
+    cmp bl, 10
+    je .cor_nl
+    inc r9
+    cmp r9, VGA_COLS
+    jne .cor_next
+    xor r9, r9
+    inc r8
+    jmp .cor_next
+.cor_nl:
+    xor r9, r9
+    inc r8
+.cor_next:
+    inc r10
+    jmp .cor_loop
+.cor_found:
+    mov rax, r10
+    pop r10
+    pop r9
+    pop r8
+    pop rsi
+    pop rbx
+    ret
+
+; .ce_render: the single redraw routine every cmd_edit navigation/edit
+; op calls afterward. Scrolls r12 (top row) just enough to keep the
+; cursor (r13) on screen, clears and redraws the header + the visible
+; slice of fs_io_buf, and leaves the hardware cursor sitting exactly on
+; r13's screen cell. O(visible page + scan-to-cursor) per call rather
+; than O(1), which is fine for a polled-keyboard editor. Clobbers
+; rax/rbx/rcx/rdx/rsi/rdi/r8/r9/r11.
+.ce_render:
+    mov rcx, r13
+    call .ce_row_of                  ; rax = cursor's row number
+    mov r11, rax
+    cmp r11, r12
+    jl .cer_scroll_up
+    mov rbx, r12
+    add rbx, (VGA_ROWS - EDIT_HEADER_ROWS - 1)
+    cmp r11, rbx
+    jle .cer_have_top
+    mov r12, r11
+    sub r12, (VGA_ROWS - EDIT_HEADER_ROWS - 1)
+    jmp .cer_have_top
+.cer_scroll_up:
+    mov r12, r11
+.cer_have_top:
+    mov rcx, r12
+    call .ce_offset_of_row           ; rax = buffer offset of the top row
+    push rax
+
+    call clear_screen
+    mov rsi, msg_edit_header1
+    mov al, ATTR_PROMPT
+    call print_string_attr
+    mov rsi, arg1_buf
+    mov al, ATTR_PROMPT
+    call print_string_attr
+    mov rsi, msg_edit_header2
+    mov al, ATTR_PROMPT
+    call print_string_attr           ; ends in \n\n -> cursor now at row EDIT_HEADER_ROWS, col 0
+
+    pop rbx                          ; rbx = i, walks the buffer from the top-row offset
+    mov byte [ce_cursor_captured], 0
+    lea rsi, [fs_io_buf]
+    xor r9, r9                       ; rows drawn so far in the body (relative to top)
+.cer_loop:
+    cmp rbx, r14
+    jae .cer_end_of_buf
+    cmp rbx, r13
+    jne .cer_no_capture
+    cmp byte [ce_cursor_captured], 0
+    jne .cer_no_capture
+    mov al, [cursor_row]
+    mov [ce_saved_row], al
+    mov al, [cursor_col]
+    mov [ce_saved_col], al
+    mov byte [ce_cursor_captured], 1
+.cer_no_capture:
+    cmp r9, (VGA_ROWS - EDIT_HEADER_ROWS)
+    jae .cer_done                    ; body's full - rest of the file stays off-screen
+    movzx eax, byte [rsi + rbx]
+    push rbx
+    mov bl, [cur_normal_attr]
+    call putchar
+    pop rbx
+    cmp byte [cursor_col], 0         ; putchar zeroed the column -> a row break just
+    jne .cer_next                    ; happened, whether from '\n' or an 80-col wrap
+    inc r9
+.cer_next:
+    inc rbx
+    jmp .cer_loop
+.cer_end_of_buf:
+    cmp byte [ce_cursor_captured], 0
+    jne .cer_done                    ; cursor is at end-of-content (r13==r14): current
+    mov al, [cursor_row]             ; live cursor_row/col, right after the last drawn
+    mov [ce_saved_row], al           ; char, is already exactly the right spot
+    mov al, [cursor_col]
+    mov [ce_saved_col], al
+    mov byte [ce_cursor_captured], 1
+.cer_done:
+    mov al, [ce_saved_row]
+    mov [cursor_row], al
+    mov al, [ce_saved_col]
+    mov [cursor_col], al
+    call update_cursor
     ret
 
 ; ------------------------------------------------------------
@@ -13797,6 +14111,9 @@ cmd_shelly:
     mov al, 0x0A
     mov bl, [cur_normal_attr]
     call putchar
+    mov rsi, shelly_version
+    mov al, ATTR_WIG
+    call print_string_attr
     mov rsi, shelly_by
     mov al, 0x0D
     call print_string_attr
@@ -14064,6 +14381,42 @@ update_cursor:
     pop rax
     ret
 
+; cursor_step_left / cursor_step_right: move the hardware cursor one cell
+; back/forward across cursor_row/cursor_col (wrapping at row edges), without
+; touching VGA content. Used by read_line for Left/Right/Home/End so moving
+; the cursor over already-echoed text doesn't erase or retype anything.
+; cursor_step_left is a no-op at row 0, col 0 (nothing further left to go).
+; cursor_step_right does not scroll - callers only step it across text that
+; has already been drawn (and therefore already fits on screen).
+cursor_step_left:
+    push rax
+    cmp byte [cursor_col], 0
+    jne .left_dec
+    cmp byte [cursor_row], 0
+    je .left_out          ; already at top-left; nothing to do
+    dec byte [cursor_row]
+    mov byte [cursor_col], VGA_COLS-1
+    jmp .left_upd
+.left_dec:
+    dec byte [cursor_col]
+.left_upd:
+    call update_cursor
+.left_out:
+    pop rax
+    ret
+
+cursor_step_right:
+    push rax
+    inc byte [cursor_col]
+    cmp byte [cursor_col], VGA_COLS
+    jne .right_upd
+    mov byte [cursor_col], 0
+    inc byte [cursor_row]
+.right_upd:
+    call update_cursor
+    pop rax
+    ret
+
 ; print_string: rsi = null terminated string, default attribute
 print_string:
     push rax
@@ -14301,11 +14654,15 @@ spinner_clear:
 
 ; get_char: blocks until a key is pressed, returns ascii in al.
 ; Also handles: Ctrl tracking (make/break of 0x1D, plain or E0-prefixed),
-; E0-prefixed arrow keys (Up=0x48, Down=0x50), and Ctrl+Up/Ctrl+Down driving
-; the on-screen scrollback view. Plain Up/Down (no Ctrl) are returned to the
-; caller as the sentinel bytes KEY_UP/KEY_DOWN instead of an ascii char, so
-; read_line can use them for command history. Right before returning any
-; real key (ascii or arrow sentinel) to the caller, if the view is currently
+; E0-prefixed arrow/Home/End/Delete keys (Up=0x48, Down=0x50, Left=0x4B,
+; Right=0x4D, Home=0x47, End=0x4F, Delete=0x53), and Ctrl+Up/Ctrl+Down (or,
+; while edit_active is set, plain Up/Down with no Ctrl needed) driving the
+; on-screen scrollback view. Plain Up/Down (no Ctrl, edit_active clear),
+; Left, Right, Home, End, and Delete are all returned to the caller as
+; sentinel bytes (KEY_UP/KEY_DOWN/KEY_LEFT/KEY_RIGHT/KEY_HOME/KEY_END/
+; KEY_DELETE) instead of an ascii char, so read_line can use them for
+; history and in-line cursor movement/editing. Right before returning any
+; real key (ascii or sentinel) to the caller, if the view is currently
 ; scrolled back it snaps back to the live screen first - typing or
 ; navigating history always means "I'm done reviewing, back to the prompt".
 get_char:
@@ -14335,6 +14692,16 @@ get_char:
     je .ext_up
     cmp bl, 0x50                 ; extended Down
     je .ext_down
+    cmp bl, 0x4B                 ; extended Left
+    je .ext_left
+    cmp bl, 0x4D                 ; extended Right
+    je .ext_right
+    cmp bl, 0x47                 ; extended Home
+    je .ext_home
+    cmp bl, 0x4F                 ; extended End
+    je .ext_end
+    cmp bl, 0x53                 ; extended Delete
+    je .ext_delete
     cmp bl, 0x1D                 ; right Ctrl make
     je .ext_ctrl_make
     cmp bl, 0x1C                 ; keypad Enter
@@ -14370,17 +14737,23 @@ get_char:
     mov byte [ctrl_state], 0
     jmp .wait
 .ext_up:
+    cmp byte [edit_active], 0
+    jne .eu_scroll                ; edit mode: plain Up always scrolls, no Ctrl needed
     cmp byte [ctrl_state], 0
     je .return_up
     cmp byte [browse_active], 0
     jne .return_up
+.eu_scroll:
     call scrollback_view_up
     jmp .wait
 .ext_down:
+    cmp byte [edit_active], 0
+    jne .ed_scroll                ; edit mode: plain Down always scrolls, no Ctrl needed
     cmp byte [ctrl_state], 0
     je .return_down
     cmp byte [browse_active], 0
     jne .return_down
+.ed_scroll:
     call scrollback_view_down
     jmp .wait
 .return_up:
@@ -14388,6 +14761,21 @@ get_char:
     jmp .snap_and_return
 .return_down:
     mov al, KEY_DOWN
+    jmp .snap_and_return
+.ext_left:
+    mov al, KEY_LEFT
+    jmp .snap_and_return
+.ext_right:
+    mov al, KEY_RIGHT
+    jmp .snap_and_return
+.ext_home:
+    mov al, KEY_HOME
+    jmp .snap_and_return
+.ext_end:
+    mov al, KEY_END
+    jmp .snap_and_return
+.ext_delete:
+    mov al, KEY_DELETE
     jmp .snap_and_return
 
 .not_ext_cont:
@@ -14658,14 +15046,18 @@ scrollback_view_down:
     ret
 
 ; read_line: rdi=buffer, rcx=max chars. Echoes to screen, handles
-; backspace, Up/Down command history, and terminates on Enter. Buffer is
-; null terminated.
+; backspace/Delete, Left/Right/Home/End in-line cursor movement, Up/Down
+; command history, and terminates on Enter. Buffer is null terminated.
+; r8 = current line length, r9 = buffer ptr, r10 = max chars, r11 = the
+; cursor's position within the line (0..r8) - everything below that
+; isn't a straight end-of-line append goes through r11 instead of r8.
 read_line:
     push rax
     push rbx
     push rdi
     push rcx
     xor r8, r8
+    xor r11, r11
     mov r9, rdi
     mov r10, rcx
     mov byte [history_nav], 0
@@ -14683,19 +15075,160 @@ read_line:
     je .hist_down
     cmp al, KEY_PASTE
     je .paste
-    cmp r8, r10
+    cmp al, KEY_LEFT
+    je .curs_left
+    cmp al, KEY_RIGHT
+    je .curs_right
+    cmp al, KEY_HOME
+    je .curs_home
+    cmp al, KEY_END
+    je .curs_end
+    cmp al, KEY_DELETE
+    je .fwd_delete
+    call .insert_char
+    jmp .loop
+
+.curs_left:
+    cmp r11, 0
+    je .loop
+    dec r11
+    call cursor_step_left
+    jmp .loop
+.curs_right:
+    cmp r11, r8
     jae .loop
-    mov [r9 + r8], al
+    inc r11
+    call cursor_step_right
+    jmp .loop
+.curs_home:
+    cmp r11, 0
+    je .loop
+    dec r11
+    call cursor_step_left
+    jmp .curs_home
+.curs_end:
+    cmp r11, r8
+    jae .loop
+    inc r11
+    call cursor_step_right
+    jmp .curs_end
+
+.bksp:
+    cmp r11, 0
+    je .loop
+    dec r11
+    call .remove_at_cursor
+    call cursor_step_left
+    mov rcx, 1                   ; one stale trailing cell to blank
+    call .redraw_tail
+    jmp .loop
+
+.fwd_delete:
+    cmp r11, r8
+    jae .loop
+    call .remove_at_cursor
+    mov rcx, 1                   ; one stale trailing cell to blank
+    call .redraw_tail
+    jmp .loop
+
+; .remove_at_cursor: deletes the buffer byte at index r11, shifting
+; everything after it left by one, and decrements r8. Does not touch the
+; screen or r11 itself - callers handle cursor movement/redraw. Clobbers
+; rax/rdx.
+.remove_at_cursor:
+    push rax
+    push rdx
+    mov rdx, r11
+.rac_loop:
+    lea rax, [rdx+1]
+    cmp rax, r8
+    jae .rac_done
+    mov al, [r9 + rax]
+    mov [r9 + rdx], al
+    inc rdx
+    jmp .rac_loop
+.rac_done:
+    dec r8
+    pop rdx
+    pop rax
+    ret
+
+; .insert_char (in: al = character to insert at the cursor). Shifts
+; buf[r11..r8-1] right by one, stores al at r9+r11, redraws the
+; widened tail, and advances r11/the screen cursor past the inserted
+; character. No-op if the buffer is already full. Clobbers
+; rax/rbx/rcx/rdx/rsi/rdi; updates r8/r11.
+.insert_char:
+    cmp r8, r10
+    jae .ic_full
+    mov dl, al                   ; stash the typed char - the shift below uses al as scratch
+    cmp r8, r11
+    je .ic_no_shift
+    mov rsi, r8
+.ic_shift:
+    dec rsi
+    mov al, [r9 + rsi]
+    mov [r9 + rsi + 1], al
+    cmp rsi, r11
+    je .ic_no_shift
+    jmp .ic_shift
+.ic_no_shift:
+    mov al, dl
+    mov [r9 + r11], al
     inc r8
+    xor rcx, rcx                 ; buffer just grew - nothing stale to blank
+    call .redraw_tail
+    inc r11
+    call cursor_step_right
+.ic_full:
+    ret
+
+; .redraw_tail (in: rcx = extra blank cells to print after the tail, 0 or
+; 1). Redraws buf[r11..r8-1] then rcx blanks via putchar, then walks the
+; hardware cursor back left until it's on r11's screen cell again. Every
+; caller above has the hardware cursor sitting exactly on r11's screen
+; cell when it calls this. Preserves r8/r9/r10/r11; clobbers
+; rax/rbx/rcx/rdx/rsi/rdi.
+.redraw_tail:
+    push rax
+    push rbx
+    push rdx
+    push rsi
+    push rdi
+    mov rdx, r8
+    sub rdx, r11                 ; rdx = tail length (buffer chars to draw)
+    mov rdi, rdx
+    add rdi, rcx                 ; rdi = total cells printed = walk-back distance
+    mov rsi, r11                 ; rsi walks r11..r8-1 as a buffer index directly
+.rt_buf_loop:
+    cmp rsi, r8
+    jae .rt_blank_loop
+    mov al, [r9 + rsi]
     mov bl, [cur_normal_attr]
     call putchar
-    jmp .loop
-.bksp:
-    cmp r8, 0
-    je .loop
-    dec r8
-    call do_backspace
-    jmp .loop
+    inc rsi
+    jmp .rt_buf_loop
+.rt_blank_loop:
+    cmp rcx, 0
+    je .rt_back_loop
+    mov al, ' '
+    mov bl, [cur_normal_attr]
+    call putchar
+    dec rcx
+    jmp .rt_blank_loop
+.rt_back_loop:
+    cmp rdi, 0
+    je .rt_done
+    call cursor_step_left
+    dec rdi
+    jmp .rt_back_loop
+.rt_done:
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rbx
+    pop rax
+    ret
 
 .paste:
     lea rsi, [clip_buf]
@@ -14715,20 +15248,18 @@ read_line:
     jb .paste_next            ; only paste printable characters
     cmp al, '~'
     ja .paste_next
-    mov [r9 + r8], al
-    inc r8
     push rsi
-    push rbx
-    mov bl, [cur_normal_attr]
-    call putchar
-    pop rbx
+    call .insert_char
     pop rsi
 .paste_next:
     inc rsi
     jmp .paste_loop
 
 .tab:
+    cmp r11, r8
+    jne .loop                    ; completion only supported with the cursor at end-of-line
     call complete_line
+    mov r11, r8                   ; completion only ever appends, so the cursor tracks the new end
     jmp .loop
 
 .hist_up:
@@ -14744,6 +15275,7 @@ read_line:
     lea rdi, [history_saved_line]
     call str_copy
 .hu_have_saved:
+    call .cursor_to_end
     inc byte [history_nav]
     call .history_index          ; -> rax = ring index for history_nav
     imul rax, LINE_MAX
@@ -14755,6 +15287,7 @@ read_line:
     cmp byte [history_nav], 0
     je .loop
     dec byte [history_nav]
+    call .cursor_to_end
     cmp byte [history_nav], 0
     jne .hd_older
     lea rsi, [history_saved_line]
@@ -14766,6 +15299,18 @@ read_line:
     lea rsi, [history_buf + rax]
     call .load_entry
     jmp .loop
+
+; .cursor_to_end: walks r11/the screen cursor forward to the end of the
+; current line. Used before history navigation replaces the whole line,
+; since the erase-and-reload below assumes the cursor starts at the end.
+.cursor_to_end:
+    cmp r11, r8
+    jae .cte_out
+    inc r11
+    call cursor_step_right
+    jmp .cursor_to_end
+.cte_out:
+    ret
 
 ; .history_index: rax = (history_next + HISTORY_MAX - history_nav) mod HISTORY_MAX
 .history_index:
@@ -14784,7 +15329,9 @@ read_line:
     ret
 
 ; .load_entry: rsi = null-terminated source string. Erases the currently
-; displayed/buffered line and replaces it with the source string.
+; displayed/buffered line (cursor assumed at end-of-line - see
+; .cursor_to_end above) and replaces it with the source string, leaving
+; the cursor at the new end.
 .load_entry:
     push rax
     push rcx
@@ -14820,6 +15367,7 @@ read_line:
     inc rcx
     jmp .le_echo
 .le_echo_done:
+    mov r11, r8
     pop rcx
     pop rax
     ret
@@ -15190,6 +15738,19 @@ cur_normal_attr: db ATTR_NORMAL      ; foreground color used for normal output; 
 
 ; --- keyboard/scrollback/history state ---
 ctrl_state:    db 0                  ; 1 while either Ctrl key is held
+edit_active:   db 0                  ; 1 while cmd_edit's editor loop owns the keyboard -
+                                      ; makes plain Up/Down scroll the view instead of
+                                      ; being treated as shell command history
+
+; --- cmd_edit .ce_render scratch: the render pass streams fs_io_buf through
+; putchar (which is the only thing allowed to touch cursor_row/cursor_col
+; and trigger wraps), so it can't just compute the cursor's screen position
+; ahead of time - it captures cursor_row/cursor_col live, the instant the
+; render reaches the cursor's buffer index, into these, then restores them
+; once the whole visible page has been drawn. ---
+ce_cursor_captured: db 0
+ce_saved_row:       db 0
+ce_saved_col:       db 0
 kbd_ext_flag:  db 0                  ; 1 while waiting for the byte after an 0xE0 prefix
 scroll_offset: db 0                  ; 0 = live view, N = N lines scrolled back
 sb_write_idx:  db 0                  ; next slot to write in scrollback_buf (ring)
@@ -15218,7 +15779,7 @@ wig_str_buf:   times 16 db 0    ; scratch for the wig clock widget
 wig_last_sec:  db 0             ; last second the widget drew (redraw gate)
 
 banner:
-    db "ShellyForever v0.1.9 -- 'help' for commands", 10, 0
+    db "ShellyForever v0.1.10 -- 'help' for commands", 10, 0
 build_stamp:
     db "build 20260809b -- Party expansion + SFFS V4", 10, 0
 
@@ -15355,6 +15916,7 @@ SHELLY_PAL_LEN equ 6
 shelly_palette: db 0x0E, 0x0B, 0x0A, 0x0D, 0x09, 0x0F   ; yel, cyan, grn, mag, lblu, wht
 shelly_rule:  db "  ============================================================", 10, 0
 shelly_title: db "         ShellyForever OS", 0
+shelly_version: db "         v0.1.10", 10, 0
 shelly_by:    db "         Developed by Sourasish Das", 10, 0
 shelly_cr:    db "         Copyright 2026. All rights reserved.", 10, 0
 str_col_black:    db "black", 0
@@ -15926,7 +16488,8 @@ help_wig:
 help_shelly:
     db "shelly", 10
     db "  Print the ShellyForever OS splash banner: a rainbow", 10
-    db "  title, the developer credit, and the copyright line.", 10, 0
+    db "  title, the build version, the developer credit, and", 10
+    db "  the copyright line.", 10, 0
 
 help_take:
     db "take <url> <file>", 10

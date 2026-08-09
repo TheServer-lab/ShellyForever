@@ -24,22 +24,28 @@ jmp start
 
 KERNEL_LOAD_SEG   equ 0x0000
 KERNEL_LOAD_OFF   equ 0x8000
-KERNEL_SECTORS    equ 900         ; how many 512B sectors to load (450KB). Bumped from
-                                  ; 560 - the real kernel.bin (with party/tcp/http/browse/
-                                  ; mouse folded in) had grown to 842 sectors, so most of
-                                  ; boot.asm's load was silently truncating the kernel's
-                                  ; own tail data (including ata_port_base/ata_drive_sel/
-                                  ; fs_disk_available, which all landed around sector 616)
-                                  ; - those never got copied off disk, so the ATA driver
-                                  ; ran with a zeroed port base and "No disk detected"
-                                  ; even though the drive was fine. 900 gives real headroom
-                                  ; past the current 842-sector size.
+KERNEL_SECTORS    equ 1100        ; how many 512B sectors to load. Bumped from 900 - the
+                                  ; splash screen's incbin'd image+palette data (see
+                                  ; kernel.asm's splash_stub) adds ~65KB (~127 sectors) on
+                                  ; top of the real kernel.bin's existing ~842 sectors
+                                  ; (with party/tcp/http/browse/mouse folded in), landing
+                                  ; around 970 - 1100 gives real headroom past that, not
+                                  ; just enough for today's build. Previously bumped from
+                                  ; 560 for the same reason (see git history): too little
+                                  ; headroom here silently truncates the kernel's own tail
+                                  ; data (ata_port_base/ata_drive_sel/fs_disk_available
+                                  ; landed around sector 616 last time this bit), so the
+                                  ; ATA driver ran with a zeroed port base and "No disk
+                                  ; detected" even though the drive was fine.
                                   ; The CHS fallback reads at most 18
                                   ; sectors per BIOS call (not limited by al directly - see
                                   ; the .loop chunking below) and this total must stay clear
-                                  ; of the SFFS region - see kernel.asm's FS_LBA_START, and
-                                  ; leave real margin, not just enough for today's build -
-                                  ; and <= 2880 (media).
+                                  ; of the SFFS region - see kernel.asm's FS_LBA_START (now
+                                  ; 1150 to match), and leave real margin, not just enough
+                                  ; for today's build - and <= 2880 (media). If
+                                  ; KERNEL_SECTORS is ever bumped again, bump FS_LBA_START in
+                                  ; kernel.asm to match - the two are not shared constants,
+                                  ; so nothing else will catch a drift between them.
 
 ; ---- on-screen checkpoint markers ----
 ; Each stage of the real->protected->long mode transition writes one
@@ -162,22 +168,18 @@ read_done:
     mov dl, '2'
     call dbg16
 
-    cli
-
-    ; ---- enable A20 via the fast-A20 gate (port 0x92). Honored by QEMU,
-    ; VirtualBox, VMware and essentially all real chipsets; the old 8042
-    ; keyboard-controller method was dropped to keep this sector at 512 bytes.
-    mov al, 0x02
-    out 0x92, al
-
-    ; ---- load GDT for protected mode ----
-    lgdt [gdt32_descriptor]
-
-    mov eax, cr0
-    or eax, 1
-    mov cr0, eax
-
-    jmp CODE32_SEL:pm_entry     ; far jump flushes prefetch, loads CS
+    ; ---- hand off to kernel.bin, STILL IN REAL MODE ----
+    ; kernel.bin now opens with its own small 16-bit stub (see kernel.asm's
+    ; splash_stub) that shows the boot splash (mode 13h) while BIOS INT 10h/
+    ; INT 16h are still available, then does the A20/GDT/protected-mode/
+    ; long-mode transition itself and finally jumps into kernel_entry. That
+    ; transition code used to live here in boot.asm; it moved to kernel.asm
+    ; so the splash can run before it, and so this sector - already tight -
+    ; doesn't have to grow to fit "set mode 13h, load palette, blit image,
+    ; wait for key, restore text mode" as well as the transition.
+    ; A far jump (not a near jump) so cs:ip is set explicitly to 0000:8000,
+    ; matching KERNEL_LOAD_SEG:KERNEL_LOAD_OFF exactly.
+    jmp KERNEL_LOAD_SEG:KERNEL_LOAD_OFF
 
 disk_error:
     mov bx, 2                   ; 'E' at col 1 (same spot '2' would use): a real
@@ -219,114 +221,6 @@ dap_set_buf:
     shr edx, 4
     mov [dap_seg], dx
     ret
-
-; ============================================================
-; 32-bit protected mode
-; ============================================================
-BITS 32
-pm_entry:
-    mov ax, DATA32_SEL
-    mov ds, ax
-    mov es, ax
-    mov fs, ax
-    mov gs, ax
-    mov ss, ax
-    mov esp, 0x9F000
-
-    ; ---- build minimal 4-level page tables for long mode ----
-    ; layout: PML4 @0x1000, PDPT @0x2000, PD @0x3000
-    ; PD uses 32 2MB page entries that identity-map 0-64MB. This boot
-    ; sector must fit in 512 bytes, so it only builds a small starter
-    ; map to get into long mode; kernel.asm (which has plenty of room)
-    ; extends this to a much larger identity map before anything that
-    ; needs it (like acpi_shutdown's ACPI table walk) runs. See
-    ; kernel.asm's expand_identity_map for why 64MB alone isn't enough.
-
-    mov edi, 0x1000
-    mov ecx, 0x3000 / 4          ; clear 0x1000..0x4000
-    xor eax, eax
-    rep stosd
-
-    ; high dwords of PML4/PDPT[0] are already 0 from the clear loop above
-    mov dword [0x1000], 0x2000 | 0x3   ; PML4[0] -> PDPT (present+rw)
-    mov dword [0x2000], 0x3000 | 0x3   ; PDPT[0] -> PD (present+rw)
-
-    ; PD[0..31] -> 2MB pages @ 0, 2MB, 4MB, ... 62MB (present+rw+PS).
-    ; High dwords are already 0 from the clear loop above, so only the
-    ; low dword of each entry needs writing.
-    mov edi, 0x3000
-    mov eax, 0x83                ; present+rw+PS(2MB), base 0 for first page
-    mov cl, 32                   ; 32 * 2MB = 64MB (ecx's upper bytes are
-                                  ; already 0 from the clear loop above)
-.fill_pd:
-    mov [edi], eax
-    add eax, 0x200000            ; next 2MB page
-    add edi, 8                   ; next PD entry
-    loop .fill_pd
-
-    ; ---- load CR3 ----
-    mov eax, 0x1000
-    mov cr3, eax
-
-    ; ---- enable PAE (CR4 bit 5) ----
-    mov eax, cr4
-    or eax, 1 << 5
-    mov cr4, eax
-
-    ; ---- set LME (long mode enable) in EFER MSR (0xC0000080) ----
-    mov ecx, 0xC0000080
-    rdmsr
-    or eax, 1 << 8
-    wrmsr
-
-    ; ---- enable paging (CR0 bit 31) => activates long mode ----
-    mov eax, cr0
-    or eax, 1 << 31
-    mov cr0, eax
-
-    ; ---- jump into 64-bit code segment ----
-    jmp CODE64_SEL:lm_entry
-
-; ============================================================
-; 64-bit long mode
-; ============================================================
-BITS 64
-lm_entry:
-    mov ax, DATA32_SEL
-    mov ds, ax
-    mov es, ax
-    mov fs, ax
-    mov gs, ax
-    mov ss, ax
-    mov rsp, 0x9F000
-
-    mov rax, KERNEL_LOAD_OFF     ; kernel is loaded flat at 0x8000
-    jmp rax
-
-; ============================================================
-; GDT
-; ============================================================
-ALIGN 8
-gdt32_start:
-    dq 0x0000000000000000                     ; null descriptor
-CODE32_DESC:
-    dw 0xFFFF, 0x0000
-    db 0x00, 10011010b, 11001111b, 0x00        ; 32-bit code, base0 limit4G
-DATA32_DESC:
-    dw 0xFFFF, 0x0000
-    db 0x00, 10010010b, 11001111b, 0x00        ; 32-bit data
-CODE64_DESC:
-    dw 0x0000, 0x0000
-    db 0x00, 10011010b, 00100000b, 0x00        ; 64-bit code (L bit set)
-gdt32_end:
-
-gdt32_descriptor:
-    dw gdt32_end - gdt32_start - 1
-    dd gdt32_start
-
-CODE32_SEL equ CODE32_DESC - gdt32_start
-DATA32_SEL equ DATA32_DESC - gdt32_start
-CODE64_SEL equ CODE64_DESC - gdt32_start
 
 ; ============================================================
 ; pad boot sector to 512 bytes, boot signature

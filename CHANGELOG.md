@@ -4,6 +4,38 @@ All notable changes to ShellyForever are documented here. The format is
 loosely based on [Keep a Changelog](https://keepachangelog.com/); the
 project does not yet follow strict SemVer.
 
+## [0.1.10] - 2026-08-10
+
+### Added
+
+- **In-line cursor movement at the shell prompt (`read_line`)**.
+  Left/Right now step the cursor one character at a time through the
+  current line without disturbing already-typed text; Home/End jump it
+  to the start or end of the line in one keystroke; Delete forward-deletes
+  the character ahead of the cursor. Typing a character or pressing
+  Backspace with the cursor mid-line inserts or removes right there and
+  reflows the rest of the line, rather than only ever appending at the
+  end. Command history (Up/Down) and scrollback (Ctrl+Up/Ctrl+Down)
+  behave as before.
+- **In-line cursor movement in `edit`**. The same Left/Right/Home/End/
+  Delete handling is now available inside the `edit` command's editor:
+  the cursor can move freely through a file's existing content instead of
+  only sitting at the append point, and inserts, deletes, and newlines
+  happen wherever the cursor is placed. The visible page (and the
+  hardware cursor's on-screen position) is redrawn around the cursor on
+  every keystroke, same as before.
+- **`shelly` splash screen shows the build version**. `cmd_shelly` now
+  prints a `v0.1.10` line under the rainbow `ShellyForever OS` title and
+  above the developer credit and copyright line, so the splash banner
+  doubles as a quick "what build is this" check.
+
+### Changed
+
+- Banner and build stamp bumped to `v0.1.10` (`kernel.asm`).
+- README updated: the line-editing section now covers cursor movement at
+  the shell prompt and inside `edit`, and the `shelly`/`edit` command
+  table rows and "What's new" section reflect both changes.
+
 ## [0.1.9] - 2026-08-09
 
 ### Added

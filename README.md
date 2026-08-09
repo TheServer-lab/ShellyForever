@@ -1,6 +1,6 @@
 # ShellyForever
 
-**Version:** 0.1.9
+**Version:** 0.1.10
 
 A 64-bit shell-based OS written entirely in x86-64 NASM assembly, from scratch —
 no C, no BIOS libraries beyond boot-time disk/keyboard calls, no existing kernel.
@@ -70,7 +70,7 @@ no C, no BIOS libraries beyond boot-time disk/keyboard calls, no existing kernel
 | `view` | `view something.txt` | print a file's content |
 | `find` | `find notes.txt` | search every drive for a file/folder by name, print its full path |
 | `lookfor` | `lookfor "todo" notes.txt`, `lookfor "todo" line 100, 200 notes.txt limit 5` | search a file's content for text, like grep |
-| `edit` | `edit something.txt` | open the built-in editor for a file (Esc, then y/n to save) |
+| `edit` | `edit something.txt` | open the built-in editor for a file — Left/Right/Home/End move the cursor through existing content, Delete removes forward (Esc, then y/n to save) |
 | `<name> = <value>` | `a = 5` | set a variable to a literal or another variable's value |
 | `rmv` | `rmv a` | remove a variable |
 | `vars` | `vars` | list all variables |
@@ -79,7 +79,7 @@ no C, no BIOS libraries beyond boot-time disk/keyboard calls, no existing kernel
 | `date` | `date` | print the current date (from the RTC clock chip) |
 | `time` | `time` | print the current time, HH:MM:SS 24-hour (from the RTC) |
 | `wig` | `wig time` | live clock widget in the top-right corner, updates every second (Esc to stop) |
-| `shelly` | `shelly` | print the splash banner: a rainbow ShellyForever OS title, the developer credit, and the copyright line |
+| `shelly` | `shelly` | print the splash banner: a rainbow ShellyForever OS title, the build version, the developer credit, and the copyright line |
 | `write` | `show hi ~ write file.txt` | write text to a file (creates it, or overwrites); handy as a `~` pipe target |
 | `rr` | `rr script.rsh` | run a rush script file (`$` = comment line) |
 | `run` | `run hello.run` | run a compiled ShellyForever `RUN 0.1` executable; typing a bare `name.run` does the same |
@@ -114,18 +114,31 @@ no C, no BIOS libraries beyond boot-time disk/keyboard calls, no existing kernel
 | `give` | `give http://10.0.2.2:8000/upload notes.txt` | HTTP POST a local file to a server endpoint |
 | `browse` | `browse http://10.0.2.2:8000/` | fetch a page over HTTP, strip HTML to text, follow `[N]` links, back/forward/bookmarks (see below) |
 
-### Line editing: history, tab completion, and scrollback
+### Line editing: history, tab completion, cursor movement, and scrollback
 
 - **Tab** — command / filename completion (see below).
 - **Up / Down** — recall previous commands (like bash). Your in-progress
   line is preserved if you arrow up through history and then back down past
   the most recent entry. History holds the last 20 non-empty lines entered
   this session (not persisted across reboot).
+- **Left / Right** — move the cursor one character at a time within the
+  current line, without disturbing already-typed text. Typing or Backspace
+  at a mid-line cursor position inserts/removes right there and reflows the
+  rest of the line, rather than only ever appending at the end.
+- **Home / End** — jump the cursor to the start or end of the current line
+  in one keystroke.
+- **Delete** — remove the character to the right of the cursor (forward
+  delete), complementing Backspace's delete-to-the-left.
 - **Ctrl+Up / Ctrl+Down** — scroll the screen back to review output that's
   scrolled off the top (up to 100 lines of scrollback), without disturbing
   whatever you're mid-typing at the prompt. Typing a character, pressing
   Enter, or recalling history all snap the view back to live automatically.
   Works at the shell prompt and inside the `edit` command's editor.
+
+Left/Right/Home/End/Delete work the same way inside `edit`'s in-file editor:
+the cursor can move freely through the file's content (not just append at
+the end), and inserts/deletes/newlines happen wherever the cursor sits, with
+the visible page redrawn around it on every keystroke.
 
 ### Tab completion
 
@@ -939,6 +952,18 @@ message and then nothing, which is your cue to power off manually.
 
 ## What's new
 
+- **In-line cursor movement — shell and `edit` (v0.1.10)** — the prompt's
+  line editor (`read_line`) and the file editor (`edit`) both now support
+  Left/Right/Home/End for moving the cursor within existing text, and
+  Delete for forward-deleting the character ahead of it. Typing or
+  Backspace at a mid-line/mid-file cursor position inserts or removes
+  right there and reflows what follows, instead of only ever appending at
+  the end. See "Line editing: history, tab completion, cursor movement,
+  and scrollback" above.
+- **`shelly` splash screen now shows the build version (v0.1.10)** — the
+  splash banner prints a `v0.1.10` line under the rainbow `ShellyForever
+  OS` title, above the developer credit and copyright line, so `shelly`
+  doubles as a quick way to check which build is running.
 - **`sys reset` — factory reset (v0.1.9)** — `auth sys reset` wipes the
   OS volume back to an empty filesystem (keeping its label), clears all
   variables and aliases, recreates the default `/sys` files, and saves
@@ -1066,9 +1091,9 @@ message and then nothing, which is your cue to power off manually.
   multi-drive scan, a format, a mount, or a filesystem save doesn't look
   like the shell has frozen.
 - **`shelly`** — a splash banner command: prints the `ShellyForever OS`
-  title one rainbow-colored character at a time, followed by the developer
-  credit (`Developed by Sourasish Das`) and the copyright line
-  (`Copyright 2026. All rights reserved.`).
+  title one rainbow-colored character at a time, followed by the current
+  build version (`v0.1.10`), the developer credit (`Developed by Sourasish
+  Das`), and the copyright line (`Copyright 2026. All rights reserved.`).
 - **`find` and `lookfor`** — `find <name>` searches every drive for a file
   or folder by exact name and prints its full path; `lookfor <text> <file>
   [limit <n>]` greps a file's content line by line, optionally restricted
