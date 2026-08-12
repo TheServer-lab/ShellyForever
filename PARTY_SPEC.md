@@ -1,4 +1,4 @@
-# Party (.pa) — Language Spec v0.1
+# Party (.pa) — Language Spec
 
 Standalone scripting language for ShellyForever. Own variables, own
 expression evaluator. No shell/command access from inside a script.
@@ -44,13 +44,19 @@ whether a program is interpreted or compiled.
 
 ## 3. Variables
 
-Declare with `vars`, value required at declaration:
+Declare with `vars`. A declaration lists one or more comma-separated
+names, each optionally initialized with `= <expr>`:
 
 ```
 vars a = "hi"
 vars n = 5
 vars ok = true
+vars x, y = 7, z       // x = 0, y = 7, z = 0
 ```
+
+A name given no value is declared with the default int `0` — handy
+with `read` (below) so `vars name` then `read name` needs no bogus
+initializer.
 
 Reassignment (no `vars`, must already be declared):
 
@@ -65,12 +71,22 @@ Using an undeclared variable is an error, not a silent default.
 
 ```
 ()                      grouping
-* /                     multiplicative
+* / %                   multiplicative (% is int-only: a float operand is an error)
 + -                     additive
 < <= > >=               comparison (int/float)
 == !=                   equality (any matching type)
+&& ||                   logical and/or (any type, truthy coercion; no short-circuit)
 =                       assignment (statement only, not an expression)
 ```
+
+`&&` / `||` treat their operands like an `if` condition — `0`, `false`,
+`""`, and `0.0` are falsy, everything else is truthy — and push a
+bool result. Both sides are always evaluated (consistent with every
+other operator; there's no short-circuit, so `f() && g()` calls `g()`
+even when `f()` is false).
+
+Precedence, high to low: unary `-`, then `* / %`, then `+ -`, then
+`< <= > >=`, then `== !=`, then `&&`, then `||`.
 
 ## 5. Control flow
 
@@ -123,11 +139,44 @@ display r
 - `display <expr>` — prints the value (string, int, float, or bool)
   followed by a newline.
 
-## 8. Example programs
+## 8. Input
+
+- `read <var>` — reads one line from the keyboard into the
+  already-declared variable as a string. **Esc** aborts the whole
+  script, the same as a running loop. The read string lives in a
+  single shared buffer, so a later `read` overwrites an earlier one
+  (same pointer-into-buffer model string literals use).
+
+```
+vars name = ""
+read name
+display name
+```
+
+## 9. Example programs
 
 `helloworld.pa`
 ```
 display "Hello world"
+```
+
+`modulo.pa`
+```
+vars a = 17
+vars b = 5
+display a % b
+```
+
+`logic.pa`
+```
+vars a = 1
+vars b = 0
+if (a == 1 && b == 0) {
+    display "and-ok"
+}
+if (b == 1 || a == 1) {
+    display "or-ok"
+}
 ```
 
 `loop.pa`
@@ -150,14 +199,18 @@ if (a == "hi") {
 }
 ```
 
+`read.pa`
+```
+vars name = ""
+read name
+display "hello "
+display name
+```
+
 ---
 
-## Not in v0.1 (deliberately deferred)
+## Not in v0.1.11 (deliberately deferred)
 
-- User input (`read` or similar)
-- `%` modulo
-- `&&` / `||` logical operators
 - Arrays, or any collection type
 
-These are natural v0.2 candidates once the interpreter skeleton
-(lexer → parser → evaluator for this exact grammar) is running.
+This is the natural v0.3 candidate.

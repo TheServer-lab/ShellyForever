@@ -211,6 +211,7 @@ party_lex:
 
     mov r12, rsi                  ; r12 = source base (offset 0)
     mov r13, rsi                  ; r13 = scan cursor
+    mov qword [party_src_base], rsi
     mov word [party_token_count], 0
     mov dword [party_error_line], 1
     mov byte [party_lex_ok], 1
@@ -764,6 +765,184 @@ party_exec:
     ret
 
 ; ------------------------------------------------------------
+; party_boot_compiled: KAPI_BOOT. A compiled .run binary's entry stub
+; does LEA RSI, embedded-source ; CALL [KAPI_BOOT] ; RET - this is that
+; bootstrap. rsi = the Party source embedded in the .run file (token
+; text offsets are relative to it). Resets the runtime, lexes the
+; embedded source, collects func declarations and runs the program
+; with the tree-walking interpreter - the same path 'party foo.pa'
+; uses, so a compiled program needs no separate runtime. On a lex
+; error prints the failing line to the screen. Clobbers rax-r15 and
+; the FPU; sets party_exec_ok / party_lex_ok / party_error_line.
+; ------------------------------------------------------------
+party_boot_compiled:
+    mov [party_src_base], rsi
+    call party_reset_runtime
+    call party_lex
+    cmp byte [party_lex_ok], 1
+    jne .pbc_lex_fail
+    xor r13, r13                   ; statement cursor, like party_exec does
+    call party_collect_funcs
+    cmp byte [party_exec_ok], 1
+    jne .pbc_out
+    mov r14, TOK_EOF
+    call party_exec_stmts
+.pbc_out:
+    ret
+.pbc_lex_fail:
+    mov rsi, msg_party_lex_err
+    mov al, ATTR_ERROR
+    call print_string_attr
+    mov eax, [party_error_line]
+    lea rdi, [show_num_buf]
+    call int_to_str
+    mov rsi, show_num_buf
+    call print_string
+    mov rsi, newline_str
+    call print_string
+    ret
+
+; ------------------------------------------------------------
+;  BACKGROUND PROCESS CONTEXT SAVE / RESTORE
+;  party_ctx_save(rdi = dst ctx base) parks the whole mutable
+;  interpreter state (token stream, value stack, variable/locals/
+;  function/call-frame tables, all scalars, the live statement cursor)
+;  into a process's proc_bg_ctx area. party_ctx_restore(rsi = src ctx
+;  base) brings it all back before a background step resumes. The
+;  regions copied are listed in party_ctx_table (src-address/size
+;  pairs, zero-terminated); r13 (statement cursor), r14 (stop token)
+;  and r15 (branch flag) are parked after the data block. Used both by
+;  cmd_run_back (parks the freshly lexed+collected state before the
+;  first step) and party_bg_suspend (parks a mid-run state at a yield).
+;  Both clobber rax, rbx, rcx, rsi, rdi, r8-r15.
+; ------------------------------------------------------------
+PARTY_CTX_REGS_OFFS equ 20226 - 24
+PARTY_CTX_SIZE      equ 20226
+
+party_ctx_table:
+    dq party_lex_ok, 7             ; lex_ok, exec_ok, killed, error_line
+    dq party_src_base, 8
+    dq party_ident_buf, 184        ; ident_buf + call_name_buf + stmt_name_buf + text_buf
+    dq party_token_count, 4098     ; token_count + the token array
+    dq party_returning, 1
+    dq party_err_msg_ptr, 40       ; err_msg_ptr, vsp, call_depth, loc_count, func_count
+    dq party_while_cond_tok, 8
+    dq party_scratch, 96           ; scratch, scratch1, scratch2
+    dq party_ftmp_i, 20            ; ftmp_i, tmp_i, fp_cw, fp_cw2
+    dq party_num_buf, 32
+    dq party_vstack, 2048
+    dq party_var_used, 32
+    dq party_var_val, 2304         ; var_val + var_name
+    dq party_loc_used, 64
+    dq party_loc_val, 4608         ; loc_val + loc_name
+    dq party_func_name, 2592       ; func_name + nparams + paramtok + bodytok + bodyend
+    dq party_frame_ret_r13, 1344   ; call frames incl. the retval block
+    dq 0, 0
+
+party_ctx_save:                    ; rdi = dst ctx base
+    push rbx
+    push r8
+    push r9
+    mov r8, rdi                    ; ctx base
+    lea rbx, [party_ctx_table]
+    xor r9, r9                     ; ctx offset
+.x_sv_loop:
+    mov rax, [rbx]                 ; src global
+    mov rcx, [rbx+8]               ; size
+    cmp rcx, 0
+    je .x_sv_done
+    add rbx, 16
+    push rbx
+    push rdi
+    mov rsi, rax
+    lea rdi, [r8 + r9]
+    rep movsb
+    pop rdi
+    pop rbx
+    add r9, rcx
+    jmp .x_sv_loop
+.x_sv_done:
+    mov [r8 + PARTY_CTX_REGS_OFFS], r13
+    mov [r8 + PARTY_CTX_REGS_OFFS + 8], r14
+    mov [r8 + PARTY_CTX_REGS_OFFS + 16], r15
+    pop r9
+    pop r8
+    pop rbx
+    ret
+
+party_ctx_restore:                 ; rsi = src ctx base
+    push rbx
+    push r8
+    push r9
+    mov r8, rsi                    ; ctx base
+    lea rbx, [party_ctx_table]
+    xor r9, r9                     ; ctx offset
+.x_rs_loop:
+    mov rax, [rbx]                 ; dst global
+    mov rcx, [rbx+8]               ; size
+    cmp rcx, 0
+    je .x_rs_done
+    add rbx, 16
+    push rbx
+    push rdi
+    mov rsi, r8
+    add rsi, r9                    ; src = ctx + offset
+    mov rdi, rax
+    rep movsb
+    pop rdi
+    pop rbx
+    add r9, rcx
+    jmp .x_rs_loop
+.x_rs_done:
+    mov r13, [r8 + PARTY_CTX_REGS_OFFS]
+    mov r14, [r8 + PARTY_CTX_REGS_OFFS + 8]
+    mov r15, [r8 + PARTY_CTX_REGS_OFFS + 16]
+    pop r9
+    pop r8
+    pop rbx
+    ret
+
+; party_bg_suspend: cooperative yield. Called from party_exec_stmts at a
+; statement boundary when the background quantum is exhausted (see the
+; party_bg_active / party_bg_quantum check at the top of the statement
+; loop). Parks the interpreter state (globals + r13/r14/r15) into the
+; current process's ctx area, saves the private-stack pointer (its top
+; word is the resume address - the instruction right after this call) into
+; proc_bg_rsp[slot], then switches back to the scheduler's stack and
+; returns to bg_scheduler_tick. The next bg_step_proc restores the ctx,
+; sets rsp back to proc_bg_rsp[slot] and RETs, so execution continues
+; right after this call. Clobbers rax, rbx, rcx, rsi, rdi, r8-r15.
+party_bg_suspend:
+    movzx rax, byte [bg_cur_slot]
+    lea rdi, [proc_bg_ctx]
+    imul rcx, rax, PARTY_CTX_SIZE
+    add rdi, rcx
+    call party_ctx_save
+    movzx rax, byte [bg_cur_slot]
+    mov [proc_bg_rsp + rax*8], rsp
+    mov rsp, [bg_shell_rsp]
+    ret
+
+; party_bg_bootstrap: the resume IP cmd_run_back parks on a background
+; process's private stack. Runs the program with the interpreter from
+; statement 0 - the tokens were already lexed and functions collected,
+; then parked in the ctx by cmd_run_back, so all this does is execute.
+; When the script reaches EOF/error/kill, party_exec_stmts returns:
+; flag the slot free (bg_finish_notice) and go back to the scheduler.
+; (A script that yields never returns here - it suspends on its own
+; private stack and this path only runs when the script actually ends.)
+party_bg_bootstrap:
+    xor r13, r13
+    mov r14, TOK_EOF
+    xor r15, r15
+    call party_exec_stmts
+    call bg_finish_notice
+    movzx rax, byte [bg_cur_slot]
+    mov qword [proc_bg_rsp + rax*8], 0
+    mov rsp, [bg_shell_rsp]
+    ret
+
+; ------------------------------------------------------------
 ; party_collect_funcs: first pass over the token stream. Every
 ; top-level `func name(params) { ... }` is recorded in the func
 ; table (name, param token indexes, body span) so a function can
@@ -915,6 +1094,19 @@ party_exec_stmts:
     call print_string_attr
     jmp .pes_out
 .pes_not_killed:
+    ; Cooperative background yield: when this interpreter is running as a
+    ; stepped background process, count the statement and hand control back
+    ; to the scheduler once party_bg_quantum is exhausted. party_bg_active
+    ; is 1 only while bg_step_proc is driving us - a foreground party/run
+    ; never yields here. On resume the scheduler has reset party_bg_quantum
+    ; and party_bg_suspend drops us back at this exact statement boundary.
+    cmp byte [party_bg_active], 0
+    je .pes_bg_done
+    dec dword [party_bg_quantum]
+    jns .pes_bg_done
+    call party_bg_suspend
+    jmp .pes_stmt_loop
+.pes_bg_done:
     call party_tok_ptr
     movzx eax, byte [rbx]
     cmp eax, TOK_NEWLINE
@@ -1324,19 +1516,10 @@ party_exec_stmts:
 party_set_err:
     push rsi
     mov [party_err_msg_ptr], rsi
-    cmp byte [party_in_compiled], 1
-    je .pse_no_line          ; r13 is a codegen buffer cursor here, not a
-                              ; token index - looking it up as one would
-                              ; index party_tokens out of bounds. Compiled
-                              ; runtime errors are reported without a line.
     call party_tok_ptr
     mov eax, [rbx+4]               ; token's start offset
     call party_line_at
     mov [party_error_line], eax
-    jmp .pse_done
-.pse_no_line:
-    mov dword [party_error_line], 0
-.pse_done:
     mov byte [party_exec_ok], 0
     pop rsi
     ret
@@ -1391,7 +1574,7 @@ party_copy_tok_text_into_rdi:
     call party_tok_ptr
     movzx rcx, word [rbx+2]
     mov eax, [rbx+4]
-    lea rsi, [fs_io_buf]
+    mov rsi, [party_src_base]
     add rsi, rax
     cmp rcx, PARTY_IDENT_MAX-1
     jbe .ctt_ok
@@ -1534,6 +1717,13 @@ party_val_set_none:
     mov qword [rdi+24], 0
     ret
 
+party_val_set_float:             ; rdi = dst, st0 = double
+    fstp qword [rdi+8]
+    mov byte [rdi], PV_FLOAT
+    mov qword [rdi+16], 0
+    mov qword [rdi+24], 0
+    ret
+
 party_val_set_str:                 ; rsi = ptr, rcx = length
     mov byte [rdi], PV_STR
     mov qword [rdi+8], 0
@@ -1548,32 +1738,7 @@ party_val_copy:                    ; rsi = src, rdi = dst
     pop rcx
     ret
 
-; party_val_set_float: rsi = ptr to an 8-byte IEEE-754 double, rdi =
-; dest. Exposed to compiled .run programs (KAPI_VAL_SET_FLOAT) since
-; float literals are folded to their 8-byte encoding at compile time
-; and just need tagging + a copy at run time - no x87 parsing needed
-; here, unlike party_parse_float_text.
-party_val_set_float:
-    mov byte [rdi], PV_FLOAT
-    mov rax, [rsi]
-    mov [rdi+8], rax
-    mov qword [rdi+16], 0
-    mov qword [rdi+24], 0
-    ret
-
-; ------------------------------------------------------------
-; party_neg_top: negates the value on top of the value stack in
-; place (unary minus). Only PV_INT/PV_FLOAT are negatable, same rule
-; party_parse_unary already applies for interpreted code - this is
-; the same logic factored out and exposed to compiled programs
-; (KAPI_NEG_TOP) via the table, since compiled unary-minus can't
-; inline x87 opcodes itself without duplicating this. On a bad type
-; or empty stack, records an error via party_set_err (party_exec_ok
-; becomes 0) and leaves the stack untouched. Clobbers rax, rbx, rdx.
-; ------------------------------------------------------------
-party_neg_top:
-    push rbx
-    push rdx
+party_neg_top:                     ; negate the value on top of the value stack
     mov rax, [party_vsp]
     cmp rax, 0
     je .pnt_err
@@ -1589,48 +1754,41 @@ party_neg_top:
     jmp .pnt_err
 .pnt_int:
     neg qword [rbx+8]
-    jmp .pnt_out
+    mov al, 1
+    ret
 .pnt_float:
     fld qword [rbx+8]
     fchs
     fstp qword [rbx+8]
-    jmp .pnt_out
+    mov al, 1
+    ret
 .pnt_err:
     lea rsi, [msg_party_bad_unary]
     call party_set_err
-.pnt_out:
-    pop rdx
-    pop rbx
+    xor al, al
     ret
 
 ; ------------------------------------------------------------
-; party_reset_runtime: clears all shared interpreter/compiled-runtime
-; state (value stack, call depth, locals, globals, function table,
-; error/kill/return flags) and resets the x87 FPU. party_exec does
-; this inline for the tree-walking interpreter; this is the same
-; reset factored out so cmd_run can call it once before handing
-; control to a compiled .run program (which reuses the exact same
-; global state via the kernel_api_table primitives) and so
-; party_compile_to_run can call it before ITS OWN compile-time use of
-; party_collect_funcs/party_push_val/etc, which would otherwise see
-; whatever a previous script left behind.
+; party_reset_runtime: resets the shared global interpreter state
+; (value stack, variable/locals/frame tables, flags, x87 FPU) to a
+; fresh pre-run condition, exactly like party_exec initializes on
+; entry. Used before lexing+collecting a compiled .run program so a
+; previous party/run leaves no stale state behind. Clobbers rdi, rsi,
+; rcx, rax and the FPU.
 ; ------------------------------------------------------------
 party_reset_runtime:
     push rbx
-    push rdi
-    push rcx
-    fninit
+    fninit                        ; reset x87 FPU (CW back to defaults)
     mov byte [party_exec_ok], 1
     mov byte [party_killed], 0
     mov byte [party_returning], 0
     mov byte [kill_flag], 0
-    mov byte [party_in_compiled], 0
     mov qword [party_vsp], 0
     mov qword [party_call_depth], 0
     mov qword [party_loc_count], 0
     mov qword [party_func_count], 0
     mov qword [party_err_msg_ptr], 0
-    mov dword [party_error_line], 0
+
     lea rdi, [party_var_used]
     mov rcx, MAXVARS
     call party_memzero
@@ -1640,8 +1798,7 @@ party_reset_runtime:
     lea rdi, [party_frame_returned]
     mov rcx, MAXCALLS
     call party_memzero
-    pop rcx
-    pop rdi
+
     pop rbx
     ret
 
@@ -2185,7 +2342,7 @@ party_parse_primary:
     jmp .pp_err_expr
 .pp_int:
     mov eax, [rbx+4]
-    lea rsi, [fs_io_buf]
+    mov rsi, [party_src_base]
     add rsi, rax
     call parse_uint_run
     lea rdi, [party_scratch]
@@ -2199,7 +2356,7 @@ party_parse_primary:
 .pp_float:
     movzx rcx, word [rbx+2]
     mov eax, [rbx+4]
-    lea rsi, [fs_io_buf]
+    mov rsi, [party_src_base]
     add rsi, rax
     lea rdi, [party_scratch+8]
     call party_parse_float_text
@@ -2215,7 +2372,7 @@ party_parse_primary:
 .pp_str:
     movzx rcx, word [rbx+2]
     mov eax, [rbx+4]
-    lea rsi, [fs_io_buf]
+    mov rsi, [party_src_base]
     add rsi, rax
     lea rdi, [party_scratch]
     call party_val_set_str
@@ -2265,6 +2422,21 @@ party_parse_primary:
     lea rdi, [party_scratch]
     mov rsi, rbx
     call party_val_copy
+    push rax
+    push rbx
+    push rsi
+    push rdi
+    movzx eax, byte [party_scratch]
+    lea rdi, [show_num_buf]
+    call int_to_str
+    mov rsi, show_num_buf
+    call print_string
+    mov rsi, newline_str
+    call print_string
+    pop rdi
+    pop rsi
+    pop rbx
+    pop rax
     lea rsi, [party_scratch]
     call party_push_val
     jmp .pp_out
@@ -2663,6 +2835,53 @@ party_op_rel:
     call party_pop_val
     cmp byte [party_exec_ok], 1
     jne .out2
+    push rax
+    push rbx
+    push rcx
+    push rsi
+    push rdi
+    movzx eax, byte [party_scratch1]
+    lea rdi, [show_num_buf]
+    call int_to_str
+    mov rsi, show_num_buf
+    call print_string
+    mov rsi, newline_str
+    call print_string
+    mov rax, [party_scratch1+8]
+    lea rdi, [show_num_buf]
+    call int_to_str
+    mov rsi, show_num_buf
+    call print_string
+    mov rsi, newline_str
+    call print_string
+    movzx eax, byte [party_scratch2]
+    lea rdi, [show_num_buf]
+    call int_to_str
+    mov rsi, show_num_buf
+    call print_string
+    mov rsi, newline_str
+    call print_string
+    mov rax, [party_scratch2+8]
+    lea rdi, [show_num_buf]
+    call int_to_str
+    mov rsi, show_num_buf
+    call print_string
+    mov rsi, newline_str
+    call print_string
+    mov rsi, str_rel_dbgpre
+    call print_string
+    mov rax, r12
+    lea rdi, [show_num_buf]
+    call int_to_str
+    mov rsi, show_num_buf
+    call print_string
+    mov rsi, newline_str
+    call print_string
+    pop rdi
+    pop rsi
+    pop rcx
+    pop rbx
+    pop rax
     mov al, [party_scratch1]
     cmp al, PV_BOOL
     je .rl_lhs_ok
@@ -2742,6 +2961,71 @@ party_op_rel:
     call party_push_val
     jmp .out2
 .rl_err_type:
+    push rax
+    push rbx
+    push rsi
+    push rdi
+    mov rsi, party_ident_buf
+    call print_string
+    mov rsi, newline_str
+    call print_string
+    mov rax, [party_call_depth]
+    lea rdi, [show_num_buf]
+    call int_to_str
+    mov rsi, show_num_buf
+    call print_string
+    mov rsi, newline_str
+    call print_string
+    mov rax, [party_loc_count]
+    lea rdi, [show_num_buf]
+    call int_to_str
+    mov rsi, show_num_buf
+    call print_string
+    mov rsi, newline_str
+    call print_string
+    mov eax, [party_frame_locbase]
+    lea rdi, [show_num_buf]
+    call int_to_str
+    mov rsi, show_num_buf
+    call print_string
+    mov rsi, newline_str
+    call print_string
+    movzx eax, byte [party_loc_used]
+    lea rdi, [show_num_buf]
+    call int_to_str
+    mov rsi, show_num_buf
+    call print_string
+    mov rsi, newline_str
+    call print_string
+    movzx eax, byte [party_var_used]
+    lea rdi, [show_num_buf]
+    call int_to_str
+    mov rsi, show_num_buf
+    call print_string
+    mov rsi, newline_str
+    call print_string
+    movzx eax, byte [party_loc_val]
+    lea rdi, [show_num_buf]
+    call int_to_str
+    mov rsi, show_num_buf
+    call print_string
+    mov rsi, newline_str
+    call print_string
+    mov rsi, party_loc_name
+    call print_string
+    mov rsi, newline_str
+    call print_string
+    movzx eax, byte [party_loc_val+32]
+    lea rdi, [show_num_buf]
+    call int_to_str
+    mov rsi, show_num_buf
+    call print_string
+    mov rsi, newline_str
+    call print_string
+    pop rdi
+    pop rsi
+    pop rbx
+    pop rax
     lea rsi, [msg_party_cmp_num]
     call party_set_err
 .out2:
@@ -2846,6 +3130,52 @@ party_var_get_ptr:
     dec rbx
     jmp .vgl_loop
 .vgl_found:
+    push rax
+    push rbx
+    push rsi
+    push rdi
+    push r8
+    mov r8, rbx                    ; save slot index
+    call party_tok_ptr
+    movzx eax, byte [rbx]
+    lea rdi, [show_num_buf]
+    call int_to_str
+    mov rsi, show_num_buf
+    call print_string
+    mov rsi, newline_str
+    call print_string
+    mov rsi, str_tok_dbgpre
+    call print_string
+    mov rax, r13
+    lea rdi, [show_num_buf]
+    call int_to_str
+    mov rsi, show_num_buf
+    call print_string
+    mov rsi, newline_str
+    call print_string
+    mov rax, r8
+    lea rdi, [show_num_buf]
+    call int_to_str
+    mov rsi, show_num_buf
+    call print_string
+    mov rsi, newline_str
+    call print_string
+    lea rdi, [party_loc_val]
+    mov rbx, r8
+    imul rbx, 32
+    add rdi, rbx
+    movzx eax, byte [rdi]
+    lea rdi, [show_num_buf]
+    call int_to_str
+    mov rsi, show_num_buf
+    call print_string
+    mov rsi, newline_str
+    call print_string
+    pop r8
+    pop rdi
+    pop rsi
+    pop rbx
+    pop rax
     imul rdx, rbx, 32
     lea rbx, [party_loc_val]
     add rbx, rdx
@@ -2871,6 +3201,25 @@ party_var_get_ptr:
     inc rcx
     jmp .vgg_loop
 .vgg_found:
+    push rax
+    push rbx
+    push rsi
+    push rdi
+    lea rdi, [party_var_val]
+    mov rbx, rcx
+    imul rbx, 32
+    add rdi, rbx
+    movzx eax, byte [rdi]
+    lea rdi, [show_num_buf]
+    call int_to_str
+    mov rsi, show_num_buf
+    call print_string
+    mov rsi, newline_str
+    call print_string
+    pop rdi
+    pop rsi
+    pop rbx
+    pop rax
     lea rbx, [party_var_val]
     imul rdx, rcx, 32
     add rbx, rdx
@@ -3074,6 +3423,44 @@ party_invoke_func:
     jne .pif_abort
     jmp .pif_bind_loop
 .pif_bind_done:
+    ; --- DEBUG: dump local table ---
+    push rax
+    push rbx
+    push rsi
+    push rdi
+    mov rax, r15
+    lea rdi, [show_num_buf]
+    call int_to_str
+    mov rsi, show_num_buf
+    call print_string
+    mov rsi, newline_str
+    call print_string
+    mov rax, [party_loc_count]
+    lea rdi, [show_num_buf]
+    call int_to_str
+    mov rsi, show_num_buf
+    call print_string
+    mov rsi, newline_str
+    call print_string
+    movzx eax, byte [party_loc_val]
+    lea rdi, [show_num_buf]
+    call int_to_str
+    mov rsi, show_num_buf
+    call print_string
+    mov rsi, newline_str
+    call print_string
+    movzx eax, byte [party_loc_val+32]
+    lea rdi, [show_num_buf]
+    call int_to_str
+    mov rsi, show_num_buf
+    call print_string
+    mov rsi, newline_str
+    call print_string
+    pop rdi
+    pop rsi
+    pop rbx
+    pop rax
+    ; --- DEBUG END ---
     mov r13d, [party_func_bodytok + r15*4]
     mov r14, TOK_RBRACE
     call party_exec_stmts
@@ -3165,7 +3552,7 @@ party_line_at:
     push rcx
     push rsi
     mov ecx, eax
-    lea rsi, [fs_io_buf]
+    mov rsi, [party_src_base]
     mov ebx, 1
 .pla_loop:
     cmp ecx, 0
@@ -3195,7 +3582,7 @@ party_print_tok_text:
     push rdi
     movzx rcx, word [rbx+2]
     mov eax, [rbx+4]
-    lea rsi, [fs_io_buf]
+    mov rsi, [party_src_base]
     add rsi, rax
     lea rdi, [party_text_buf]
     cmp rcx, 63
@@ -3361,6 +3748,8 @@ str_tok_gt:      db 'GT', 0
 str_tok_gte:     db 'GTE', 0
 str_tok_comma:   db 'COMMA', 0
 str_tok_error:   db 'ERROR', 0
+str_tok_dbgpre:  db 'VGL tok=', 0
+str_rel_dbgpre:  db 'REL op=', 0
 str_free_dbgpre: db 'FREE', 0
 str_tok_sep:     db ' [', 0
 
@@ -3378,21 +3767,7 @@ party_lex_ok:      db 0
 party_exec_ok:     db 0
 party_killed:      db 0
 party_error_line:  dd 0
-party_in_compiled: db 0    ; 1 while a compiled .run program is executing;
-                           ; tells party_set_err that r13 isn't a token
-                           ; index right now (see party_set_err).
-ALIGN 8
-party_c_table:     dq 0    ; kernel_api_table pointer, stashed here by a
-                           ; compiled program's own entry prologue so the
-                           ; rest of its emitted code can reload it (see
-                           ; party_compile_to_run's PROLOGUE emission).
-party_c_native_sp: dq 0    ; native rsp at compiled-program entry, so a
-                           ; fatal runtime error can unwind arbitrarily
-                           ; deep (recursive) call nesting in one step.
-party_c_scratch:   times 32 db 0   ; one value-sized scratch slot compiled
-                           ; code uses to shuttle values into/out of the
-                           ; runtime primitives (e.g. pop-then-truthy for
-                           ; an if/while condition).
+party_src_base:    dq 0     ; source base that token text offsets are relative to
 party_ident_buf:   times PARTY_IDENT_MAX db 0
 party_call_name_buf: times PARTY_IDENT_MAX db 0
 party_stmt_name_buf: times PARTY_IDENT_MAX db 0
@@ -3608,302 +3983,41 @@ party_compile_to_run:
     lea rdi, [party_run_bin_buf]
     mov rsi, str_run_header_block
     call str_copy
-    lea rsi, [party_run_bin_buf]
-    call str_len
-    add rdi, rax
+    dec rdi                        ; overwrite the trailing NUL str_copy
+                                   ; wrote: the stub must sit immediately
+                                   ; after the header's last \n so cmd_run's
+                                   ; str_next_line lands on it, not on a gap
 
-    xor rbx, rbx
-.pc_loop:
-    cmp bx, [party_token_count]
-    jae .pc_done
-    mov rax, rbx
-    imul rax, 8
-    lea rsi, [party_tokens + rax]
-    movzx r8, byte [rsi]
-    cmp r8, TOK_DISPLAY
-    jne .pc_check_while
+    ; ---- 14-byte entry stub + embedded source. A .run binary is now:
+    ; 3-line header, a 14-byte stub, then the whole NUL-terminated Party
+    ; source. 'run f.run' executes the stub byte-for-byte (LEA RSI,[RIP+7]
+    ; -> the embedded source, CALL [RDI+0xE0] -> KAPI_BOOT -> the
+    ; party_boot_compiled interpreter bootstrap, RET). 'run f.run -back'
+    ; copies the source at [stub+14] into the process's own buffer and
+    ; lexes it directly - the same layout serves both paths. ----
+    mov byte [rdi], 0x48          ; lea rsi, [rip+7]
+    mov byte [rdi+1], 0x8D
+    mov byte [rdi+2], 0x35
+    mov dword [rdi+3], 7
+    mov byte [rdi+7], 0xFF        ; call [rdi+0xE0]
+    mov byte [rdi+8], 0x57
+    mov byte [rdi+9], 0xE0
+    mov byte [rdi+10], 0xC3       ; ret
+    mov byte [rdi+11], 0x90       ; nop x3 pads to the 14-byte stub
+    mov byte [rdi+12], 0x90
+    mov byte [rdi+13], 0x90
+    add rdi, 14
 
-    inc rbx
-    mov rax, rbx
-    imul rax, 8
-    lea rsi, [party_tokens + rax]
-    movzx r8, byte [rsi]
-
-    xor r11, r11                   ; r11 = 1 if a leading unary '-' precedes the literal
-    cmp r8, TOK_MINUS
-    jne .pc_disp_dispatch
-    mov r11, 1
-    inc rbx
-    mov rax, rbx
-    imul rax, 8
-    lea rsi, [party_tokens + rax]
-    movzx r8, byte [rsi]
-
-.pc_disp_dispatch:
-    cmp r8, TOK_STR
-    je .pc_disp_str
-    cmp r8, TOK_INT
-    je .pc_disp_num
-    cmp r8, TOK_FLOAT
-    je .pc_disp_num
-    cmp r8, TOK_TRUE
-    je .pc_disp_true
-    cmp r8, TOK_FALSE
-    je .pc_disp_false
-    jmp .pc_next                   ; not compilable yet (vars/expr/etc) - skip
-
-.pc_disp_str:
-    cmp r11, 1
-    je .pc_next                    ; "-"+string is invalid - skip, same as the interpreter
-    movzx rcx, word [rsi + 2]      ; length = content only (lexer already excludes the quotes)
-    mov eax, [rsi + 4]
+    ; embed the whole Party source (the compile command lexed it out of
+    ; fs_io_buf just before calling us), NUL-terminated
     lea rsi, [fs_io_buf]
-    add rsi, rax                   ; -> first content byte (no off-by-one skip needed)
-    call party_emit_lit_display
-    jmp .pc_next
-
-.pc_disp_num:
-    movzx rcx, word [rsi + 2]      ; length = full token span (digits, '.' for floats)
-    mov eax, [rsi + 4]
-    lea rsi, [fs_io_buf]
-    add rsi, rax
-    call party_emit_lit_display
-    jmp .pc_next
-
-.pc_disp_true:
-    cmp r11, 1
-    je .pc_next                    ; "-true" is invalid - skip
-    lea rsi, [kw_true]
-    mov rcx, 4
-    call party_emit_lit_display
-    jmp .pc_next
-
-.pc_disp_false:
-    cmp r11, 1
-    je .pc_next                    ; "-false" is invalid - skip
-    lea rsi, [kw_false]
-    mov rcx, 5
-    call party_emit_lit_display
-    jmp .pc_next
-
-; ------------------------------------------------------------
-; while (true|false) { ... } compilation.
-; Only a literal true/false condition is compilable right now - same
-; "literals only" rule party_emit_lit_display already applies to display.
-; A non-literal condition (a variable, comparison, etc.) falls through
-; to .pc_next just like an uncompilable display argument does, i.e. the
-; whole loop is silently skipped rather than crashing the compile.
-; Nested while/if blocks inside the body aren't compiled (their DISPLAY
-; statements still are, since brace tokens are otherwise just skipped),
-; but a while(true) loop nested inside this loop's body isn't supported -
-; only one loop level is tracked here.
-; ------------------------------------------------------------
-.pc_check_while:
-    cmp r8, TOK_WHILE
-    jne .pc_next
-    inc rbx                        ; consume WHILE, rbx -> should be LPAREN
-    cmp bx, [party_token_count]
-    jae .pc_done
-    mov rax, rbx
-    imul rax, 8
-    lea rsi, [party_tokens + rax]
-    movzx r8, byte [rsi]
-    cmp r8, TOK_LPAREN
-    jne .pc_next                   ; malformed - bail, resume normal scan here
-    inc rbx                        ; rbx -> condition token
-    cmp bx, [party_token_count]
-    jae .pc_done
-    mov rax, rbx
-    imul rax, 8
-    lea rsi, [party_tokens + rax]
-    movzx r8, byte [rsi]
-    mov r9, r8                     ; r9 = condition token type (TRUE/FALSE/other)
-    cmp r8, TOK_TRUE
-    je .pc_while_cond_ok
-    cmp r8, TOK_FALSE
-    je .pc_while_cond_ok
-    jmp .pc_next                   ; non-literal condition - not compilable yet
-.pc_while_cond_ok:
-    inc rbx                        ; rbx -> should be RPAREN
-    cmp bx, [party_token_count]
-    jae .pc_done
-    mov rax, rbx
-    imul rax, 8
-    lea rsi, [party_tokens + rax]
-    movzx r8, byte [rsi]
-    cmp r8, TOK_RPAREN
-    jne .pc_next
-    inc rbx                        ; rbx -> should be LBRACE
-    cmp bx, [party_token_count]
-    jae .pc_done
-    mov rax, rbx
-    imul rax, 8
-    lea rsi, [party_tokens + rax]
-    movzx r8, byte [rsi]
-    cmp r8, TOK_LBRACE
-    jne .pc_next
-    inc rbx                        ; rbx -> first token of the loop body
-
-    cmp r9, TOK_FALSE
-    jne .pc_while_true
-
-    ; while(false): dead code - skip the whole body without emitting it,
-    ; tracking brace depth so a nested { } inside doesn't end the skip early.
-    mov r14, 1
-.pc_while_skip:
-    cmp bx, [party_token_count]
-    jae .pc_done
-    mov rax, rbx
-    imul rax, 8
-    lea rsi, [party_tokens + rax]
-    movzx r8, byte [rsi]
-    inc rbx
-    cmp r8, TOK_LBRACE
-    jne .pc_ws_chkclose
-    inc r14
-    jmp .pc_while_skip
-.pc_ws_chkclose:
-    cmp r8, TOK_RBRACE
-    jne .pc_while_skip
-    dec r14
-    jnz .pc_while_skip
-    jmp .pc_loop                   ; matching close brace consumed - resume
-
-.pc_while_true:
-    ; while(true): r13 = address in the .run code buffer where the loop
-    ; body's compiled code starts, so the closing brace can jump back here.
-    mov r13, rdi
-
-    ; --- Esc/kill check, emitted once so it runs at the top of every
-    ; iteration (the backward JMP re-enters right here). Without this,
-    ; a while(true) loop can never be stopped, since this kernel has no
-    ; preemption - the .run binary just runs to completion (or forever)
-    ; once called. call [rdi_table+0x20] -> party_poll_kill_api, which
-    ; returns al=1 if Esc was pressed or 'prs kill <pid/name>' targeted
-    ; this process; if so, ret out of the compiled program entirely
-    ; instead of looping.
-    mov byte [rdi], 0xFF           ; call [rdi+0x20]
-    mov byte [rdi+1], 0x57
-    mov byte [rdi+2], 0x20
-    add rdi, 3
-    mov byte [rdi], 0x84           ; test al, al
-    mov byte [rdi+1], 0xC0
-    add rdi, 2
-    mov byte [rdi], 0x74           ; jz +1 (skip the ret below if al==0)
-    mov byte [rdi+1], 0x01
-    add rdi, 2
-    mov byte [rdi], 0xC3           ; ret (bail out of the whole .run program)
+.pc_src_copy:
+    mov al, byte [rsi]
+    mov [rdi], al
+    inc rsi
     inc rdi
-
-    mov r14, 1                     ; brace depth
-.pc_while_body:
-    cmp bx, [party_token_count]
-    jae .pc_done                   ; unterminated body - stop compiling rather
-                                    ; than run off the end of the token array
-    mov rax, rbx
-    imul rax, 8
-    lea rsi, [party_tokens + rax]
-    movzx r8, byte [rsi]
-
-    cmp r8, TOK_LBRACE
-    jne .pc_wb_chkclose
-    inc r14
-    inc rbx
-    jmp .pc_while_body
-.pc_wb_chkclose:
-    cmp r8, TOK_RBRACE
-    jne .pc_wb_chkdisplay
-    inc rbx
-    dec r14
-    jnz .pc_while_body             ; still inside a nested block - keep scanning
-    ; this is the matching close brace for the loop - emit JMP rel32 back
-    ; to r13 and resume the outer scan right after it
-    mov byte [rdi], 0xE9
-    mov rax, r13
-    sub rax, rdi
-    sub rax, 5                     ; rel32 is relative to the end of this jmp
-    mov [rdi+1], eax
-    add rdi, 5
-    jmp .pc_loop
-.pc_wb_chkdisplay:
-    cmp r8, TOK_DISPLAY
-    jne .pc_wb_next
-    ; --- same literal-display compilation as the top-level handler above ---
-    inc rbx
-    mov rax, rbx
-    imul rax, 8
-    lea rsi, [party_tokens + rax]
-    movzx r8, byte [rsi]
-
-    xor r11, r11
-    cmp r8, TOK_MINUS
-    jne .pc_wb_disp_dispatch
-    mov r11, 1
-    inc rbx
-    mov rax, rbx
-    imul rax, 8
-    lea rsi, [party_tokens + rax]
-    movzx r8, byte [rsi]
-
-.pc_wb_disp_dispatch:
-    cmp r8, TOK_STR
-    je .pc_wb_disp_str
-    cmp r8, TOK_INT
-    je .pc_wb_disp_num
-    cmp r8, TOK_FLOAT
-    je .pc_wb_disp_num
-    cmp r8, TOK_TRUE
-    je .pc_wb_disp_true
-    cmp r8, TOK_FALSE
-    je .pc_wb_disp_false
-    jmp .pc_wb_next                ; not compilable yet - skip
-
-.pc_wb_disp_str:
-    cmp r11, 1
-    je .pc_wb_next
-    movzx rcx, word [rsi + 2]
-    mov eax, [rsi + 4]
-    lea rsi, [fs_io_buf]
-    add rsi, rax
-    call party_emit_lit_display
-    jmp .pc_wb_next
-
-.pc_wb_disp_num:
-    movzx rcx, word [rsi + 2]
-    mov eax, [rsi + 4]
-    lea rsi, [fs_io_buf]
-    add rsi, rax
-    call party_emit_lit_display
-    jmp .pc_wb_next
-
-.pc_wb_disp_true:
-    cmp r11, 1
-    je .pc_wb_next
-    lea rsi, [kw_true]
-    mov rcx, 4
-    call party_emit_lit_display
-    jmp .pc_wb_next
-
-.pc_wb_disp_false:
-    cmp r11, 1
-    je .pc_wb_next
-    lea rsi, [kw_false]
-    mov rcx, 5
-    call party_emit_lit_display
-    jmp .pc_wb_next
-
-.pc_wb_next:
-    inc rbx
-    jmp .pc_while_body
-
-.pc_next:
-    inc rbx
-    jmp .pc_loop
-
-.pc_done:
-    mov byte [rdi], 0xC3
-    inc rdi
-    mov byte [rdi], 0
+    cmp al, 0
+    jne .pc_src_copy
 
     push rdi
     mov rax, [cur_dir]
@@ -3939,7 +4053,8 @@ party_compile_to_run:
 .pc_do_write:
     mov rax, r12
     lea rsi, [party_run_bin_buf]
-    mov rcx, rdi
+    mov rcx, [rsp]              ; the saved write cursor (pushed above,
+                                ; before fs_resolve_path clobbered rdi)
     sub rcx, rsi
     call fs_write_binary_file
     call maybe_auto_sync

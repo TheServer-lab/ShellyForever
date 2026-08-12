@@ -1,6 +1,6 @@
 # ShellyForever
 
-**Version:** 0.1.10
+**Version:** 0.1.11
 
 A 64-bit shell-based OS written entirely in x86-64 NASM assembly, from scratch —
 no C, no BIOS libraries beyond boot-time disk/keyboard calls, no existing kernel.
@@ -341,7 +341,8 @@ with `owrite: no such file: <path>` otherwise) and never creates one.
 `party <file.pa>` runs a program in **Party**, a small scripting language
 with its own variables, expression evaluator, and control flow — no shell
 command access from inside a script. The full spec is in `PARTY_SPEC.md`.
-As of 0.1.9 the interpreter implements the entire v0.1 spec end-to-end.
+As of 0.1.11 the interpreter adds `%`, `&&`/`||`, multi-name `vars`, and
+user input to the v0.1 feature set.
 
 ```
 vars a = "hi"
@@ -361,18 +362,22 @@ What's in there:
 
 - **Types:** `int`, `float`, `bool`, `string` (quoted text; a bare word is
   always a variable reference, never a string).
-- **Variables:** declare with `vars name = value` (value required), reassign
-  with `name = value`; using an undeclared variable is an error.
-- **Operators:** `()`, `* /`, `+ -`, comparisons `< <= > >=`, equality
-  `== !=`, and statement-level `=`.
+- **Variables:** declare with `vars a = value`, or list several at once —
+  `vars x, y = 7, z` declares `x` and `z` (each int `0`) and `y` (as `7`);
+  reassign with `name = value`; using an undeclared variable is an error.
+- **Operators:** `()`, `* / %` (`%` is int-only), `+ -`, comparisons
+  `< <= > >=`, equality `== !=`, logical `&&` / `||` (any-type truthy
+  coercion; eager — no short-circuit), and statement-level `=`.
 - **Control flow:** `if` / `else if` / `else` and `while`, with mandatory
   `{ }` braces on every block.
 - **Functions:** `func name(a, b) { return ... }` — fixed arity, recursion
   allowed (depth-limited call stack), callable before their `func` block
   appears. No mandatory `main()`: top-level statements run top-to-bottom.
 - **Output:** `display <expr>` prints the value followed by a newline.
-- **Not in v0.1:** no user input, `%`, `&&`/`||`, or arrays (see
-  `PARTY_SPEC.md`).
+- **Input:** `read <var>` reads one keyboard line into a declared variable
+  as a string (Esc aborts the script); the read string shares a single
+  buffer, so a later `read` overwrites an earlier one.
+- **Not in v0.1.11:** no arrays or collection types (see `PARTY_SPEC.md`).
 
 `party foo.pa -tokens` dumps the raw token stream instead of executing, and
 **Esc** interrupts a running script.

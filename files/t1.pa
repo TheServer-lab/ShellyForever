@@ -1,0 +1,49 @@
+display "start"
+
+vars a, b = 5, c
+display a
+display b
+display c
+
+vars x = 17, y = 4
+display x % y
+
+vars tt = true, ff = false
+display tt && tt
+display tt && ff
+display ff || tt
+display 3 < 5 && 2 >= 2
+
+if (x > 10) {
+    display "big"
+} else {
+    display "small"
+}
+
+vars n = 1
+while (n <= 3) {
+    display n
+    n = n + 1
+}
+
+func fib(n) {
+    if (n < 2) {
+        return n
+    }
+    return fib(n - 1) + fib(n - 2)
+}
+
+display fib(10)
+
+func greet(name) {
+    return "hello " + name
+}
+
+display greet("shelly")
+
+vars f = 3.5
+display f * 2
+
+display -7
+display 10 / 4
+display "done"

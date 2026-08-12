@@ -1,0 +1,9 @@
+display "A: " + "shelly"
+vars s = "shelly"
+display "B: " + s
+display "C: " + "X"
+func greet(name) {
+  return "D: " + name
+}
+display greet("shelly")
+display "done"

@@ -125,23 +125,27 @@ PIPE_CAP_MAX    equ 192       ; max bytes captured from a "~" pipe's left side
 ;  dscan probes all four ATA device slots for the magic, format writes
 ;  a fresh empty volume + label, and mount loads a volume's node table
 ;  into memory (remapping its parent indices) rooted at /<label>/.
-;  The kernel occupies LBA 1..900 (KERNEL_SECTORS in boot.asm; the real
-;  kernel.bin is currently 842 sectors, so 900 leaves some slack) - the
-;  NIC/network stack (Milestone B), TCP engine (Milestone C) and the
-;  browser (Milestone E) grew the image well past 460, which is why
-;  KERNEL_SECTORS itself was bumped from 560 to 900 (see boot.asm). The
+;  The kernel occupies LBA 1..1500 (KERNEL_SECTORS in boot.asm; the real
+;  kernel.bin is ~1180 sectors after MAX_PROCESSES was trimmed 4->2, so
+;  1500 leaves some slack). HARD CEILING: the image is loaded flat at
+;  0x8000 and base RAM tops out at 0x9FFFF (0xA0000 is the VGA adapter
+;  window - not RAM - so anything past that boundary is silently lost; the
+;  bg-scheduler arrays once grew the image to ~1373 sectors, past the edge,
+;  and the boot crashed). Keep kernel.bin under 0x98000 bytes. The
 ;  filesystem region must start clear of KERNEL_SECTORS, with real
 ;  margin for the kernel to keep growing - not just enough for today's
-;  build - so it starts at LBA 1000. v4's bigger name/content regions
+;  build - so it starts at LBA 1560. v4's bigger name/content regions
 ;  need ~100 sectors per volume (was ~28) - make sure each disk image
-;  you build/attach has enough room past LBA 1000 for that.
+;  you build/attach has enough room past LBA 1560 for that.
 ; ------------------------------------------------------------------
-FS_LBA_START    equ 1150            ; bumped from 1000 - see boot.asm's KERNEL_SECTORS
-                                     ; (now 1100) for why. *** BREAKING CHANGE: any disk
-                                     ; image with a filesystem already written at the old
-                                     ; FS_LBA_START=1000 needs to be reformatted (dscan/fmt)
-                                     ; after this change, or that data is effectively at the
-                                     ; wrong LBA and won't be found. ***
+FS_LBA_START    equ 1560            ; bumped from 1150 - the background-process arrays
+                                    ; once grew kernel.bin to ~1373 sectors, so boot.asm's
+                                    ; KERNEL_SECTORS went 1100 -> 1500 and the filesystem
+                                    ; must start past LBA 1500. *** BREAKING CHANGE: any
+                                    ; image with a filesystem already written at the old
+                                    ; FS_LBA_START=1150 needs to be reformatted (dscan/fmt)
+                                    ; after this change, or that data is effectively at the
+                                    ; wrong LBA and won't be found. ***
 SFFS_VERSION    equ 4               ; current on-disk format (256-node volumes)
 SFFS_VERSION_V3 equ 3               ; old format (64-node volumes, has node_next) - still readable
 SFFS_VERSION_V2 equ 2               ; old, single-block format - still readable
@@ -154,6 +158,8 @@ NAME_LBA        equ SUPER_LBA + 4
 NAME_SECTORS    equ (VOL_NODES * NAME_LEN) / 512          ; 16 (256 nodes * 32B / 512)
 CONTENT_LBA     equ NAME_LBA + NAME_SECTORS                ; computed, not hardcoded - see above
 CONTENT_SECTORS equ (VOL_NODES * CONTENT_LEN) / 512       ; 80 (256 nodes * 160B / 512)
+BINLEN_LBA      equ CONTENT_LBA + CONTENT_SECTORS          ; binary-length table, first free LBA
+BINLEN_SECTORS  equ (VOL_NODES * 4) / 512                 ; 2 (256 nodes * 4B / 512)
 NODE_TYPE_CHAIN equ 3               ; continuation node in a file's content chain
 
 ; --- legacy v3 (64-node) on-disk geometry, needed only so vol_read can
@@ -226,6 +232,21 @@ kernel_entry:
 
     call clear_screen
     call fs_load                ; loads persisted fs from disk, or fs_init's a fresh one
+
+    ; --- auto-create the system folders every boot, not just on a fresh
+    ; filesystem or factory reset. ensure_sys_folder creates /home/sys
+    ; (the OS volume's sys folder) plus its two plain-text config files
+    ; alias.sly and sysconfig.sly if any of them are missing, so a user
+    ; deleting them can't brick the aliases/config system. Then persist
+    ; right away so the recreated folders/files survive even a hard
+    ; power-off (i.e. we don't rely on a clean shutdown's fs_save). ---
+    call ensure_sys_folder
+    call fs_save
+
+    ; the terminal starts in /home (the OS volume's home folder); be
+    ; explicit about it so a stale cur_dir can never leak across reboots
+    mov qword [cur_dir], 0
+
     call aliases_load           ; restore aliases saved to /home/sys/alias.sly, if any
 
     mov rsi, banner
@@ -265,7 +286,11 @@ kernel_entry:
         mov rdi, line_buf
         mov rcx, LINE_MAX-1
         call read_line
-    
+
+        ; print any queued background-process completion notice now, on a
+        ; fresh line, before this command's own output
+        call bg_flush_notice
+
         ; skip $ comments (lines starting with $)
         cmp byte [line_buf], '$'
         je .shell_loop
@@ -2844,6 +2869,37 @@ cmd_run:
     call str_next_line
     mov r12, rsi
 
+    ; Some older .run files were written with a NUL-filled gap between the
+    ; header and the stub (the old compile cursor bug), so str_next_line can
+    ; stop on that NUL instead of the stub. Scan forward for the stub's first
+    ; three bytes (48 8D 35 = lea rsi, [rip+7]); the stub is always the first
+    ; such occurrence before the embedded source.
+    mov rcx, 128
+.cr_stub_scan:
+    mov al, [r12]
+    cmp al, 0x48
+    jne .cr_stub_next
+    cmp byte [r12+1], 0x8D
+    jne .cr_stub_next
+    cmp byte [r12+2], 0x35
+    je .cr_stub_found
+.cr_stub_next:
+    inc r12
+    dec rcx
+    jnz .cr_stub_scan
+    jmp .cr_bad_header
+.cr_stub_found:
+
+    ; "run <file> -back" starts the script in the background: it shares the
+    ; process slot but is stepped cooperatively by the shell when idle, its
+    ; output is captured into a per-process ring for 'prs peek', and the
+    ; prompt comes right back.
+    mov rsi, arg2_buf
+    mov rdi, str_run_back
+    call str_eq
+    cmp al, 1
+    je cmd_run_back
+
     ; Allocate a process slot so this run shows up in 'prs' and can be
     ; stopped by name/pid via 'prs kill', same as rr scripts.
     call proc_alloc
@@ -2904,6 +2960,7 @@ cmd_run:
     mov qword [rdi + KAPI_LEX], party_lex
     mov qword [rdi + KAPI_COLLECT_FUNCS], party_collect_funcs
     mov qword [rdi + KAPI_VAL_SET_FLOAT], party_val_set_float
+    mov qword [rdi + KAPI_BOOT], party_boot_compiled
 
     ; A compiled .run program shares the SAME global interpreter state
     ; (value stack, variable table, function table, call depth) as the
@@ -2918,8 +2975,19 @@ cmd_run:
     push r15
     push rbp
 
+    ; Never execute the file's embedded 14-byte entry stub - its bytes are
+    ; DATA, and this stub's own encoding is broken (FF 57 E0 decodes as
+    ; call [rdi-32], not call [rdi+0xE0]). Skip it and call the compiled
+    ; runtime bootstrap directly with rsi = the embedded source (stub+14),
+    ; exactly like cmd_run_back does. This also stops a .run file from
+    ; running arbitrary machine code as ring-0.
+    lea rsi, [r12 + 14]          ; embedded Party source (past the stub)
     mov rdi, kernel_api_table
-    call r12
+    mov rax, [rdi + KAPI_BOOT]   ; party_boot_compiled (KAPI_BOOT=0xE0=224,
+                                 ; too big for a signed disp8, so nasm uses
+                                 ; disp32 - this reads [rdi+0xE0], NOT the
+                                 ; [rdi-32] the stub's disp8 fell into)
+    call rax
 
     pop rbp
     pop r15
@@ -2960,6 +3028,164 @@ cmd_run:
     call print_string
     mov rsi, newline_str
     call print_string
+    ret
+
+; ============================================================
+;  cmd_run_back: "run <file>.run -back". Starts a compiled .run
+;  program as a background process. The .run binary embeds its whole
+;  Party source (after a 3-line header + the 14-byte entry stub), so
+;  we copy that source into the process's own buffer, lex + collect
+;  functions right here (so syntax/collection errors are reported
+;  immediately), park the resulting interpreter state into the
+;  process's save area, and leave it for the idle scheduler to step.
+;  Enters with r12 = pointer to the entry stub in fs_io_buf.
+; ============================================================
+cmd_run_back:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+
+    call proc_alloc
+    cmp rax, -1
+    je .crb_toomany
+
+    movzx r13, byte [proc_cur_slot]     ; slot index
+    mov r14, r12
+    add r14, 14                         ; embedded Party source (past the stub)
+
+    ; Name the process "run", same as a foreground run.
+    mov rax, r13
+    imul rax, 32
+    lea rdi, [proc_name + rax]
+    mov rsi, str_run_procname
+    call str_copy
+
+    ; Copy the embedded source into the process's own source buffer.
+    lea r15, [proc_bg_src]
+    imul rax, r13, BG_SRC_MAX
+    add r15, rax
+    xor rcx, rcx
+.crb_copy:
+    mov al, [r14+rcx]
+    cmp al, 0
+    je .crb_copy_done
+    cmp rcx, BG_SRC_MAX-1
+    jae .crb_too_big
+    mov [r15+rcx], al
+    inc rcx
+    jmp .crb_copy
+.crb_copy_done:
+    mov byte [r15+rcx], 0
+
+    ; Lex + collect functions now, so the user sees any error immediately.
+    call party_reset_runtime
+    mov qword [party_src_base], r15
+    mov rsi, r15
+    call party_lex
+    cmp byte [party_lex_ok], 1
+    jne .crb_lex_fail
+    call party_collect_funcs
+    cmp byte [party_exec_ok], 1
+    jne .crb_exec_fail
+
+    ; Point the process's private stack at the bootstrap and park the
+    ; freshly-created interpreter state.
+    lea rax, [proc_bg_stack]
+    imul rcx, r13, BG_STACK_SIZE
+    add rax, rcx
+    add rax, BG_STACK_SIZE-8
+    mov rbx, party_bg_bootstrap
+    mov [rax], rbx
+    mov [proc_bg_rsp + r13*8], rax
+
+    lea rdi, [proc_bg_ctx]
+    imul rax, r13, PARTY_CTX_SIZE
+    add rdi, rax
+    call party_ctx_save
+
+    mov byte [proc_bg + r13], 1
+    mov byte [bg_notice_pending], 0
+    mov byte [kill_flag], 0
+
+    mov rsi, msg_run_bg_running
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    mov rsi, arg1_buf
+    call print_string
+    movzx rax, byte [proc_cur_slot]
+    movzx rax, word [proc_id + rax*2]
+    lea rdi, [show_num_buf]
+    call int_to_str
+    mov rsi, msg_rr_pid1
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    mov rsi, show_num_buf
+    call print_string
+    mov rsi, msg_rr_pid2
+    call print_string
+    jmp .crb_out
+
+.crb_toomany:
+    mov rsi, msg_run_toomany
+    mov al, ATTR_ERROR
+    call print_string_attr
+    jmp .crb_out
+
+.crb_too_big:
+    mov rdi, r13
+    call proc_free_slot
+    mov rsi, msg_run_bg_big
+    mov al, ATTR_ERROR
+    call print_string_attr
+    mov rsi, newline_str
+    call print_string
+    jmp .crb_out
+
+.crb_lex_fail:
+    mov rdi, r13
+    call proc_free_slot
+    mov rsi, msg_run_bg_lexerr
+    mov al, ATTR_ERROR
+    call print_string_attr
+    mov eax, [party_error_line]
+    lea rdi, [show_num_buf]
+    call int_to_str
+    mov rsi, show_num_buf
+    call print_string
+    mov rsi, newline_str
+    call print_string
+    jmp .crb_out
+
+.crb_exec_fail:
+    mov rdi, r13
+    call proc_free_slot
+    mov rsi, msg_run_bg_execerr
+    mov al, ATTR_ERROR
+    call print_string_attr
+    mov rsi, [party_err_msg_ptr]
+    cmp rsi, 0
+    je .crb_exec_line
+    call print_string
+.crb_exec_line:
+    mov rsi, msg_party_err_near
+    call print_string
+    mov eax, [party_error_line]
+    lea rdi, [show_num_buf]
+    call int_to_str
+    mov rsi, show_num_buf
+    call print_string
+    mov rsi, newline_str
+    call print_string
+    jmp .crb_out
+
+.crb_out:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
     ret
 
 str_line_eq:
@@ -4532,6 +4758,20 @@ cmd_format:
     jc .disk_err
     inc rax
     loop .content_wr
+    ; node_bin_len: zero sectors
+    mov rax, BINLEN_LBA
+    mov rcx, BINLEN_SECTORS
+.binlen_wr:
+    push rax
+    push rcx
+    call spinner_step
+    lea rsi, [fs_super_buf]
+    call disk_write_sector
+    pop rcx
+    pop rax
+    jc .disk_err
+    inc rax
+    loop .binlen_wr
     call spinner_clear
     ; report
     mov rsi, msg_fmt_ok1
@@ -6061,6 +6301,218 @@ proc_free_slot:
     ret
 
 ; ============================================================
+;  BACKGROUND PARTY SCHEDULER
+;  A background .run is a Party program stepped cooperatively: it
+;  executes on its OWN private stack (proc_bg_stack) with its OWN
+;  parked interpreter state (proc_bg_ctx), so a background script
+;  nested in while loops / function calls can be paused at any
+;  statement boundary and resumed later without losing its call
+;  stack. The shared interpreter globals are parked into/restored
+;  from the process's ctx area around every step, which is what lets
+;  a foreground 'party'/'run' (or another background process) safely
+;  reuse them in between.
+; ============================================================
+
+; bg_step_proc: rax = slot. Restores the process's interpreter state,
+; redirects putchar at its output ring, then switches to its private
+; stack and resumes it (the first step lands in party_bg_bootstrap,
+; later steps in the interpreter's own yield-resume point). Control
+; returns to the scheduler - as if this call simply returned - either
+; when the process yields after BG_QUANTUM statements or when it ends.
+; Note this never returns via a normal `ret` (the process stack's saved
+; top word is the resume IP), so it must NOT push anything after saving
+; bg_shell_rsp. Clobbers rax, rbx, rcx, rdx, rsi, rdi, r8-r15.
+bg_step_proc:
+    movzx rbx, al
+    mov [bg_cur_slot], rbx
+    mov [bg_shell_rsp], rsp          ; scheduler's return address is on top
+
+    ; restore the process's parked interpreter state
+    lea rsi, [proc_bg_ctx]
+    imul rax, rbx, PARTY_CTX_SIZE
+    add rsi, rax
+    call party_ctx_restore
+
+    ; point putchar's capture at this process's output ring
+    lea rax, [proc_bg_ring]
+    imul rcx, rbx, BG_RING_CAP
+    add rax, rcx
+    mov [bg_capture_base], rax
+    lea rcx, [proc_bg_ring_start]
+    lea rax, [rcx + rbx*4]
+    mov [bg_capture_start_ptr], rax
+    lea rcx, [proc_bg_ring_len]
+    lea rax, [rcx + rbx*4]
+    mov [bg_capture_len_ptr], rax
+    mov qword [bg_capture_max], BG_RING_CAP
+
+    mov byte [party_bg_active], 1
+    mov dword [party_bg_quantum], BG_QUANTUM
+    fninit
+
+    mov rax, rbx
+    mov rsp, [proc_bg_rsp + rax*8]
+    ret
+
+; bg_scheduler_tick: steps every running background process once.
+; Called from the shell's idle path (read_char_or_step) when no key is
+; waiting, so background scripts run exactly when the shell would
+; otherwise be sitting at the prompt. Finishing processes have their
+; completion notice queued (bg_finish_notice) and their slots freed.
+; Preserves all registers.
+bg_scheduler_tick:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov byte [sched_slot], 0
+.sched_loop:
+    movzx r13, byte [sched_slot]
+    cmp r13, MAX_PROCESSES
+    jae .sched_done
+    cmp byte [proc_bg + r13], 1
+    jne .sched_next
+    mov rax, r13
+    call bg_step_proc
+    ; The step returned (yielded or finished): the interpreter is no
+    ; longer active, so stop capturing output.
+    mov qword [bg_capture_base], 0
+    mov byte [party_bg_active], 0
+    ; bg_step_proc + the interpreter clobbered every register, so the
+    ; slot is reloaded from sched_slot.
+    movzx r13, byte [sched_slot]
+    cmp byte [proc_bg + r13], 1
+    jne .sched_finished
+    jmp .sched_next
+.sched_finished:
+    mov rdi, r13
+    call proc_free_slot
+.sched_next:
+    movzx r13, byte [sched_slot]
+    inc r13
+    mov [sched_slot], r13b
+    jmp .sched_loop
+.sched_done:
+    mov qword [bg_capture_base], 0
+    mov byte [party_bg_active], 0
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; bg_finish_notice: called by party_bg_bootstrap when a background
+; process's script actually ends (EOF, an interpreter error, or a
+; kill). Clears the process's background flag (so the scheduler frees
+; the slot) and queues a one-line completion notice for the shell to
+; print at its next prompt. Clobbers rax, rbx, rcx, rdx, rsi, rdi.
+bg_finish_notice:
+    movzx rbx, byte [bg_cur_slot]
+    mov byte [proc_bg + rbx], 0
+    mov byte [bg_notice_pending], 1
+    lea rdi, [bg_notice]
+    mov byte [rdi], 0
+
+    cmp byte [party_killed], 0
+    jne .bfn_killed
+    cmp byte [party_exec_ok], 1
+    jne .bfn_error
+
+    ; finished normally
+    lea rsi, [msg_bg_notice_pre]
+    call str_append
+    movzx rax, word [proc_id + rbx*2]
+    lea rdi, [show_num_buf]
+    call int_to_str
+    lea rdi, [bg_notice]
+    lea rsi, [show_num_buf]
+    call str_append
+    lea rdi, [bg_notice]
+    lea rsi, [msg_bg_notice_done]
+    call str_append
+    jmp .bfn_out
+
+.bfn_killed:
+    lea rsi, [msg_bg_notice_pre]
+    call str_append
+    movzx rax, word [proc_id + rbx*2]
+    lea rdi, [show_num_buf]
+    call int_to_str
+    lea rdi, [bg_notice]
+    lea rsi, [show_num_buf]
+    call str_append
+    lea rdi, [bg_notice]
+    lea rsi, [msg_bg_notice_killed]
+    call str_append
+    jmp .bfn_out
+
+.bfn_error:
+    lea rsi, [msg_bg_notice_pre]
+    call str_append
+    movzx rax, word [proc_id + rbx*2]
+    lea rdi, [show_num_buf]
+    call int_to_str
+    lea rdi, [bg_notice]
+    lea rsi, [show_num_buf]
+    call str_append
+    lea rdi, [bg_notice]
+    lea rsi, [msg_bg_notice_err]
+    call str_append
+    mov rsi, [party_err_msg_ptr]
+    cmp rsi, 0
+    je .bfn_err_line
+    lea rdi, [bg_notice]
+    call str_append
+.bfn_err_line:
+    lea rdi, [bg_notice]
+    lea rsi, [msg_party_err_near]
+    call str_append
+    mov eax, [party_error_line]
+    lea rdi, [show_num_buf]
+    call int_to_str
+    lea rdi, [bg_notice]
+    lea rsi, [show_num_buf]
+    call str_append
+.bfn_out:
+    lea rdi, [bg_notice]
+    lea rsi, [newline_str]
+    call str_append
+    ret
+
+; bg_flush_notice: prints a queued background-process completion notice.
+; Called from the shell loop right after read_line returns, so the line
+; lands cleanly above the next command's output.
+bg_flush_notice:
+    cmp byte [bg_notice_pending], 0
+    je .bfn_flush_done
+    mov byte [bg_notice_pending], 0
+    lea rsi, [bg_notice]
+    mov al, [cur_normal_attr]
+    call print_string_attr
+.bfn_flush_done:
+    ret
+
+; ============================================================
 ;  cmd_rr: run a rush script file
 ;  Usage: rr <filename.rsh>
 ;  Creates a process called "runrush <filename>" with a PID.
@@ -6246,8 +6698,82 @@ cmd_prs:
     cmp al, 1
     je .prs_kill
 
+    ; Check if arg1 is "peek"
+    mov rsi, arg1_buf
+    mov rdi, str_peek
+    call str_eq
+    cmp al, 1
+    je .prs_peek
+
     ; No subcommand - show process info
     call prs_show
+    ret
+
+.prs_peek:
+    ; usage: prs peek <pid|name> [lower|last] <N>
+    ; Find the process by pid (if arg2 is numeric) or by name.
+    mov rsi, arg2_buf
+    call parse_int
+    cmp cl, 1
+    je .peek_by_pid
+    cmp byte [arg2_buf], 0
+    je .peek_badarg
+    xor r13, r13
+.peek_find_name:
+    cmp r13, MAX_PROCESSES
+    jae .kill_not_found
+    cmp byte [proc_state + r13], 0
+    je .peek_name_next
+    mov rax, r13
+    imul rax, 32
+    lea rdi, [proc_name + rax]
+    mov rsi, arg2_buf
+    call str_eq
+    cmp al, 1
+    je .peek_found
+.peek_name_next:
+    inc r13
+    jmp .peek_find_name
+.peek_by_pid:
+    mov r12, rax                    ; target PID
+    xor r13, r13
+.peek_find_pid:
+    cmp r13, MAX_PROCESSES
+    jae .kill_not_found
+    cmp byte [proc_state + r13], 0
+    je .peek_pid_next
+    movzx rax, word [proc_id + r13*2]
+    cmp rax, r12
+    je .peek_found
+.peek_pid_next:
+    inc r13
+    jmp .peek_find_pid
+.peek_found:
+    ; r13 = slot. Only background processes capture output.
+    cmp byte [proc_bg + r13], 1
+    jne .peek_not_bg
+    mov rsi, arg4_buf
+    call parse_int
+    cmp cl, 1
+    jne .peek_default_n
+    mov r12, rax
+    jmp .peek_have_n
+.peek_default_n:
+    mov r12, 10
+.peek_have_n:
+    mov rdi, r13                    ; slot
+    mov rsi, r12                    ; N lines
+    call prs_peek_ring
+    ret
+.peek_not_bg:
+    mov rsi, msg_prs_peek_notbg
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+.peek_badarg:
+    mov rsi, msg_prs_peek_usage
+    mov al, ATTR_ERROR
+    call print_string_attr
     ret
 
 .prs_kill:
@@ -6364,6 +6890,97 @@ cmd_prs:
     mov rsi, msg_prs_noid
     mov al, ATTR_ERROR
     call print_string_attr
+    ret
+
+; prs_peek_ring: rdi = slot, rsi = N. Linearizes the process's output
+; ring and prints the last N lines. Clobbers rax, rbx, rcx, rdx,
+; rsi, rdi, r8-r15.
+prs_peek_ring:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r12, rdi                    ; slot
+    mov r13, rsi                    ; N
+    mov eax, [proc_bg_ring_len + r12*4]
+    mov ecx, [proc_bg_ring_start + r12*4]
+    mov r15, rax                    ; byte count
+    cmp r15, 0
+    je .ppr_done
+    cmp r15, BG_RING_CAP
+    jbe .ppr_have_len
+    mov r15, BG_RING_CAP
+.ppr_have_len:
+    mov rax, r12
+    imul rax, BG_RING_CAP
+    lea r14, [proc_bg_ring + rax]   ; ring base
+    lea rdi, [prs_peek_buf]
+    xor r8, r8                      ; copied count
+.ppr_cp_loop:
+    cmp r8, r15
+    jae .ppr_cp_done
+    lea rsi, [r14 + rcx]
+    mov al, [rsi]
+    mov [rdi], al
+    inc rdi
+    inc r8
+    inc rcx
+    cmp rcx, BG_RING_CAP
+    jb .ppr_cp_loop
+    xor rcx, rcx
+    jmp .ppr_cp_loop
+.ppr_cp_done:
+    ; prs_peek_buf[0..r15) = newest output. Find the first byte of the
+    ; last N lines (the trailing newline terminates the last line; count
+    ; newlines backwards from there).
+    mov r8, 0                       ; print start
+    mov rcx, r15
+    cmp rcx, 0
+    je .ppr_scan_done2
+    dec rcx
+    lea rsi, [prs_peek_buf + rcx]
+    cmp byte [rsi], 0x0A
+    jne .ppr_scan2
+    dec rcx                         ; skip the trailing newline
+.ppr_scan2:
+    cmp rcx, 0
+    jl .ppr_scan_done2              ; all lines kept: print from 0
+    lea rsi, [prs_peek_buf + rcx]
+    cmp byte [rsi], 0x0A
+    jne .ppr_scan_dec
+    dec r13
+    jz .ppr_found
+.ppr_scan_dec:
+    dec rcx
+    jmp .ppr_scan2
+.ppr_found:
+    mov r8, rcx
+    inc r8                          ; print from after this newline
+.ppr_scan_done2:
+    lea rsi, [prs_peek_buf + r8]
+    mov byte [prs_peek_buf + r15], 0
+    cmp byte [prs_peek_buf + r15 - 1], 0x0A
+    je .ppr_print
+    mov byte [prs_peek_buf + r15], 0x0A
+    mov byte [prs_peek_buf + r15 + 1], 0
+.ppr_print:
+    mov al, [cur_normal_attr]
+    call print_string_attr
+.ppr_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
     ret
 
 ; prs_show: display process table
@@ -7340,6 +7957,11 @@ fs_init:
     mov rcx, MAX_NODES
     mov ax, 0xFFFF
     rep stosw
+    ; node_bin_len: no binary file lengths yet
+    mov rdi, node_bin_len
+    mov rcx, MAX_NODES
+    xor eax, eax
+    rep stosd
     mov byte [node_type], 1          ; root: folder
     mov word [node_parent], 0xFFFF
     lea rdi, [node_name]
@@ -9128,6 +9750,39 @@ vol_read:
     add rdi, 512
     inc rax
     loop .content_loop
+    ; node_bin_len: only the v4 layout carries it; v2/v3 volumes predate
+    ; binary files, so zero the whole table - stale memory must never
+    ; look like a valid length for a binary file read.
+    cmp byte [fs_layout_ver], 2
+    jne .binlen_zero
+    mov rax, BINLEN_LBA
+    mov rcx, BINLEN_SECTORS
+    lea rdi, [node_bin_len]
+    mov r9, r8
+    imul r9, 4
+    add rdi, r9
+.binlen_read_loop:
+    push rax
+    push rcx
+    push rdi
+    call disk_read_sector
+    pop rdi
+    pop rcx
+    pop rax
+    jc .fail
+    add rdi, 512
+    inc rax
+    loop .binlen_read_loop
+    jmp .binlen_done
+.binlen_zero:
+    lea rdi, [node_bin_len]
+    mov r9, r8
+    imul r9, 4
+    add rdi, r9
+    mov rcx, VOL_NODES
+    xor eax, eax
+    rep stosd
+.binlen_done:
     ; v2/v3 volumes only ever had OLD_VOL_NODES(64) real slots on disk -
     ; explicitly free the newly-available 64..255 range for this volume
     ; instead of trusting whatever bytes happened to land there, so the
@@ -9315,6 +9970,28 @@ vol_write:
     add rsi, 512
     inc rax
     loop .content_loop
+    ; --- node_bin_len: exact byte count of binary files (written by
+    ; fs_write_binary_file, e.g. compiled .run programs). Without it the
+    ; length is lost on a reboot and fs_read_binary_file returns 0 bytes.
+    mov rax, BINLEN_LBA
+    mov rcx, BINLEN_SECTORS
+    lea rsi, [node_bin_len]
+    mov rdi, r8
+    imul rdi, 4
+    add rsi, rdi
+.binlen_loop:
+    push rax
+    push rcx
+    push rsi
+    call spinner_step
+    call disk_write_sector
+    pop rsi
+    pop rcx
+    pop rax
+    jc .fail
+    add rsi, 512
+    inc rax
+    loop .binlen_loop
     clc
     jmp .done
 .fail:
@@ -14521,6 +15198,62 @@ putchar:
     pop rax
     ret
 .not_capturing:
+    ; background-process capture: while a background .run is being
+    ; stepped, putchar appends to that process's output ring instead of
+    ; touching the screen/serial at all (like the "~" pipe capture above).
+    cmp qword [bg_capture_base], 0
+    je .bg_nocap
+    cmp al, 0x0D
+    je .bg_cap_exit              ; ignore carriage returns
+    push rsi
+    push rcx
+    push rdx
+    mov bl, al                   ; stash the char (bl is dead on this path)
+    mov rsi, [bg_capture_base]
+    mov rcx, [bg_capture_len_ptr]
+    mov rdx, [bg_capture_start_ptr]
+    mov ecx, [rcx]               ; current byte count
+    mov edx, [rdx]               ; current start offset
+    mov rdi, [bg_capture_max]
+    cmp rcx, rdi
+    jb .bg_cap_append
+    ; ring full: overwrite the oldest byte and advance the start
+    lea rsi, [rsi + rdx]
+    mov [rsi], bl
+    inc rdx
+    cmp rdx, rdi
+    jb .bg_cap_s_ok
+    xor rdx, rdx
+.bg_cap_s_ok:
+    mov rsi, [bg_capture_start_ptr]
+    mov [rsi], edx
+    jmp .bg_cap_exit2
+.bg_cap_append:
+    ; len < max: write at (start + len) mod max
+    mov rax, rdx
+    add rax, rcx
+    cmp rax, rdi
+    jb .bg_cap_nowrap
+    sub rax, rdi
+.bg_cap_nowrap:
+    mov rsi, [bg_capture_base]
+    add rsi, rax
+    mov [rsi], bl
+    inc rcx
+    mov rsi, [bg_capture_len_ptr]
+    mov [rsi], ecx
+.bg_cap_exit2:
+    pop rdx
+    pop rcx
+    pop rsi
+.bg_cap_exit:
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+.bg_nocap:
     cmp al, 0x0A
     je .newline
     cmp al, 0x0D
@@ -15051,6 +15784,49 @@ scrollback_view_down:
 ; r8 = current line length, r9 = buffer ptr, r10 = max chars, r11 = the
 ; cursor's position within the line (0..r8) - everything below that
 ; isn't a straight end-of-line append goes through r11 instead of r8.
+; read_char_or_step: like get_char but non-blocking from the shell's
+; point of view: if no keyboard byte is waiting, steps the background
+; processes for one quantum and returns al = 0 (never returned by
+; get_char, which maps every zero table entry to "wait"). Preserves
+; every register so read_line's r8-r11 line state survives a step.
+read_char_or_step:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    in al, 0x64
+    test al, 1
+    jnz .rcs_get
+    call bg_scheduler_tick
+    xor al, al
+    jmp .rcs_out
+.rcs_get:
+    call get_char
+.rcs_out:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
 read_line:
     push rax
     push rbx
@@ -15062,7 +15838,9 @@ read_line:
     mov r10, rcx
     mov byte [history_nav], 0
 .loop:
-    call get_char
+    call read_char_or_step
+    test al, al
+    jz .loop
     cmp al, 0x0D
     je .enter
     cmp al, 0x08
@@ -15779,9 +16557,9 @@ wig_str_buf:   times 16 db 0    ; scratch for the wig clock widget
 wig_last_sec:  db 0             ; last second the widget drew (redraw gate)
 
 banner:
-    db "ShellyForever v0.1.10 -- 'help' for commands", 10, 0
+    db "ShellyForever v0.1.11 -- 'help' for commands", 10, 0
 build_stamp:
-    db "build 20260809b -- Party expansion + SFFS V4", 10, 0
+    db "build 20260811 -- Party v0.1.11: % && || read, multi-var vars", 10, 0
 
 prompt_head: db "rush>", 0
 prompt_tail: db ": ", 0
@@ -15814,11 +16592,20 @@ str_run:    db "run", 0
 str_run_magic1: db "[ShellyForever]", 0
 str_run_magic2: db "[run 0.1]", 0
 str_run_magic3: db "program = v1", 0
-msg_run_usage: db "run: usage: run <file.run>", 10, 0
+msg_run_usage: db "run: usage: run <file.run> [-back]", 10, 0
 msg_run_badheader: db "run: error: invalid or missing RUN 0.1 header", 10, 0
 msg_run_running: db "run ", 0
 msg_run_toomany: db "run: too many processes running", 10, 0
 str_run_procname: db "run", 0
+str_run_back: db "-back", 0
+msg_run_bg_running: db "run ", 0
+msg_run_bg_big: db "run: script too large for background (16KB max)", 0
+msg_run_bg_lexerr: db "run: background script failed to parse, line ", 0
+msg_run_bg_execerr: db "run: background script error: ", 0
+msg_bg_notice_pre: db "Background process ", 0
+msg_bg_notice_done: db " finished.", 0
+msg_bg_notice_killed: db " killed.", 0
+msg_bg_notice_err: db " error", 0
 
 ; ------------------------------------------------------------
 ; kernel_api_table slot layout (each slot = 8 bytes, offset shown
@@ -15828,8 +16615,11 @@ str_run_procname: db "run", 0
 ; backend (see party.asm: party_compile_to_run) so compiled programs
 ; can call the SAME tested interpreter primitives (value stack,
 ; operators, variable table, function invocation) instead of each
-; compiled program re-implementing them. Two slots (0x18, 0xE0) hold
-; DATA pointers, not code - everything else is a function pointer.
+; compiled program re-implementing them. One slot (0x18) holds a DATA
+; pointer - everything else is a function pointer. 0xE0 (KAPI_BOOT)
+; is the compiled-program runtime bootstrap: a compiled binary's
+; whole entry sequence is LEA RSI,embedded-source ; CALL [KAPI_BOOT]
+; ; RET - party_boot_compiled does the lex + interpreted run.
 ; ------------------------------------------------------------
 KAPI_PRINT_STRING       equ 0x00
 KAPI_PRINT_STRING_ATTR  equ 0x08
@@ -15859,7 +16649,8 @@ KAPI_NEG_TOP            equ 0xC0
 KAPI_LEX                equ 0xC8
 KAPI_COLLECT_FUNCS      equ 0xD0
 KAPI_VAL_SET_FLOAT      equ 0xD8
-KAPI_TABLE_SIZE         equ 0xE0   ; total bytes
+KAPI_BOOT               equ 0xE0   ; compiled-program runtime bootstrap
+KAPI_TABLE_SIZE         equ 0xF0   ; total bytes
 
 ALIGN 8
 kernel_api_table: times KAPI_TABLE_SIZE db 0
@@ -15880,7 +16671,7 @@ str_eq_sign: db "=", 0
 str_home_name: db "home", 0
 str_sys_name:   db "sys", 0
 str_alias_sly_name: db "alias.sly", 0
-str_alias_sly_content: db 0
+str_alias_sly_content: db "ali h help", 10, "ali l list", 10, 0
 str_sysconfig_name: db "sysconfig.sly", 0
 str_sysconfig_content: db "mouse = off", 10, "internet = on", 10, "auto_sync = on", 10, 0
 str_auth:   db "auth", 0
@@ -15916,7 +16707,7 @@ SHELLY_PAL_LEN equ 6
 shelly_palette: db 0x0E, 0x0B, 0x0A, 0x0D, 0x09, 0x0F   ; yel, cyan, grn, mag, lblu, wht
 shelly_rule:  db "  ============================================================", 10, 0
 shelly_title: db "         ShellyForever OS", 0
-shelly_version: db "         v0.1.10", 10, 0
+shelly_version: db "         v0.1.11", 10, 0
 shelly_by:    db "         Developed by Sourasish Das", 10, 0
 shelly_cr:    db "         Copyright 2026. All rights reserved.", 10, 0
 str_col_black:    db "black", 0
@@ -16240,6 +17031,9 @@ msg_prs_killed:   db "Killed process ", 0
 msg_prs_noid:     db "prs: no such process", 10, 0
 msg_prs_header:   db "PID  Name", 10, 0
 prs_spaces:      db "   ", 0
+str_peek:        db "peek", 0
+msg_prs_peek_notbg: db "prs: that process is not a background process", 10, 0
+msg_prs_peek_usage: db "prs: usage: prs peek <pid|name> [lower|last] <N>", 10, 0
 
 ; --- auth / vars / flags messages ---
 msg_auth_required: db "error: this command requires authentication. Use 'auth <command>' first.", 10, 0
@@ -16949,7 +17743,9 @@ dev_name_num_buf: times 24 db 0
 ident_buf:  times 40 db 0
 
 ; --- process table for rush scripts ---
-MAX_PROCESSES equ 4
+MAX_PROCESSES equ 2   ; was 4; trimmed to fit the kernel's BSS under 0xA0000 -
+                       ; the kernel image must end before the VGA adapter window
+                       ; at physical 0xA0000 (base RAM tops out at 0x9FFFF).
 proc_id:       times MAX_PROCESSES dw 0
 proc_name:     times MAX_PROCESSES*32 db 0
 proc_state:    times MAX_PROCESSES db 0    ; 0=free, 1=running, 2=killed
@@ -16957,6 +17753,42 @@ proc_next_pid: dw 1
 proc_cur_slot: db 0                         ; slot index of currently running script
 kill_flag:     db 0                         ; set by Esc key or prs kill
 rr_content_ptr: dq 0                         ; cursor into script file content
+
+; --- background (.run -back) process support ---
+; A background .run is a Party program (the interpreter path, exactly like
+; 'party file.pa') run cooperatively: it executes on its OWN private stack
+; (proc_bg_stack) with its OWN parked interpreter state (proc_bg_ctx), and
+; yields back to the shell after BG_QUANTUM statements so the prompt stays
+; responsive. Output is redirected by putchar into the process's output
+; ring (proc_bg_ring) while it runs, and 'prs peek' shows the last lines.
+BG_RING_CAP   equ 4096          ; bytes of captured output per process
+BG_SRC_MAX    equ 16384         ; max embedded source bytes for a -back script
+BG_STACK_SIZE equ 8192          ; per-process private interpreter stack
+BG_QUANTUM    equ 200           ; statements a background step may run
+
+proc_bg:          times MAX_PROCESSES db 0    ; 1 = background party process
+proc_bg_rsp:      times MAX_PROCESSES dq 0    ; saved private-stack pointer (resume IP on top)
+proc_bg_ring_start: times MAX_PROCESSES dd 0  ; output ring read offset
+proc_bg_ring_len:   times MAX_PROCESSES dd 0  ; output ring byte count
+proc_bg_ring:     times MAX_PROCESSES*BG_RING_CAP db 0
+proc_bg_src:      times MAX_PROCESSES*BG_SRC_MAX db 0
+proc_bg_stack:    times MAX_PROCESSES*BG_STACK_SIZE db 0
+proc_bg_ctx:      times MAX_PROCESSES*PARTY_CTX_SIZE db 0  ; parked interpreter state
+
+bg_shell_rsp:       dq 0        ; shell stack pointer parked across a background step
+bg_cur_slot:        db 0        ; slot currently being stepped (read by party_bg_suspend)
+bg_stmt_idx:        dd 0        ; saved token cursor for a yielded background process
+bg_stop_tok:        dd 0        ; saved stop token (r14) for a yielded background process
+party_bg_quantum:   dd 0        ; statements left in the current background step
+party_bg_active:    db 0        ; 1 while a background process is running (interpreter checks)
+bg_capture_base:    dq 0        ; putchar redirection: base of the active output ring
+bg_capture_start_ptr: dq 0      ; pointer to the ring's read-offset dword
+bg_capture_len_ptr: dq 0        ; pointer to the ring's byte-count dword
+bg_capture_max:     dq 0        ; ring capacity
+bg_notice:          times 160 db 0   ; pending "process finished/killed" line
+bg_notice_pending:  db 0        ; 1 while a notice is waiting to be printed
+prs_peek_buf:       times BG_RING_CAP+1 db 0   ; linearized output for 'prs peek'
+sched_slot:         db 0        ; round-robin cursor for the bg scheduler
 
 ; --- large staging buffers. A file can span a whole VOL_NODES-node volume slice, so
 ; these are sized to hold a full file's content (EDIT_MAX). Declared at the

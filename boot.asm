@@ -24,16 +24,16 @@ jmp start
 
 KERNEL_LOAD_SEG   equ 0x0000
 KERNEL_LOAD_OFF   equ 0x8000
-KERNEL_SECTORS    equ 1100        ; how many 512B sectors to load. Bumped from 900 - the
-                                  ; splash screen's incbin'd image+palette data (see
-                                  ; kernel.asm's splash_stub) adds ~65KB (~127 sectors) on
-                                  ; top of the real kernel.bin's existing ~842 sectors
-                                  ; (with party/tcp/http/browse/mouse folded in), landing
-                                  ; around 970 - 1100 gives real headroom past that, not
-                                  ; just enough for today's build. Previously bumped from
-                                  ; 560 for the same reason (see git history): too little
-                                  ; headroom here silently truncates the kernel's own tail
-                                  ; data (ata_port_base/ata_drive_sel/fs_disk_available
+KERNEL_SECTORS    equ 1500        ; how many 512B sectors to load. The background-process
+                                  ; scheduler added the per-slot proc_bg_* arrays (ctx
+                                  ; 20226B + src 16KB + stack 8KB + ring 4KB each, x4
+                                  ; slots), which took kernel.bin from ~970 sectors to
+                                  ; ~1373 sectors - so this was bumped from 1100 to 1500
+                                  ; (~768KB) for headroom. Previously bumped from 900 for
+                                  ; the splash data and from 560 for the same reason (see
+                                  ; git history): too little headroom here silently
+                                  ; truncates the kernel's own tail data
+                                  ; (ata_port_base/ata_drive_sel/fs_disk_available
                                   ; landed around sector 616 last time this bit), so the
                                   ; ATA driver ran with a zeroed port base and "No disk
                                   ; detected" even though the drive was fine.
@@ -41,7 +41,7 @@ KERNEL_SECTORS    equ 1100        ; how many 512B sectors to load. Bumped from 9
                                   ; sectors per BIOS call (not limited by al directly - see
                                   ; the .loop chunking below) and this total must stay clear
                                   ; of the SFFS region - see kernel.asm's FS_LBA_START (now
-                                  ; 1150 to match), and leave real margin, not just enough
+                                  ; 1560 to match), and leave real margin, not just enough
                                   ; for today's build - and <= 2880 (media). If
                                   ; KERNEL_SECTORS is ever bumped again, bump FS_LBA_START in
                                   ; kernel.asm to match - the two are not shared constants,

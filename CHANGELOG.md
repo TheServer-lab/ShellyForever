@@ -4,6 +4,43 @@ All notable changes to ShellyForever are documented here. The format is
 loosely based on [Keep a Changelog](https://keepachangelog.com/); the
 project does not yet follow strict SemVer.
 
+## [0.1.11] - 2026-08-11
+
+### Added
+
+- **`%` modulo operator in Party**. New `%` token (int-only — a float
+  operand is a type error), multiplicative precedence, and a remainder
+  branch in the interpreter's arithmetic path with the same divide-by-zero
+  guard `/` has. Works in interpreted scripts and shows up correctly in
+  `party foo.pa -tokens`.
+- **`&&` / `||` logical operators in Party**. New two-char tokens, a
+  precedence tier between equality and the rest (`|| < && < ==/!= <
+  relational < additive < multiplicative`), and `party_op_logical`, which
+  coerces both operands with the interpreter's truthiness rule (falsy:
+  `0`, `false`, `0.0`, `""`) and pushes a bool. Eager — both sides are
+  evaluated, matching every other binary operator (no short-circuit).
+- **Multi-name `vars` declarations in Party**. `vars a, b = 5, c`
+  declares several variables in one statement; each name may carry its own
+  `= <expr>` initializer, and a bare name is declared as int `0` (so
+  `vars name` + `read name` needs no dummy initializer).
+- **`read <var>` — user input in Party**. Reads one keyboard line into an
+  already-declared variable as a string, echoing printable characters and
+  handling Backspace, terminating on Enter, and aborting the whole script
+  on Esc (via `kbd_poll`/`kill_flag`, same as a running loop). Strings land
+  in a single shared `party_read_buf` (128 bytes), so a later `read`
+  overwrites an earlier one.
+- **Token names** for all four new tokens (`MOD`/`AND`/`OR`/`READ`), so
+  `party foo.pa -tokens` renders them instead of `ERROR`.
+
+### Changed
+
+- Banner and build stamp bumped to `v0.1.11` (`kernel.asm`).
+- `PARTY_SPEC.md` rewritten for v0.1.11: multi-var `vars` with optional
+  per-name initializers, `%`, `&&`/`||` (with precedence table and the
+  eager/truthy semantics), a new Input section, updated example programs,
+  and the deferred list trimmed to arrays/collections only.
+- README's Party section updated to match.
+
 ## [0.1.10] - 2026-08-10
 
 ### Added

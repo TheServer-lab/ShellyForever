@@ -657,6 +657,8 @@ cmd_take:
     jbe .body_fits
     mov ecx, (HTTP_RX_BUF_SIZE - 1)
 .body_fits:
+    mov dword [http_body_len], ecx   ; effective (capped) length - must store before
+                                     ; rep movsb consumes ecx as the copy counter
     lea rdi, [http_rx_buf]
     rep movsb
     mov byte [rdi], 0
@@ -702,10 +704,32 @@ cmd_take:
     mov r12, rax
 
 .tk_do_write:
-    ; http_rx_buf now holds the null-terminated body. Write it via fs_write_file.
+    ; http_rx_buf holds the body (http_body_len bytes). Text bodies are
+    ; written with fs_write_file; a body containing embedded NUL bytes is
+    ; binary (e.g. a compiled .run program) and must go through
+    ; fs_write_binary_file or it gets truncated at the first NUL.
+    mov ecx, [http_body_len]
+    test ecx, ecx
+    jz .tk_text_write
+    lea rdi, [http_rx_buf]
+.tk_scan_nul:
+    mov al, [rdi]
+    test al, al
+    je .tk_binary_write
+    inc rdi
+    dec ecx
+    jnz .tk_scan_nul
+.tk_text_write:
     mov rax, r12
     lea rsi, [http_rx_buf]
     call fs_write_file
+    jmp .tk_written
+.tk_binary_write:
+    mov rax, r12
+    lea rsi, [http_rx_buf]
+    mov ecx, [http_body_len]
+    call fs_write_binary_file
+.tk_written:
     call maybe_auto_sync
     mov rsi, msg_take_saved
     call print_string
@@ -779,7 +803,15 @@ cmd_give:
     je .nofile
 
     mov r12, rax                ; file node index
+    mov eax, [node_bin_len + r12*4]
+    test eax, eax
+    jnz .gv_len_binary
+    mov rax, r12
     call fs_file_len
+    jmp .gv_len_done
+.gv_len_binary:
+    mov eax, [node_bin_len + r12*4]
+.gv_len_done:
     cmp rax, (HTTP_RX_BUF_SIZE - 1)
     jbe .len_ok
     mov eax, (HTTP_RX_BUF_SIZE - 1)
@@ -787,8 +819,13 @@ cmd_give:
     mov r13, rax                ; r13 = content length
     mov rax, r12
     lea rdi, [http_rx_buf]
+    cmp dword [node_bin_len + r12*4], 0
+    je .gv_read_text
+    call fs_read_binary_file    ; binary-safe read for compiled .run files
+    jmp .gv_read_done
+.gv_read_text:
     call fs_read_file           ; reads file into http_rx_buf
-
+.gv_read_done:
     mov byte [http_rx_buf + r13], 0   ; NUL-terminate
 
     lea rsi, [http_rx_buf]
