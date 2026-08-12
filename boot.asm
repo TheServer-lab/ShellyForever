@@ -24,19 +24,37 @@ jmp start
 
 KERNEL_LOAD_SEG   equ 0x0000
 KERNEL_LOAD_OFF   equ 0x8000
-KERNEL_SECTORS    equ 1500        ; how many 512B sectors to load. The background-process
+KERNEL_SECTORS    equ 1200        ; how many 512B sectors to load. The background-process
                                   ; scheduler added the per-slot proc_bg_* arrays (ctx
                                   ; 20226B + src 16KB + stack 8KB + ring 4KB each, x4
                                   ; slots), which took kernel.bin from ~970 sectors to
-                                  ; ~1373 sectors - so this was bumped from 1100 to 1500
-                                  ; (~768KB) for headroom. Previously bumped from 900 for
-                                  ; the splash data and from 560 for the same reason (see
-                                  ; git history): too little headroom here silently
-                                  ; truncates the kernel's own tail data
-                                  ; (ata_port_base/ata_drive_sel/fs_disk_available
-                                  ; landed around sector 616 last time this bit), so the
-                                  ; ATA driver ran with a zeroed port base and "No disk
-                                  ; detected" even though the drive was fine.
+                                  ; ~1373 sectors before MAX_PROCESSES was trimmed 4->2
+                                  ; (see kernel.asm), bringing it back down to ~1180.
+                                  ;
+                                  ; *** HARD CEILING, NOT JUST A HEADROOM NUMBER ***
+                                  ; The kernel is loaded flat at 0x8000 in real mode, and
+                                  ; conventional memory ends at 0x9FFFF - 0xA0000 is the VGA
+                                  ; framebuffer window, not RAM, and 0xC0000+ is typically
+                                  ; the video BIOS ROM shadow. That puts a hard limit of
+                                  ; (0xA0000 - 0x8000) / 512 = 1216 sectors on this constant
+                                  ; no matter how large KERNEL_SECTORS is set: BIOS INT 13h
+                                  ; will happily "read" sectors past that boundary, but real
+                                  ; hardware will not store them as normal RAM - they land on
+                                  ; the video card/ROM instead and are silently lost. This
+                                  ; previously bit us (via 1500, which was fine for the ~1180
+                                  ; actual sectors but would have quietly eaten a future
+                                  ; kernel.bin that regrew past ~1216, exactly like the
+                                  ; ata_port_base/ata_drive_sel/fs_disk_available truncation
+                                  ; that motivated the old headroom bumps - see git history).
+                                  ; 1200 leaves ~20 sectors of headroom above the current
+                                  ; ~1180-sector build while staying under the 1216 ceiling.
+                                  ; If the kernel needs to grow past ~1216 sectors, bumping
+                                  ; this constant further is NOT safe - the kernel needs to
+                                  ; be loaded somewhere other than conventional memory (e.g.
+                                  ; a relocation copy after entering protected mode, or an
+                                  ; unreal-mode/big-real-mode load straight to an
+                                  ; above-1MB buffer) instead.
+                                  ;
                                   ; The CHS fallback reads at most 18
                                   ; sectors per BIOS call (not limited by al directly - see
                                   ; the .loop chunking below) and this total must stay clear

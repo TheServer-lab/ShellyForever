@@ -81,19 +81,137 @@ splash_stub:
     xor ax, ax                  ; restore ds (clobbered above for the blit)
     mov ds, ax
 
+    mov bx, (24*80 + 2) * 2      ; checkpoint 3: splash done, entering the
+    mov dl, '3'                  ; A20/GDT/protected-mode transition
+    call dbg_local
+
     ; ---- same A20/GDT/protected-mode transition boot.asm's read_done used
     ; to do right after loading the kernel ----
     cli
-    mov al, 0x02
-    out 0x92, al                 ; fast-A20 gate (port 0x92)
+    call enable_a20
+    jne .a20_ok
+    ; A20 could not be enabled by either method - stop here with a distinct
+    ; marker rather than pressing on into paging with a gated A20 line,
+    ; which would silently corrupt memory instead of failing loudly.
+    mov bx, (24*80 + 3) * 2
+    mov dl, '!'
+    call dbg_local
+    cli
+    hlt
+    jmp $
+.a20_ok:
+    mov bx, (24*80 + 3) * 2      ; checkpoint 4: A20 confirmed on (not just
+    mov dl, '4'                  ; "we wrote to port 0x92 and hoped") - see
+    call dbg_local                ; enable_a20/test_a20 below
 
     lgdt [gdt32_descriptor]
+
+    mov bx, (24*80 + 4) * 2      ; checkpoint 5: GDT loaded, about to flip
+    mov dl, '5'                   ; CR0.PE and far-jump into 32-bit mode
+    call dbg_local
 
     mov eax, cr0
     or eax, 1
     mov cr0, eax
 
     jmp CODE32_SEL:splash_pm32   ; far jump flushes prefetch, loads CS
+
+; in: bx = byte offset into VGA memory, dl = char to show. Same idea as
+; boot.asm's dbg16, but boot.asm and kernel.bin are separate nasm builds
+; (boot.asm is ORG 0x7C00, kernel.asm/this file is ORG 0x8000) so there is
+; no shared symbol to call across that boundary - this is kernel.bin's own
+; copy, used only while still in real mode.
+dbg_local:
+    push ax
+    push es
+    mov ax, 0xB800
+    mov es, ax
+    mov [es:bx], dl
+    mov byte [es:bx+1], 0x4F
+    pop es
+    pop ax
+    ret
+
+; ---- A20 gate: enable, then VERIFY, instead of writing to port 0x92 and
+; just hoping. Fast-A20 (port 0x92) is widely supported but not universal -
+; some real chipsets ignore it, need a brief settle delay, or need the
+; legacy PS/2 keyboard-controller method instead. QEMU/Bochs accept the
+; fast-A20 write unconditionally and immediately, which is exactly the kind
+; of gap that boots fine in an emulator and hangs/corrupts on real hardware:
+; with A20 still gated, every physical address above 1MB silently aliases
+; back down to (addr - 1MB), which does not break anything while splash_stub
+; itself is only touching addresses below 1MB, but corrupts memory the
+; moment the identity-mapped kernel starts using extended RAM.
+; out: ZF=1 if A20 could not be enabled by either method (caller hangs)
+enable_a20:
+    call test_a20
+    jne .done                     ; already on - some BIOSes enable it for you
+    mov al, 0x02
+    out 0x92, al                  ; fast-A20 gate
+    call test_a20
+    jne .done
+    call a20_kbc                  ; fall back to the PS/2 keyboard controller
+    call test_a20
+.done:
+    ret
+
+; classic A20 test: 0000:0500 and FFFF:0510 address the same byte
+; (physical 0x100500) when A20 is disabled, and different bytes when it's
+; enabled. Returns ZF=1 (equal => A20 OFF) or ZF=0 (different => A20 ON).
+test_a20:
+    push ax
+    push es
+    push ds
+    xor ax, ax
+    mov ds, ax
+    mov byte [0x0500], 0x00
+    mov ax, 0xFFFF
+    mov es, ax
+    mov byte [es:0x0510], 0xFF
+    mov al, [0x0500]
+    cmp al, 0xFF
+    pop ds
+    pop es
+    pop ax
+    ret
+
+; legacy PS/2 keyboard-controller A20 enable (the pre-Fast-A20 method every
+; real PS/2-compatible chipset supports): disable keyboard, read the
+; controller's output port, set bit 1 (A20), write it back, re-enable.
+a20_kbc:
+    call kbc_wait_input
+    mov al, 0xAD                  ; disable keyboard
+    out 0x64, al
+    call kbc_wait_input
+    mov al, 0xD0                  ; command: read output port
+    out 0x64, al
+    call kbc_wait_output
+    in al, 0x60
+    push ax
+    call kbc_wait_input
+    mov al, 0xD1                  ; command: write output port
+    out 0x64, al
+    call kbc_wait_input
+    pop ax
+    or al, 2                      ; set A20 bit
+    out 0x60, al
+    call kbc_wait_input
+    mov al, 0xAE                  ; re-enable keyboard
+    out 0x64, al
+    call kbc_wait_input
+    ret
+
+kbc_wait_input:                   ; wait until it's safe to write a command/data
+    in al, 0x64
+    test al, 2
+    jnz kbc_wait_input
+    ret
+
+kbc_wait_output:                  ; wait until a byte is ready to read
+    in al, 0x64
+    test al, 1
+    jz kbc_wait_output
+    ret
 
 BITS 32
 splash_pm32:
@@ -104,6 +222,11 @@ splash_pm32:
     mov gs, ax
     mov ss, ax
     mov esp, 0x9F000
+
+    ; checkpoint 6: landed in 32-bit protected mode. Flat linear write, no
+    ; segment juggling needed now that DATA32_SEL is a 4GB flat descriptor.
+    mov byte [0xB8000 + (24*80 + 5) * 2], '6'
+    mov byte [0xB8000 + (24*80 + 5) * 2 + 1], 0x4F
 
     ; ---- build minimal 4-level page tables for long mode (identical to
     ; boot.asm's old pm_entry - PML4 @0x1000, PDPT @0x2000, PD @0x3000,
@@ -143,6 +266,10 @@ splash_pm32:
     or eax, 1 << 31                ; PG - activates long mode
     mov cr0, eax
 
+    ; no checkpoint 7 here on purpose - kernel_entry's checkpoint 'A' (col 6)
+    ; is the very next thing that runs after splash_lm64's jump, so it
+    ; already confirms this far jump into 64-bit mode landed correctly;
+    ; giving this spot its own char would just collide with 'A' at col 6.
     jmp CODE64_SEL:splash_lm64
 
 BITS 64
