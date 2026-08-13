@@ -12,7 +12,7 @@ cat boot.bin kernel.bin > shellyforever.img
 python3 - <<'EOF'
 with open('shellyforever.img','rb') as f:
     data = f.read()
-target = 1474560
+target = 256 * 1024 * 1024
 with open('shellyforever.img','ab') as f:
     f.write(b'\x00' * (target - len(data)))
 EOF

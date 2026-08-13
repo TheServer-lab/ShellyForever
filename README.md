@@ -1,6 +1,6 @@
 # ShellyForever
 
-**Version:** 0.1.11
+**Version:** 0.1.12
 
 A 64-bit shell-based OS written entirely in x86-64 NASM assembly, from scratch —
 no C, no BIOS libraries beyond boot-time disk/keyboard calls, no existing kernel.
@@ -957,6 +957,17 @@ message and then nothing, which is your cue to power off manually.
 
 ## What's new
 
+- **Fixed: background scripts eating keystrokes (v0.1.12)** — a
+  background process's `while` loop called `kbd_poll` on every
+  iteration unconditionally, which reads and discards whatever byte is
+  waiting at the keyboard controller. That meant a `run <file> -back`
+  script with a `while` loop would silently consume keystrokes you
+  typed at the live shell prompt, one dropped character per loop
+  iteration, alongside the process. `kbd_poll` inside the loop is now
+  skipped while `party_bg_active` is set, matching the guard the
+  top-level statement loop already had — background scripts no longer
+  touch the keyboard at all; only a foreground `party`/`run` script
+  still polls for Esc-to-kill there.
 - **In-line cursor movement — shell and `edit` (v0.1.10)** — the prompt's
   line editor (`read_line`) and the file editor (`edit`) both now support
   Left/Right/Home/End for moving the cursor within existing text, and

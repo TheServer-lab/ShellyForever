@@ -4,6 +4,29 @@ All notable changes to ShellyForever are documented here. The format is
 loosely based on [Keep a Changelog](https://keepachangelog.com/); the
 project does not yet follow strict SemVer.
 
+## [0.1.12] - 2026-08-13
+
+### Fixed
+
+- **Background Party scripts silently eating keystrokes**. A
+  background process's `while` loop (`.pes_while_loop` in `party.asm`)
+  called `kbd_poll` unconditionally on every iteration to check for
+  Esc-to-kill. `kbd_poll` reads and discards whatever byte is waiting
+  at the `8042` keyboard controller — so a `run <file> -back` script
+  with a `while` loop would consume characters the user was typing at
+  the live shell prompt, one dropped keystroke per loop iteration,
+  while it ran in the background. The top-level statement loop in
+  `party_exec_stmts` already skipped `kbd_poll` while
+  `party_bg_active` is set (a background process has its own kill path
+  via `prs kill`, and stealing prompt input isn't safe since the shell
+  is live), but that same guard was missing from the `while`-loop's
+  own `kbd_poll` call. Added the same `party_bg_active` check there, so
+  background scripts no longer touch the keyboard at all.
+
+### Changed
+
+- Banner and build stamp bumped to `v0.1.12` (`kernel.asm`).
+
 ## [0.1.11] - 2026-08-11
 
 ### Added

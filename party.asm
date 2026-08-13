@@ -856,10 +856,10 @@ party_ctx_save:                    ; rdi = dst ctx base
     push rdi
     mov rsi, rax
     lea rdi, [r8 + r9]
+    add r9, rcx
     rep movsb
     pop rdi
     pop rbx
-    add r9, rcx
     jmp .x_sv_loop
 .x_sv_done:
     mov [r8 + PARTY_CTX_REGS_OFFS], r13
@@ -888,10 +888,10 @@ party_ctx_restore:                 ; rsi = src ctx base
     mov rsi, r8
     add rsi, r9                    ; src = ctx + offset
     mov rdi, rax
+    add r9, rcx
     rep movsb
     pop rdi
     pop rbx
-    add r9, rcx
     jmp .x_rs_loop
 .x_rs_done:
     mov r13, [r8 + PARTY_CTX_REGS_OFFS]
@@ -1085,6 +1085,15 @@ party_exec_stmts:
     jne .pes_out
     cmp byte [party_exec_ok], 0
     je .pes_out
+    ; Esc-to-kill only applies to a foreground script (the shell is
+    ; blocked while it runs, so there's nowhere else for keystrokes to
+    ; go). A background process is stepped in short quanta between
+    ; shell prompts and already has its own kill path ('prs kill
+    ; <pid>'), so skip kbd_poll here - otherwise it would silently
+    ; consume/discard keys the user is typing at the live shell prompt
+    ; while this quantum runs.
+    cmp byte [party_bg_active], 0
+    jne .pes_not_killed
     call kbd_poll
     cmp byte [kill_flag], 0
     je .pes_not_killed
@@ -1388,6 +1397,11 @@ party_exec_stmts:
     jmp .pes_stmt_loop
 
 .pes_while_loop:
+    ; Same rule as the top-level statement loop: a background process
+    ; must not consume keystrokes meant for the live shell prompt. Only
+    ; poll for Esc-to-kill when running in the foreground.
+    cmp byte [party_bg_active], 0
+    jne .pes_while_nk
     call kbd_poll
     cmp byte [kill_flag], 0
     je .pes_while_nk

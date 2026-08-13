@@ -31,13 +31,13 @@ ATTR_WIG        equ 0x0B          ; light cyan - used by the wig clock widget
 ; newlines msg_edit_header1+msg_edit_header2 print before file content.
 EDIT_HEADER_ROWS equ 2
 
-; SFFS v4 raises this from 64 to 256 (see the SFFS v4 block below) - the
-; old 64-node table was shared by folders, files, AND every chain
-; continuation node a file needed once its content passed 159 bytes, so a
-; handful of ordinary-sized files could exhaust it well before the disk
-; itself was anywhere near full ("error: filesystem is full" with tons of
-; free space left). v2/v3 disks (still readable) keep working exactly as
-; before; a sync upgrades them to v4 in place - see fs_layout_ver.
+; SFFS v5 removes the old chain-of-nodes content storage entirely: the
+; node table used to hold file bytes (160 bytes per node, chained through
+; type-3 continuation nodes), which capped one file at ~40KB and let a
+; handful of files exhaust all 256 node slots of a volume while the disk
+; was still almost empty. v5 stores file content in 4096-byte clusters on
+; disk (see the SFFS v5 block below), so a file can span (almost) the
+; whole 256 MiB disk and node slots are used only by real files/folders.
 OS_NODES        equ 256             ; nodes per volume (each drive holds its own node table)
 MAX_MOUNTS      equ 2               ; how many extra drives can be mounted at once
 
@@ -51,7 +51,6 @@ TOTAL_DEVICES   equ 4 + AHCI_MAX_PORTS
 VOL_NODES       equ OS_NODES        ; every volume, OS or mounted, is the same size
 MAX_NODES       equ OS_NODES * (1 + MAX_MOUNTS)   ; 768 = OS volume + 2 mounts
 NAME_LEN        equ 32
-CONTENT_LEN     equ 160
 LINE_MAX        equ 220
 
 SCROLLBACK_LINES equ 100         ; extra off-screen rows kept for Ctrl+Up/Down
@@ -77,66 +76,56 @@ ALIAS_MAX_DEPTH equ 8          ; guards against an alias (in)directly invoking i
 PIPE_CAP_MAX    equ 192       ; max bytes captured from a "~" pipe's left side
 
 ; ------------------------------------------------------------------
-;  SFFS v4 -- ShellyForever File Storage format (on-disk layout).
-;  Every drive (OS boot drive and any data drives) uses the same
-;  fixed layout so any drive can be scanned, formatted, and mounted:
+;  SFFS v5 -- ShellyForever File Storage format (on-disk layout).
+;  Every drive (OS boot drive and any data drives) uses the same fixed
+;  layout so any drive can be scanned, formatted, and mounted:
 ;
-;    LBA  FS_LBA_START     : superblock (512B) - magic 'SFFS', version
-;                             byte, reserved, 32-byte disk label
-;    LBA  FS_LBA_START+1   : node_type[VOL_NODES]  (1 sector, padded)
-;    LBA  FS_LBA_START+2   : node_parent[VOL_NODES] (1 sector, padded)
-;    LBA  FS_LBA_START+3   : node_next[VOL_NODES]  (1 sector; 0xFFFF = no
-;                             continuation). v3+ only - v2 has no next sector.
-;    LBA  FS_LBA_START+4.. : node_name[VOL_NODES*NAME_LEN]    (NAME_SECTORS)
-;    LBA  ..after name..   : node_content[VOL_NODES*CONTENT_LEN] (CONTENT_SECTORS)
+;    LBA  FS_LBA_START       : superblock (512B) - magic 'SFFS', version
+;                              byte, reserved, 32-byte disk label
+;    LBA  FS_LBA_START+1     : node_type[VOL_NODES]   (1 sector)
+;    LBA  FS_LBA_START+2     : node_parent[VOL_NODES] (1 sector; 0xFFFF = root)
+;    LBA  FS_LBA_START+3..   : node_name[VOL_NODES*NAME_LEN] (NAME_SECTORS)
+;    LBA  ..after name..     : node_bin_len[VOL_NODES]   (BINLEN_SECTORS)
+;    LBA  ..after binlen..   : node_first_block[VOL_NODES] (FIRSTBLOCK_SECTORS)
+;    LBA  ..after firstblk.. : free-block bitmap (BITMAP_SECTORS)
+;    LBA  DATA_START_LBA..   : data area, allocated in CLUSTER_SECTORS
+;                              (4096-byte) clusters
 ;
-;  A file whose content exceeds one 159-byte slot is stored as a chain:
-;  the file's own node holds the first chunk, and its node_next points at
-;  NODE_TYPE_CHAIN (type-3) continuation nodes, each holding the next 159
-;  bytes and linked through their own node_next (0xFFFF terminates). Chain
-;  nodes are invisible to path lookup, listing, and the allocator, and are
-;  freed along with the file.
+;  A node (type 1 = folder, type 2 = file) only holds metadata now. A
+;  file's bytes live in a contiguous run of clusters starting at
+;  node_first_block[node]; node_bin_len[node] is the exact byte count.
+;  The bitmap tracks which clusters are free (1 bit per cluster; 0 = free,
+;  1 = used), one per volume, cached in RAM and persisted at the same
+;  fixed LBA on each disk.
 ;
-;  *** Why v4 exists ***
-;  v2/v3 volumes had a hard VOL_NODES=64 ceiling, and that table was
-;  shared by folders, files, AND every chain continuation node. A single
-;  file bigger than 159 bytes already burns 2+ node slots, so it took
-;  surprisingly few real files (e.g. a compiler test fixture) to trip
-;  "error: filesystem is full" while the disk itself still had plenty of
-;  free sectors - the node *table*, not the disk, was what ran out.
-;  v4 keeps the exact same chain-of-nodes design (so all the code above
-;  that walks node_next doesn't change) and simply widens VOL_NODES to
-;  256, which needs bigger NAME/CONTENT regions - CONTENT_LBA is now
-;  computed from NAME_LBA+NAME_SECTORS instead of being hardcoded, so
-;  the two regions can never overlap as VOL_NODES changes again later.
-;  It also nudges EDIT_MAX (one file's max size) up from ~10KB to ~40KB
-;  as a side effect, since that's just VOL_NODES*CONTENT_LEN.
+;  *** What changed in v5 ***
+;  v4 kept content in the node table itself (160 bytes/node, chained
+;  through type-3 continuation nodes) which capped one file at ~40KB and
+;  let a handful of files exhaust all 256 node slots of a volume while
+;  the disk was still almost empty. v5 moves content off the node table
+;  entirely: node_content/node_next are gone, replaced by a 4-byte
+;  starting-cluster index per node. Files now grow up to the whole data
+;  region (~255 MB on a 256 MiB disk), the node table is used only by
+;  real files/folders, and interactive view/edit/run still stage content
+;  through the fixed fs_io_buf (EDIT_MAX bytes) exactly as before.
 ;
 ;  *** Backward compatibility ***
-;  v2 volumes (no node_next sector, name LBA at SUPER_LBA+3 / content at
-;  SUPER_LBA+7, 64 nodes) and v3 volumes (has node_next, but still the old
-;  64-node-sized name/content regions at OLD_NAME_LBA/OLD_CONTENT_LBA)
-;  both still load and read fine - see fs_layout_ver in vol_read. Loading
-;  either one leaves nodes 64..255 of that volume's slice explicitly
-;  cleared (free), so the moment you mkfl/mkf/edit again you're already
-;  using the bigger table; a sync then writes the volume back out in the
-;  current (v4) layout, upgrading it on disk permanently.
+;  NONE. v2/v3/v4 volumes (and the old single-block layout) are no longer
+;  readable - the on-disk layout and the semantics of node_next differ too
+;  much. Any existing disk must be reformatted (dscan/fmt). This is a
+;  deliberate breaking change to fund the cluster-based design.
 ;
-;  dscan probes all four ATA device slots for the magic, format writes
-;  a fresh empty volume + label, and mount loads a volume's node table
+;  dscan probes all device slots for the magic, format writes a fresh
+;  empty volume + label, and mount loads a volume's node table + bitmap
 ;  into memory (remapping its parent indices) rooted at /<label>/.
 ;  The kernel occupies LBA 1..1500 (KERNEL_SECTORS in boot.asm; the real
-;  kernel.bin is ~1180 sectors after MAX_PROCESSES was trimmed 4->2, so
-;  1500 leaves some slack). HARD CEILING: the image is loaded flat at
-;  0x8000 and base RAM tops out at 0x9FFFF (0xA0000 is the VGA adapter
-;  window - not RAM - so anything past that boundary is silently lost; the
-;  bg-scheduler arrays once grew the image to ~1373 sectors, past the edge,
-;  and the boot crashed). Keep kernel.bin under 0x98000 bytes. The
-;  filesystem region must start clear of KERNEL_SECTORS, with real
-;  margin for the kernel to keep growing - not just enough for today's
-;  build - so it starts at LBA 1560. v4's bigger name/content regions
-;  need ~100 sectors per volume (was ~28) - make sure each disk image
-;  you build/attach has enough room past LBA 1560 for that.
+;  kernel.bin is ~1180 sectors, so 1500 leaves some slack). HARD CEILING:
+;  the image is loaded flat at 0x8000 and base RAM tops out at 0x9FFFF
+;  (0xA0000 is the VGA adapter window - not RAM - so anything past that
+;  boundary is silently lost). Keep kernel.bin under 0x98000 bytes. The
+;  filesystem region must start clear of KERNEL_SECTORS, so it starts at
+;  LBA 1560. v5 needs ~36 sectors of metadata per volume (was ~100) -
+;  tiny - and the data area spans the rest of the disk.
 ; ------------------------------------------------------------------
 FS_LBA_START    equ 1560            ; bumped from 1150 - the background-process arrays
                                     ; once grew kernel.bin to ~1373 sectors, so boot.asm's
@@ -146,33 +135,30 @@ FS_LBA_START    equ 1560            ; bumped from 1150 - the background-process 
                                     ; FS_LBA_START=1150 needs to be reformatted (dscan/fmt)
                                     ; after this change, or that data is effectively at the
                                     ; wrong LBA and won't be found. ***
-SFFS_VERSION    equ 4               ; current on-disk format (256-node volumes)
-SFFS_VERSION_V3 equ 3               ; old format (64-node volumes, has node_next) - still readable
-SFFS_VERSION_V2 equ 2               ; old, single-block format - still readable
+SFFS_VERSION    equ 5               ; current on-disk format (cluster-based file storage)
 SUPER_LABEL_OFF equ 8               ; label lives at superblock offset 8..39
 SUPER_LBA       equ FS_LBA_START
 TYPE_LBA        equ SUPER_LBA + 1
 PARENT_LBA      equ SUPER_LBA + 2
-NEXT_LBA        equ SUPER_LBA + 3
-NAME_LBA        equ SUPER_LBA + 4
+NAME_LBA        equ SUPER_LBA + 3
 NAME_SECTORS    equ (VOL_NODES * NAME_LEN) / 512          ; 16 (256 nodes * 32B / 512)
-CONTENT_LBA     equ NAME_LBA + NAME_SECTORS                ; computed, not hardcoded - see above
-CONTENT_SECTORS equ (VOL_NODES * CONTENT_LEN) / 512       ; 80 (256 nodes * 160B / 512)
-BINLEN_LBA      equ CONTENT_LBA + CONTENT_SECTORS          ; binary-length table, first free LBA
+BINLEN_LBA      equ NAME_LBA + NAME_SECTORS                ; computed, not hardcoded
 BINLEN_SECTORS  equ (VOL_NODES * 4) / 512                 ; 2 (256 nodes * 4B / 512)
-NODE_TYPE_CHAIN equ 3               ; continuation node in a file's content chain
+FIRSTBLOCK_LBA  equ BINLEN_LBA + BINLEN_SECTORS
+FIRSTBLOCK_SECTORS equ (VOL_NODES * 4) / 512              ; 2 (256 nodes * 4B / 512)
+BITMAP_LBA      equ FIRSTBLOCK_LBA + FIRSTBLOCK_SECTORS
+BITMAP_SECTORS  equ 16              ; covers 16*512*8 = 65536 clusters >= 65336 (whole disk)
+BITMAP_BYTES    equ BITMAP_SECTORS * 512                  ; 8192 bytes per volume's cached bitmap
+DATA_START_LBA  equ BITMAP_LBA + BITMAP_SECTORS           ; first cluster LBA of the data area
+CLUSTER_SECTORS equ 8               ; one allocation unit = 4096 bytes
+CLUSTER_BYTES   equ CLUSTER_SECTORS * 512
+TOTAL_DISK_SECTORS equ 256 * 1024 * 1024 / 512            ; 524288 (a 256 MiB image)
+TOTAL_CLUSTERS  equ (TOTAL_DISK_SECTORS - DATA_START_LBA) / CLUSTER_SECTORS ; 65336
+EMPTY_CLUSTER   equ 0xFFFFFFFF      ; node_first_block value meaning "file is empty"
 
-; --- legacy v3 (64-node) on-disk geometry, needed only so vol_read can
-; still locate an old volume's name/content regions at their old fixed
-; offsets before it gets upgraded to v4 on the next sync. Do not use these
-; anywhere else - VOL_NODES/NAME_LBA/CONTENT_LBA above are the live ones. ---
-OLD_VOL_NODES       equ 64
-OLD_NAME_SECTORS    equ (OLD_VOL_NODES * NAME_LEN) / 512      ; 4
-OLD_CONTENT_SECTORS equ (OLD_VOL_NODES * CONTENT_LEN) / 512   ; 20
-OLD_NAME_LBA        equ SUPER_LBA + 4
-OLD_CONTENT_LBA     equ SUPER_LBA + 8
-
-EDIT_MAX        equ VOL_NODES * CONTENT_LEN   ; max bytes one file can hold (256*160)
+EDIT_MAX        equ 40960           ; max bytes one file can hold in the staging buffers
+                                    ; (fs_io_buf / script buffers) - a cap on interactive
+                                    ; view/edit/run, not on the on-disk format anymore.
 
 ; ============================================================
 kernel_entry:
@@ -926,6 +912,12 @@ dispatch:
     je cmd_prs
 
     mov rsi, cmd_buf
+    mov rdi, str_peek
+    call str_eq
+    cmp al, 1
+    je cmd_peek
+
+    mov rsi, cmd_buf
     mov rdi, str_syscmd
     call str_eq
     cmp al, 1
@@ -948,6 +940,12 @@ dispatch:
     call str_eq
     cmp al, 1
     je cmd_dscan
+
+    mov rsi, cmd_buf
+    mov rdi, str_storage
+    call str_eq
+    cmp al, 1
+    je cmd_storage
 
     mov rsi, cmd_buf
     mov rdi, str_format
@@ -1120,6 +1118,14 @@ dispatch:
     jne .not_bare_run
     cmp byte [rsi+3], 'n'
     jne .not_bare_run
+
+    ; Shift whatever was already tokenized into arg1_buf (e.g. "-back")
+    ; down into arg2_buf BEFORE we clobber arg1_buf with the filename -
+    ; cmd_run reads arg2_buf for "-back", so without this shift a typed
+    ; "1.run -back" silently lost its flag and ran in the foreground.
+    mov rsi, arg1_buf
+    mov rdi, arg2_buf
+    call str_copy
 
     mov rsi, cmd_buf
     mov rdi, arg1_buf
@@ -2077,8 +2083,6 @@ cmd_ls:
     jae .done
     cmp byte [node_type + r9], 0
     je .next
-    cmp byte [node_type + r9], NODE_TYPE_CHAIN
-    je .next
     movzx rax, word [node_parent + r9*2]
     cmp rax, [cur_dir]
     jne .next
@@ -2145,11 +2149,8 @@ cmd_cat:
     ret
 
 ; ------------------------------------------------------------
-; cmd_about: "about <path>" - print type, size, and node-usage info for
-; a file or folder without printing its content (unlike "view"). Handy
-; for seeing exactly how many chain nodes a file is eating out of the
-; volume's node table - the resource "error: filesystem is full" is
-; actually about (see fs_create_node/vol_read comments above).
+; cmd_about: "about <path>" - print type, size, and disk-usage info for
+; a file or folder without printing its content (unlike "view").
 cmd_about:
     cmp byte [arg1_buf], 0
     jne .have_arg
@@ -2220,16 +2221,11 @@ cmd_about:
     mov rsi, msg_about_bytes
     call print_string
 
-    ; count how many nodes (head + chain continuations) this file occupies
-    mov r13, 1
-    movzx rax, word [node_next + r12*2]
-.count_loop:
-    cmp rax, 0xFFFF
-    je .count_done
-    inc r13
-    movzx rax, word [node_next + rax*2]
-    jmp .count_loop
-.count_done:
+    ; how many 4096-byte clusters this file's content occupies on disk
+    mov rax, r13                ; byte size
+    add rax, CLUSTER_BYTES - 1
+    shr rax, 12
+    mov r13, rax
     mov rsi, msg_about_blocks
     call print_string
     mov rax, r13
@@ -2260,8 +2256,6 @@ cmd_about:
     cmp rcx, MAX_NODES
     jae .folder_done
     cmp byte [node_type + rcx], 0
-    je .folder_next
-    cmp byte [node_type + rcx], NODE_TYPE_CHAIN
     je .folder_next
     movzx rax, word [node_parent + rcx*2]
     cmp rax, r12
@@ -2487,6 +2481,12 @@ help_lookup:
     je .h_dscan
 
     mov rsi, arg1_buf
+    mov rdi, str_storage
+    call str_eq
+    cmp al, 1
+    je .h_storage
+
+    mov rsi, arg1_buf
     mov rdi, str_format
     call str_eq
     cmp al, 1
@@ -2686,6 +2686,9 @@ help_lookup:
     jmp .h_print
 .h_dscan:
     mov rsi, help_dscan
+    jmp .h_print
+.h_storage:
+    mov rsi, help_storage
     jmp .h_print
 .h_fmt:
     mov rsi, help_fmt
@@ -4358,8 +4361,6 @@ cmd_dscan:
     cmp byte [fs_super_buf+3], 'S'
     jne .other
     cmp byte [fs_super_buf+4], SFFS_VERSION
-    je .valid_sffs
-    cmp byte [fs_super_buf+4], SFFS_VERSION_V2
     jne .other
 .valid_sffs:
     ; valid SFFS volume
@@ -4559,8 +4560,6 @@ cmd_format:
     cmp byte [fs_super_buf+3], 'S'
     jne .fu_unformatted
     cmp byte [fs_super_buf+4], SFFS_VERSION
-    je .fu_is_sffs
-    cmp byte [fs_super_buf+4], SFFS_VERSION_V2
     jne .fu_unformatted
 .fu_is_sffs:
     ; already an SFFS volume - remember it for the -force path
@@ -4620,8 +4619,6 @@ cmd_format:
     cmp byte [fs_super_buf+3], 'S'
     jne .tg_next
     cmp byte [fs_super_buf+4], SFFS_VERSION
-    je .tg_is_sffs
-    cmp byte [fs_super_buf+4], SFFS_VERSION_V2
     jne .tg_next
 .tg_is_sffs:
     mov rsi, arg1_buf
@@ -4710,15 +4707,6 @@ cmd_format:
     lea rsi, [fs_super_buf]
     call disk_write_sector
     jc .disk_err
-    ; node_next: every node starts with no continuation
-    mov rdi, fs_super_buf
-    mov rcx, 512 / 2
-    mov ax, 0xFFFF
-    rep stosw
-    mov rax, NEXT_LBA
-    lea rsi, [fs_super_buf]
-    call disk_write_sector
-    jc .disk_err
     ; node_name: root named <label>, then zero sectors
     mov rdi, fs_super_buf
     mov rcx, 512 / 8
@@ -4740,14 +4728,14 @@ cmd_format:
     jc .disk_err
     inc rax
     loop .name_wr
-    ; node_content: zero sectors
+    ; node_first_block: every node starts with no cluster run
     mov rdi, fs_super_buf
-    mov rcx, 512 / 8
-    xor rax, rax
-    rep stosq
-    mov rax, CONTENT_LBA
-    mov rcx, CONTENT_SECTORS
-.content_wr:
+    mov rcx, 512 / 4
+    mov eax, EMPTY_CLUSTER
+    rep stosd
+    mov rax, FIRSTBLOCK_LBA
+    mov rcx, FIRSTBLOCK_SECTORS
+.firstblk_wr:
     push rax
     push rcx
     call spinner_step
@@ -4757,7 +4745,7 @@ cmd_format:
     pop rax
     jc .disk_err
     inc rax
-    loop .content_wr
+    loop .firstblk_wr
     ; node_bin_len: zero sectors
     mov rax, BINLEN_LBA
     mov rcx, BINLEN_SECTORS
@@ -4772,6 +4760,20 @@ cmd_format:
     jc .disk_err
     inc rax
     loop .binlen_wr
+    ; free-block bitmap: everything free
+    mov rax, BITMAP_LBA
+    mov rcx, BITMAP_SECTORS
+.bmp_wr:
+    push rax
+    push rcx
+    call spinner_step
+    lea rsi, [fs_super_buf]
+    call disk_write_sector
+    pop rcx
+    pop rax
+    jc .disk_err
+    inc rax
+    loop .bmp_wr
     call spinner_clear
     ; report
     mov rsi, msg_fmt_ok1
@@ -4870,8 +4872,6 @@ cmd_mount:
     cmp byte [fs_super_buf+3], 'S'
     jne .scan_next
     cmp byte [fs_super_buf+4], SFFS_VERSION
-    je .scan_is_sffs
-    cmp byte [fs_super_buf+4], SFFS_VERSION_V2
     jne .scan_next
 .scan_is_sffs:
     lea rsi, [fs_super_buf + SUPER_LABEL_OFF]
@@ -5120,8 +5120,6 @@ cmd_label:
     cmp byte [fs_super_buf+3], 'S'
     jne .dup_next
     cmp byte [fs_super_buf+4], SFFS_VERSION
-    je .dup_is_sffs
-    cmp byte [fs_super_buf+4], SFFS_VERSION_V2
     jne .dup_next
 .dup_is_sffs:
     lea rsi, [fs_super_buf + SUPER_LABEL_OFF]
@@ -5153,8 +5151,6 @@ cmd_label:
     cmp byte [fs_super_buf+3], 'S'
     jne .scan_next
     cmp byte [fs_super_buf+4], SFFS_VERSION
-    je .scan_is_sffs
-    cmp byte [fs_super_buf+4], SFFS_VERSION_V2
     jne .scan_next
 .scan_is_sffs:
     lea rsi, [fs_super_buf + SUPER_LABEL_OFF]
@@ -5249,6 +5245,153 @@ cmd_label:
     mov rsi, msg_label_long
     mov al, ATTR_ERROR
     call print_string_attr
+    ret
+
+; ------------------------------------------------------------
+; cmd_storage: show how much of a volume's storage is used vs free.
+;   storage             every volume currently in the tree (home + mounts)
+;   storage <label>     just that one volume ('home' is the OS volume)
+; Reads only the in-RAM cached free-block bitmap via fs_count_used - no
+; disk I/O, so figures are as of the last mount/format/write (run 'sync'
+; first if unsure the on-disk copy matches).
+cmd_storage:
+    cmp byte [arg1_buf], 0
+    jne .one_label
+    ; --- no argument: report every volume currently in the tree ---
+    mov rsi, msg_storage_header
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    xor rdx, rdx                 ; OS volume = bitmap slot 0
+    mov rsi, str_home_name
+    call .print_one
+    xor r12, r12
+.all_loop:
+    cmp r12, MAX_MOUNTS
+    jae .all_done
+    cmp byte [mount_used + r12], 0
+    je .all_next
+    mov rax, r12
+    imul rax, 32
+    lea rsi, [mount_label + rax]
+    mov rdx, r12
+    inc rdx                      ; mount slot k lives at bitmap slot k+1
+    call .print_one
+.all_next:
+    inc r12
+    jmp .all_loop
+.all_done:
+    ret
+.one_label:
+    ; the OS volume?
+    mov rsi, arg1_buf
+    mov rdi, str_home_name
+    call str_eq
+    cmp al, 1
+    jne .check_mounts
+    mov rsi, msg_storage_header
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    xor rdx, rdx
+    mov rsi, arg1_buf
+    call .print_one
+    ret
+.check_mounts:
+    xor r12, r12
+.cm_loop:
+    cmp r12, MAX_MOUNTS
+    jae .cm_not_found
+    cmp byte [mount_used + r12], 0
+    je .cm_next
+    mov rax, r12
+    imul rax, 32
+    lea rsi, [mount_label + rax]
+    mov rdi, arg1_buf
+    call str_eq
+    cmp al, 1
+    je .cm_found
+.cm_next:
+    inc r12
+    jmp .cm_loop
+.cm_found:
+    mov rsi, msg_storage_header
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    mov rdx, r12
+    inc rdx
+    mov rsi, arg1_buf
+    call .print_one
+    ret
+.cm_not_found:
+    mov rsi, msg_storage_none1
+    mov al, ATTR_ERROR
+    call print_string_attr
+    mov rsi, arg1_buf
+    mov al, ATTR_ERROR
+    call print_string_attr
+    mov rsi, msg_storage_none2
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+
+; .print_one: rdx = bitmap slot, rsi = label (must be stable memory - str_home_name
+; / mount_label / arg1_buf all qualify). Prints one
+; "  /<label>: <used> KB used, <free> KB free of <total> KB total (N% used)"
+; line. Uses r8-r11 (not r12/r13) so callers can keep a loop counter in r12
+; across the call.
+.print_one:
+    mov r8, rdx                  ; save slot
+    mov r9, rsi                  ; save label pointer
+    mov rsi, msg_storage_slash   ; "  /"
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    mov rsi, r9
+    call print_string
+    mov rsi, msg_storage_colon   ; ": "
+    call print_string
+    mov rdx, r8
+    call fs_count_used           ; rax = used clusters
+    mov r10, rax                 ; used clusters
+    mov r11, TOTAL_CLUSTERS
+    sub r11, r10                 ; free clusters
+    ; used KB (CLUSTER_BYTES = 4096, so clusters*4 = KB)
+    mov rax, r10
+    imul rax, 4
+    lea rdi, [show_num_buf]
+    call int_to_str
+    mov rsi, show_num_buf
+    call print_string
+    mov rsi, msg_storage_used_kb ; " KB used, "
+    call print_string
+    ; free KB
+    mov rax, r11
+    imul rax, 4
+    lea rdi, [show_num_buf]
+    call int_to_str
+    mov rsi, show_num_buf
+    call print_string
+    mov rsi, msg_storage_free_kb ; " KB free of "
+    call print_string
+    ; total KB
+    mov rax, TOTAL_CLUSTERS
+    imul rax, 4
+    lea rdi, [show_num_buf]
+    call int_to_str
+    mov rsi, show_num_buf
+    call print_string
+    mov rsi, msg_storage_total_kb ; " KB total ("
+    call print_string
+    ; percentage used
+    mov rax, r10
+    imul rax, 100
+    xor rdx, rdx
+    mov rbx, TOTAL_CLUSTERS
+    div rbx
+    lea rdi, [show_num_buf]
+    call int_to_str
+    mov rsi, show_num_buf
+    call print_string
+    mov rsi, msg_storage_pct_used ; "% used)", 10
+    call print_string
     ret
 
 ; ------------------------------------------------------------
@@ -5521,8 +5664,8 @@ sys_do_reset:
     lea rdi, [sys_reset_label_tmp]
     call str_copy
 
-    ; wipe node_type/node_parent/node_next/node_name/node_content for
-    ; just the OS volume's slice of nodes
+    ; wipe node_type/node_parent/node_first_block/node_bin_len/node_name
+    ; for just the OS volume's slice of nodes, and reset its bitmap
     mov rdi, node_type
     mov rcx, OS_NODES
     xor al, al
@@ -5533,18 +5676,24 @@ sys_do_reset:
     xor ax, ax
     rep stosw
 
-    mov rdi, node_next
+    mov rdi, node_first_block
     mov rcx, OS_NODES
-    mov ax, 0xFFFF
-    rep stosw
+    mov eax, EMPTY_CLUSTER
+    rep stosd
+
+    mov rdi, node_bin_len
+    mov rcx, OS_NODES
+    xor eax, eax
+    rep stosd
 
     mov rdi, node_name
     mov rcx, OS_NODES * NAME_LEN
     xor al, al
     rep stosb
 
-    mov rdi, node_content
-    mov rcx, OS_NODES * CONTENT_LEN
+    ; all clusters free again on the OS volume's bitmap
+    mov rdi, fs_bitmap
+    mov rcx, BITMAP_BYTES
     xor al, al
     rep stosb
 
@@ -6543,11 +6692,24 @@ cmd_rr:
     cmp rax, -1
     je .not_found
 
-    ; rax = node index, get content pointer
+    ; rax = node index - read the script into this nesting depth's buffer
+    ; (runrush used to stream straight from node_content, which no longer
+    ; holds file bytes). Two halves toggle on nesting so a script that runs
+    ; another script doesn't clobber the outer script's content.
     mov rbx, rax                    ; node index
-    mov rdi, rbx
-    imul rdi, CONTENT_LEN
-    lea r12, [node_content + rdi]   ; r12 = pointer to file content
+    mov al, [rr_buf_idx]
+    xor al, 1
+    mov [rr_buf_idx], al
+    and rax, 1
+    imul rax, EDIT_MAX
+    lea rdi, [rr_script_buf + rax]
+    mov rax, rbx
+    call fs_read_file
+    mov al, [rr_buf_idx]
+    xor al, 1
+    and rax, 1
+    imul rax, EDIT_MAX
+    lea r12, [rr_script_buf + rax]
     mov [rr_content_ptr], r12
 
     ; Allocate a process slot
@@ -6761,6 +6923,17 @@ cmd_prs:
 .peek_default_n:
     mov r12, 10
 .peek_have_n:
+    ; arg3_buf holds the optional "lower"/"last"/"upper" direction word.
+    ; Only "upper" changes anything - everything else (including nothing
+    ; at all) means the original tail behavior.
+    xor rdx, rdx
+    mov rsi, arg3_buf
+    mov rdi, str_upper
+    call str_eq
+    cmp al, 1
+    jne .peek_dir_set
+    mov rdx, 1
+.peek_dir_set:
     mov rdi, r13                    ; slot
     mov rsi, r12                    ; N lines
     call prs_peek_ring
@@ -6892,8 +7065,102 @@ cmd_prs:
     call print_string_attr
     ret
 
-; prs_peek_ring: rdi = slot, rsi = N. Linearizes the process's output
-; ring and prints the last N lines. Clobbers rax, rbx, rcx, rdx,
+; ============================================================
+;  cmd_peek: standalone "peek <pid|name> <N> [lower|upper]" command.
+;  Same job as 'prs peek', just spelled as its own top-level word and
+;  with the count read before the direction (peek <target> <N>
+;  <lower|upper>) instead of prs peek's <target> <lower|upper> <N>.
+;  Finds the background process by pid or name and hands off to the
+;  shared ring-printing routine below.
+; ============================================================
+cmd_peek:
+    cmp byte [arg1_buf], 0
+    jne .pk_have_arg
+    mov rsi, msg_peek_usage
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+.pk_have_arg:
+    ; Find the process by pid (if arg1 is numeric) or by name.
+    mov rsi, arg1_buf
+    call parse_int
+    cmp cl, 1
+    je .pk_by_pid
+    xor r13, r13
+.pk_find_name:
+    cmp r13, MAX_PROCESSES
+    jae .pk_not_found
+    cmp byte [proc_state + r13], 0
+    je .pk_name_next
+    mov rax, r13
+    imul rax, 32
+    lea rdi, [proc_name + rax]
+    mov rsi, arg1_buf
+    call str_eq
+    cmp al, 1
+    je .pk_found
+.pk_name_next:
+    inc r13
+    jmp .pk_find_name
+.pk_by_pid:
+    mov r12, rax                    ; target PID
+    xor r13, r13
+.pk_find_pid:
+    cmp r13, MAX_PROCESSES
+    jae .pk_not_found
+    cmp byte [proc_state + r13], 0
+    je .pk_pid_next
+    movzx rax, word [proc_id + r13*2]
+    cmp rax, r12
+    je .pk_found
+.pk_pid_next:
+    inc r13
+    jmp .pk_find_pid
+.pk_found:
+    ; r13 = slot. Only background processes capture output.
+    cmp byte [proc_bg + r13], 1
+    jne .pk_not_bg
+
+    ; arg2_buf holds the optional line count (default 10).
+    mov rsi, arg2_buf
+    call parse_int
+    cmp cl, 1
+    jne .pk_default_n
+    mov r12, rax
+    jmp .pk_have_n
+.pk_default_n:
+    mov r12, 10
+.pk_have_n:
+    ; arg3_buf holds the optional "lower"/"upper" direction word.
+    ; Only "upper" changes anything - everything else (including
+    ; nothing at all) means the original tail/lower behavior.
+    xor rdx, rdx
+    mov rsi, arg3_buf
+    mov rdi, str_upper
+    call str_eq
+    cmp al, 1
+    jne .pk_dir_set
+    mov rdx, 1
+.pk_dir_set:
+    mov rdi, r13                    ; slot
+    mov rsi, r12                    ; N lines
+    call prs_peek_ring
+    ret
+.pk_not_bg:
+    mov rsi, msg_peek_notbg
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+.pk_not_found:
+    mov rsi, msg_peek_noproc
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+
+; prs_peek_ring: rdi = slot, rsi = N, rdx = direction (0 = lower/tail -
+; last N lines, the original behavior; 1 = upper/head - first N lines
+; of what's still held in the ring). Linearizes the process's output
+; ring and prints the requested N lines. Clobbers rax, rbx, rcx, rdx,
 ; rsi, rdi, r8-r15.
 prs_peek_ring:
     push rbx
@@ -6907,6 +7174,7 @@ prs_peek_ring:
     push r15
     mov r12, rdi                    ; slot
     mov r13, rsi                    ; N
+    mov rbx, rdx                    ; direction: 0=lower(tail), 1=upper(head)
     mov eax, [proc_bg_ring_len + r12*4]
     mov ecx, [proc_bg_ring_start + r12*4]
     mov r15, rax                    ; byte count
@@ -6935,9 +7203,14 @@ prs_peek_ring:
     xor rcx, rcx
     jmp .ppr_cp_loop
 .ppr_cp_done:
-    ; prs_peek_buf[0..r15) = newest output. Find the first byte of the
-    ; last N lines (the trailing newline terminates the last line; count
-    ; newlines backwards from there).
+    ; prs_peek_buf[0..r15) = the ring's content in chronological order
+    ; (oldest byte at index 0, newest at r15-1).
+    cmp rbx, 1
+    je .ppr_mode_upper
+
+    ; ---- lower/tail mode: find the first byte of the last N lines
+    ; (the trailing newline terminates the last line; count newlines
+    ; backwards from there). ----
     mov r8, 0                       ; print start
     mov rcx, r15
     cmp rcx, 0
@@ -6961,9 +7234,37 @@ prs_peek_ring:
 .ppr_found:
     mov r8, rcx
     inc r8                          ; print from after this newline
+    jmp .ppr_scan_done2
+
+    ; ---- upper/head mode: always print from the start of what's still
+    ; held in the ring; walk forward and stop after the Nth newline
+    ; (or the end of the captured data if there are fewer than N lines),
+    ; truncating r15 there so the shared termination code below cuts the
+    ; output off at that point. ----
+.ppr_mode_upper:
+    mov r8, 0                       ; print start is always the oldest byte
+    xor rcx, rcx
+.ppr_upper_scan:
+    cmp rcx, r15
+    jae .ppr_upper_capend
+    lea rsi, [prs_peek_buf + rcx]
+    cmp byte [rsi], 0x0A
+    jne .ppr_upper_next
+    dec r13
+    jz .ppr_upper_found
+.ppr_upper_next:
+    inc rcx
+    jmp .ppr_upper_scan
+.ppr_upper_found:
+    inc rcx                         ; keep the Nth line's trailing newline
+.ppr_upper_capend:
+    mov r15, rcx                    ; truncate the printed region here
+
 .ppr_scan_done2:
     lea rsi, [prs_peek_buf + r8]
     mov byte [prs_peek_buf + r15], 0
+    cmp r15, 0
+    je .ppr_print
     cmp byte [prs_peek_buf + r15 - 1], 0x0A
     je .ppr_print
     mov byte [prs_peek_buf + r15], 0x0A
@@ -7952,16 +8253,21 @@ fs_init:
     mov rcx, MAX_NODES
     xor al, al
     rep stosb
-    ; node_next: every node starts with no chain
-    mov rdi, node_next
+    ; node_first_block: every node starts with no cluster run
+    mov rdi, node_first_block
     mov rcx, MAX_NODES
-    mov ax, 0xFFFF
-    rep stosw
-    ; node_bin_len: no binary file lengths yet
+    mov eax, EMPTY_CLUSTER
+    rep stosd
+    ; node_bin_len: no file lengths yet
     mov rdi, node_bin_len
     mov rcx, MAX_NODES
     xor eax, eax
     rep stosd
+    ; bitmap: everything free on every volume
+    mov rdi, fs_bitmap
+    mov rcx, (1 + MAX_MOUNTS) * BITMAP_BYTES
+    xor al, al
+    rep stosb
     mov byte [node_type], 1          ; root: folder
     mov word [node_parent], 0xFFFF
     lea rdi, [node_name]
@@ -8128,8 +8434,6 @@ fs_find_child:
     jae .notfound
     cmp byte [node_type + r9], 0
     je .next
-    cmp byte [node_type + r9], NODE_TYPE_CHAIN
-    je .next
     cmp r10, -1
     je .typeok
     movzx rax, byte [node_type + r9]
@@ -8207,7 +8511,8 @@ fs_create_node:
 .free:
     mov byte [node_type + r9], r10b
     mov [node_parent + r9*2], r8w
-    mov word [node_next + r9*2], 0xFFFF
+    mov dword [node_first_block + r9*4], EMPTY_CLUSTER
+    mov dword [node_bin_len + r9*4], 0
     mov rdi, r9
     imul rdi, NAME_LEN
     lea rdi, [node_name + rdi]
@@ -8242,302 +8547,633 @@ fs_delete_node:
     mov r9, rax
     mov byte [node_type + r9], 0
     mov word [node_parent + r9*2], 0
-    mov word [node_next + r9*2], 0xFFFF
+    mov dword [node_first_block + r9*4], EMPTY_CLUSTER
+    mov dword [node_bin_len + r9*4], 0
     mov rdi, r9
     imul rdi, NAME_LEN
     lea rdi, [node_name + rdi]
     mov rcx, NAME_LEN
     xor al, al
     rep stosb
-    mov rdi, r9
-    imul rdi, CONTENT_LEN
-    lea rdi, [node_content + rdi]
-    mov rcx, CONTENT_LEN
-    xor al, al
-    rep stosb
     pop r9
     pop rcx
     pop rdi
     pop rax
     ret
 
-; fs_file_len: rax = file node index. Returns rax = total content bytes
-; (each slot stores a 0-terminated chunk, so this is the logical length).
-fs_file_len:
+; ---- cluster allocation / deallocation ---------------------------------
+; fs_node_slot: rax = node index. Returns rdx = volume slot (0 = OS volume,
+; 1..MAX_MOUNTS = mount slots). Clobbers rax/rcx/rdx.
+fs_node_slot:
+    xor rdx, rdx
+    mov rcx, VOL_NODES
+    div rcx                     ; rax = slot, rdx = offset within volume
+    mov rdx, rax
+    ret
+
+; fs_slot_device: rdx = volume slot. Returns al = device id for that slot.
+fs_slot_device:
+    push rdx
+    test rdx, rdx
+    jnz .mounted
+    movzx eax, byte [boot_device]
+    jmp .done
+.mounted:
+    dec rdx
+    movzx eax, byte [mount_device + rdx]
+.done:
+    pop rdx
+    ret
+
+; fs_alloc_run: rdx = slot, rbx = number of clusters. Scans that volume's
+; cached bitmap for a run of rbx free clusters and marks them used. Returns
+; rax = first cluster index, or -1 if no contiguous run is that long.
+; Pure RAM - no disk I/O.
+fs_alloc_run:
     push rbx
     push rcx
-    push rsi
-    mov rcx, rax                ; current node in the chain
-    xor rbx, rbx                ; running total
-.len_loop:
-    mov rsi, rcx
-    imul rsi, CONTENT_LEN
-    lea rsi, [node_content + rsi]
-    call str_len
-    add rbx, rax
-    movzx rax, word [node_next + rcx*2]
-    cmp rax, 0xFFFF
-    je .done
-    mov rcx, rax
-    jmp .len_loop
-.done:
-    mov rax, rbx
-    pop rsi
+    push rdx
+    push r8
+    push r9
+    push r14
+    push r15
+    mov r15, rdx                ; slot
+    imul r15, BITMAP_BYTES
+    lea r15, [fs_bitmap + r15]  ; r15 = this volume's bitmap
+    xor r14, r14                ; candidate start
+.outer:
+    cmp r14, TOTAL_CLUSTERS
+    jae .full
+    xor r9, r9                  ; run length checked so far
+.inner:
+    cmp r9, rbx
+    jae .found
+    mov eax, r14d
+    add eax, r9d                ; bit index (bt computes the byte offset itself)
+    bt dword [r15], eax
+    jc .next_start              ; bit set -> cluster used, not free
+    inc r9
+    jmp .inner
+.next_start:
+    inc r14
+    jmp .outer
+.found:
+    ; mark rbx bits used starting at r14
+    xor r9, r9
+.set_loop:
+    cmp r9, rbx
+    jae .set_done
+    mov eax, r14d
+    add eax, r9d
+    bts dword [r15], eax
+    inc r9
+    jmp .set_loop
+.set_done:
+    mov rax, r14
+    jmp .out
+.full:
+    mov rax, -1
+.out:
+    pop r15
+    pop r14
+    pop r9
+    pop r8
+    pop rdx
     pop rcx
     pop rbx
     ret
 
-; fs_read_file: rax = file node index, rdi = destination buffer. Concatenates
-; every chunk in the file's chain into the destination (0-terminated). The
-; destination buffer must hold fs_file_len bytes + 1.
-fs_read_file:
+; fs_free_run: rdx = slot, rax = first cluster, rbx = count. Marks those
+; clusters free in the volume's cached bitmap. Pure RAM - no disk I/O.
+fs_free_run:
     push rbx
+    push rcx
+    push rdx
+    push r8
+    push r9
+    push r15
+    mov r15, rdx                ; slot
+    imul r15, BITMAP_BYTES
+    lea r15, [fs_bitmap + r15]
+    mov rcx, rax                ; first cluster
+    xor r9, r9                  ; counter
+.clr_loop:
+    cmp r9, rbx
+    jae .done
+    mov eax, ecx
+    add eax, r9d                ; bit index (btr computes the byte offset itself)
+    btr dword [r15], eax
+    inc r9
+    jmp .clr_loop
+.done:
+    pop r15
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; fs_count_used: rdx = slot. Returns rax = number of clusters marked used
+; in that volume's cached bitmap (see 'storage' command). Pure RAM scan,
+; same one-bit-at-a-time approach as fs_alloc_run above - no disk I/O.
+fs_count_used:
+    push rbx
+    push rcx
+    push rdx
+    push r14
+    push r15
+    mov r15, rdx                ; slot
+    imul r15, BITMAP_BYTES
+    lea r15, [fs_bitmap + r15]  ; r15 = this volume's bitmap
+    xor rbx, rbx                 ; used-cluster counter
+    xor r14, r14                 ; cluster index
+.cu_loop:
+    cmp r14, TOTAL_CLUSTERS
+    jae .cu_done
+    mov eax, r14d
+    bt dword [r15], eax
+    jnc .cu_free
+    inc rbx
+.cu_free:
+    inc r14
+    jmp .cu_loop
+.cu_done:
+    mov rax, rbx
+    pop r15
+    pop r14
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; ---- cluster data transfer ---------------------------------------------
+; fs_write_run: rsi = source buffer, rbx = byte length, rdx = slot,
+; rax = first cluster. Writes the bytes to disk starting at that cluster
+; (the slot's device must already be selected). Zero-pads the tail sector.
+; Returns CF=0 ok, CF=1 io error. Preserves everything but rax.
+fs_write_run:
+    push rbx
+    push rcx
+    push rdx
     push rsi
     push rdi
-    mov rbx, rax                ; current node
-.read_loop:
-    mov rsi, rbx
-    imul rsi, CONTENT_LEN
-    lea rsi, [node_content + rsi]
-    call str_copy               ; rdi ends up just past the NUL
-    movzx rax, word [node_next + rbx*2]
-    cmp rax, 0xFFFF
-    je .done
-    dec rdi                     ; step back over the NUL: the next chunk overwrites it
-    mov rbx, rax
-    jmp .read_loop
-.done:
+    push r8
+    push r9
+    push r10
+    push r11
+    push r15
+    mov r9, rbx                 ; remaining bytes
+    mov r8, rsi                 ; source cursor
+    mov r15, rax                ; current cluster index
+.wr_loop:
+    test r9, r9
+    jz .wr_done
+    mov r11, r9                 ; bytes in this cluster
+    cmp r11, CLUSTER_BYTES
+    jbe .wr_have_n
+    mov r11, CLUSTER_BYTES
+.wr_have_n:
+    mov rax, r15
+    imul rax, CLUSTER_SECTORS
+    add rax, DATA_START_LBA
+    mov rbx, r11                ; bytes left in this cluster
+.wr_sect:
+    cmp rbx, 512
+    jb .wr_tail
+    lea rsi, [r8]
+    call disk_write_sector
+    jc .wr_fail
+    inc rax
+    add r8, 512
+    sub rbx, 512
+    sub r9, 512
+    jmp .wr_sect
+.wr_tail:
+    test rbx, rbx
+    jz .wr_next_cluster
+    ; zero-pad one final sector with the tail bytes
+    push rax
+    push rbx
+    push rcx
+    push rsi
+    push rdi
+    push r8
+    lea rdi, [fs_io_scratch]
+    mov rcx, 512
+    xor al, al
+    rep stosb
+    lea rdi, [fs_io_scratch]
+    mov rsi, r8
+    mov rcx, rbx
+    rep movsb
+    pop r8
     pop rdi
     pop rsi
+    pop rcx
+    pop rbx
+    pop rax
+    lea rsi, [fs_io_scratch]
+    call disk_write_sector
+    jc .wr_fail
+    sub r9, rbx
+.wr_next_cluster:
+    inc r15
+    jmp .wr_loop
+.wr_done:
+    clc
+    jmp .wr_out
+.wr_fail:
+    stc
+.wr_out:
+    pop r15
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; fs_read_run: rdi = destination buffer, rbx = byte length, rdx = slot,
+; rax = first cluster. Copies the bytes from disk starting at that cluster
+; (the slot's device must already be selected). Returns CF=0 ok, CF=1 io
+; error. Preserves everything but rax; rdi/rsi advance.
+fs_read_run:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r15
+    mov r9, rbx                 ; remaining bytes
+    mov r8, rdi                 ; destination cursor
+    mov r15, rax                ; current cluster index
+.rd_loop:
+    test r9, r9
+    jz .rd_done
+    mov r11, r9
+    cmp r11, CLUSTER_BYTES
+    jbe .rd_have_n
+    mov r11, CLUSTER_BYTES
+.rd_have_n:
+    mov rax, r15
+    imul rax, CLUSTER_SECTORS
+    add rax, DATA_START_LBA
+    mov rbx, r11                ; bytes left in this cluster
+.rd_sect:
+    cmp rbx, 512
+    jb .rd_tail
+    mov rdi, r8
+    call disk_read_sector
+    jc .rd_fail
+    inc rax
+    add r8, 512
+    sub rbx, 512
+    sub r9, 512
+    jmp .rd_sect
+.rd_tail:
+    test rbx, rbx
+    jz .rd_next_cluster
+    push rax
+    push rbx
+    push rcx
+    push rsi
+    push rdi
+    push r8
+    lea rdi, [fs_io_scratch]
+    call disk_read_sector
+    pop r8
+    pop rdi
+    pop rsi
+    pop rcx
+    pop rbx
+    pop rax
+    jc .rd_fail
+    push rax
+    push rbx
+    push rcx
+    push rsi
+    push rdi
+    push r8
+    lea rsi, [fs_io_scratch]
+    mov rdi, r8
+    mov rcx, rbx
+    rep movsb
+    pop r8
+    pop rdi
+    pop rsi
+    pop rcx
+    pop rbx
+    pop rax
+    sub r9, rbx
+.rd_next_cluster:
+    inc r15
+    jmp .rd_loop
+.rd_done:
+    clc
+    jmp .rd_out
+.rd_fail:
+    stc
+.rd_out:
+    pop r15
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; ---- file read/write ---------------------------------------------------
+; fs_file_len: rax = file node index. Returns rax = exact content length
+; in bytes. O(1) - v5 records the length per file instead of walking a chain.
+fs_file_len:
+    mov eax, [node_bin_len + rax*4]
+    ret
+
+; fs_read_file: rax = file node index, rdi = destination buffer. Copies the
+; file's exact byte count (node_bin_len) from its cluster run into the
+; destination and NUL-terminates it. The destination buffer must hold
+; fs_file_len bytes + 1.
+fs_read_file:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r12
+    push r13
+    push r14
+    mov r14, rdi                ; destination
+    mov rbx, rax                ; node index
+    mov eax, [node_bin_len + rbx*4]
+    mov r13, rax                ; length
+    mov eax, [node_first_block + rbx*4]
+    mov r12, rax                ; first cluster
+    ; select the slot's device
+    mov rax, rbx
+    call fs_node_slot           ; rdx = slot
+    push rdx
+    mov rdi, rdx
+    call fs_slot_device
+    call disk_select_device
+    pop rdx
+    mov rdi, r14
+    mov rbx, r13
+    mov rax, r12
+    call fs_read_run
+    jc .io_fail
+    lea rdi, [r14 + r13]
+    mov byte [rdi], 0           ; NUL-terminate
+    jmp .done
+.io_fail:
+    mov byte [r14], 0           ; safe empty result
+.done:
+    pop r14
+    pop r13
+    pop r12
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
     pop rbx
     ret
 
 ; fs_write_file: rax = file node index, rsi = content to store (0-terminated).
-; Writes the content across the file's chain, allocating NODE_TYPE_CHAIN
-; continuation nodes in the same volume slice as needed and freeing any that
-; become surplus. Returns CF=0 on success, CF=1 if the volume ran out of
-; nodes (partial write possible - the file is still valid, just truncated).
+; Replaces the file's content: frees any old cluster run, allocates a new
+; contiguous run, writes the bytes. Returns CF=0 on success, CF=1 if the
+; volume ran out of contiguous clusters (the file is left empty on failure).
 fs_write_file:
-    push rax
     push rbx
     push rcx
     push rdx
-    push rsi
-    push r8
-    mov rbx, rax                ; current node (starts at the file's head)
-    mov r8, rsi                 ; r8 = remaining content ptr
-.write_loop:
-    ; copy one chunk into the current node
-    mov rdi, rbx
-    imul rdi, CONTENT_LEN
-    lea rdi, [node_content + rdi]
-    mov rcx, 0
-.copy_char:
-    mov al, [r8]
-    cmp al, 0
-    je .chunk_done
-    cmp rcx, CONTENT_LEN - 1
-    jae .need_next
-    mov [rdi + rcx], al
-    inc r8
-    inc rcx
-    jmp .copy_char
-.chunk_done:
-    mov byte [rdi + rcx], 0     ; NUL-terminate this chunk
-    mov [rdi + CONTENT_LEN - 1], byte 0
-    jmp .finish
-.need_next:
-    ; this node is full - link a continuation node if we don't have one
-    mov byte [rdi + CONTENT_LEN - 1], 0
-    movzx rdx, word [node_next + rbx*2]
-    cmp rdx, 0xFFFF
-    jne .use_next
-    ; allocate a chain node in this volume's slice (parent = the file head)
-    push rsi
-    push r8
-    mov rax, rbx
-    mov rsi, empty_str
-    mov r10, NODE_TYPE_CHAIN
-    call fs_create_node
-    pop r8
-    pop rsi
-    cmp rax, -1
-    je .no_space
-    mov rdx, rax
-    mov [node_next + rbx*2], dx
-.use_next:
-    mov rbx, rdx
-    jmp .write_loop
-.finish:
-    ; truncate any leftover chain nodes beyond what we wrote
-    movzx rcx, word [node_next + rbx*2]
-    cmp rcx, 0xFFFF
-    je .clean
-    mov [node_next + rbx*2], word 0xFFFF
-    mov rax, rcx
-    call fs_free_chain
-.clean:
-    clc
-    jmp .out
-.no_space:
-    stc
-.out:
-    pop r8
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
-    pop rax
-    ret
-
-; fs_write_binary_file: rax = file node index, rsi = buffer ptr, rcx = length in bytes.
-; Writes arbitrary binary data across the file's chain.
-fs_write_binary_file:
-    mov [node_bin_len + rax*4], ecx
-    push rax
-    push rbx
-    push rcx
-    push rdx
-    push rsi
-    push r8
-    push r9
-    mov rbx, rax
-    mov r8, rsi
-    mov r9, rcx
-.wb_loop:
-    test r9, r9
-    jle .wb_finish
-    mov rdi, rbx
-    imul rdi, CONTENT_LEN
-    lea rdi, [node_content + rdi]
-    xor rcx, rcx
-.wb_copy_byte:
-    test r9, r9
-    jle .wb_chunk_done
-    cmp rcx, CONTENT_LEN - 1
-    jae .wb_need_next
-    mov al, [r8]
-    mov [rdi + rcx], al
-    inc r8
-    dec r9
-    inc rcx
-    jmp .wb_copy_byte
-.wb_chunk_done:
-    mov byte [rdi + rcx], 0
-    jmp .wb_finish
-.wb_need_next:
-    mov byte [rdi + rcx], 0
-    movzx rdx, word [node_next + rbx*2]
-    cmp rdx, 0xFFFF
-    jne .wb_use_next
-    push rsi
-    push r8
-    push r9
-    mov rax, rbx
-    mov rsi, empty_str
-    mov r10, NODE_TYPE_CHAIN
-    call fs_create_node
-    pop r9
-    pop r8
-    pop rsi
-    cmp rax, -1
-    je .wb_no_space
-    mov rdx, rax
-    mov [node_next + rbx*2], dx
-.wb_use_next:
-    mov rbx, rdx
-    jmp .wb_loop
-.wb_finish:
-    movzx rcx, word [node_next + rbx*2]
-    cmp rcx, 0xFFFF
-    je .wb_clean
-    mov [node_next + rbx*2], word 0xFFFF
-    mov rax, rcx
-    call fs_free_chain
-.wb_clean:
-    clc
-    jmp .wb_out
-.wb_no_space:
-    stc
-.wb_out:
-    pop r9
-    pop r8
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
-    pop rax
-    ret
-
-; fs_read_binary_file: rax = file node index, rdi = destination buffer.
-; Binary-safe counterpart to fs_read_file: copies back the exact byte
-; count fs_write_binary_file recorded for this node, instead of stopping
-; at the first 0x00 byte - real binary content (e.g. a compiled .run
-; program) contains plenty of those and isn't just a C string.
-; Out: rax = number of bytes copied. Destination buffer must hold that
-; many bytes (same buffers already sized for fs_read_file are fine -
-; compiled programs are far smaller than fs_io_buf/EDIT_MAX).
-fs_read_binary_file:
-    push rbx
-    push rcx
     push rsi
     push rdi
     push r8
     push r9
-    mov r8d, [node_bin_len + rax*4]   ; r8 = bytes remaining to copy
-    mov r9, r8                        ; r9 = total, for the return value
-    mov rbx, rax                      ; current node
-.rb_loop:
-    test r8, r8
-    jle .rb_done
-    mov rsi, rbx
-    imul rsi, CONTENT_LEN
-    lea rsi, [node_content + rsi]
-    xor rcx, rcx
-.rb_copy_byte:
-    test r8, r8
-    jle .rb_done
-    cmp rcx, CONTENT_LEN - 1
-    jae .rb_next_node
-    mov al, [rsi + rcx]
-    mov [rdi], al
-    inc rdi
-    inc rcx
-    dec r8
-    jmp .rb_copy_byte
-.rb_next_node:
-    movzx rax, word [node_next + rbx*2]
-    cmp rax, 0xFFFF
-    je .rb_done                       ; chain ended early - shouldn't happen
-    mov rbx, rax
-    jmp .rb_loop
-.rb_done:
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r9, rax                 ; node index
+    mov r15, rsi                ; content
+    mov rsi, r15
+    call str_len
+    mov r13, rax                ; length
     mov rax, r9
+    call fs_node_slot           ; rdx = slot
+    mov r14, rdx
+    push rdx
+    mov rdi, rdx
+    call fs_slot_device
+    call disk_select_device
+    pop rdx
+    ; free the old run (if any)
+    mov eax, [node_first_block + r9*4]
+    cmp eax, EMPTY_CLUSTER
+    je .no_old
+    mov r8, rax                 ; old first cluster
+    mov eax, [node_bin_len + r9*4]
+    add rax, CLUSTER_BYTES - 1
+    shr rax, 12                 ; old cluster count
+    push r9
+    mov rbx, rax
+    mov rax, r8
+    mov rdx, r14
+    call fs_free_run
+    pop r9
+.no_old:
+    test r13, r13
+    jnz .alloc
+    mov dword [node_first_block + r9*4], EMPTY_CLUSTER
+    mov dword [node_bin_len + r9*4], 0
+    clc
+    jmp .done
+.alloc:
+    mov rax, r13
+    add rax, CLUSTER_BYTES - 1
+    shr rax, 12                 ; cluster count
+    mov rbx, rax
+    mov rdx, r14
+    call fs_alloc_run
+    cmp rax, -1
+    je .full
+    mov r12, rax                ; first cluster
+    mov rsi, r15
+    mov rbx, r13
+    mov rdx, r14
+    mov rax, r12
+    call fs_write_run
+    jc .full
+    mov dword [node_first_block + r9*4], r12d
+    mov dword [node_bin_len + r9*4], r13d
+    clc
+    jmp .done
+.full:
+    mov dword [node_first_block + r9*4], EMPTY_CLUSTER
+    mov dword [node_bin_len + r9*4], 0
+    stc
+.done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
     pop r9
     pop r8
     pop rdi
     pop rsi
+    pop rdx
     pop rcx
     pop rbx
     ret
 
-; fs_free_chain: rax = node index. Frees every continuation node linked after
-; it (not the node itself) and unlinks them. Never used on a folder.
-fs_free_chain:
-    push rax
+; fs_write_binary_file: rax = file node index, rsi = buffer ptr, rcx = length.
+; Writes arbitrary binary data to the file's cluster run.
+fs_write_binary_file:
+    push rbx
     push rcx
-    movzx rax, word [node_next + rax*2]   ; rax = first continuation node
-.free_loop:
-    cmp rax, 0xFFFF
-    je .done
-    movzx rcx, word [node_next + rax*2]   ; remember what follows this node
-    mov [node_next + rax*2], word 0xFFFF  ; unlink it
-    call fs_delete_node                   ; frees rax; rax & rcx are preserved
-    mov rax, rcx                          ; walk to the next continuation node
-    jmp .free_loop
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r9, rax                 ; node index
+    mov r15, rsi                ; content
+    mov r13, rcx                ; length
+    mov rax, r9
+    call fs_node_slot           ; rdx = slot
+    mov r14, rdx
+    push rdx
+    mov rdi, rdx
+    call fs_slot_device
+    call disk_select_device
+    pop rdx
+    mov eax, [node_first_block + r9*4]
+    cmp eax, EMPTY_CLUSTER
+    je .no_old
+    mov r8, rax
+    mov eax, [node_bin_len + r9*4]
+    add rax, CLUSTER_BYTES - 1
+    shr rax, 12
+    push r9
+    mov rbx, rax
+    mov rax, r8
+    mov rdx, r14
+    call fs_free_run
+    pop r9
+.no_old:
+    test r13, r13
+    jnz .alloc
+    mov dword [node_first_block + r9*4], EMPTY_CLUSTER
+    mov dword [node_bin_len + r9*4], 0
+    clc
+    jmp .done
+.alloc:
+    mov rax, r13
+    add rax, CLUSTER_BYTES - 1
+    shr rax, 12
+    mov rbx, rax
+    mov rdx, r14
+    call fs_alloc_run
+    cmp rax, -1
+    je .full
+    mov r12, rax
+    mov rsi, r15
+    mov rbx, r13
+    mov rdx, r14
+    mov rax, r12
+    call fs_write_run
+    jc .full
+    mov dword [node_first_block + r9*4], r12d
+    mov dword [node_bin_len + r9*4], r13d
+    clc
+    jmp .done
+.full:
+    mov dword [node_first_block + r9*4], EMPTY_CLUSTER
+    mov dword [node_bin_len + r9*4], 0
+    stc
 .done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
     pop rcx
-    pop rax
+    pop rbx
+    ret
+
+; fs_read_binary_file: rax = file node index, rdi = destination buffer.
+; Binary-safe counterpart to fs_read_file: copies back the exact byte count
+; recorded in node_bin_len instead of stopping at the first 0x00 byte - real
+; binary content (e.g. a compiled .run program) contains plenty of those.
+; Out: rax = number of bytes copied. Destination buffer must hold that many.
+fs_read_binary_file:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r12
+    push r13
+    push r14
+    mov r14, rdi                ; destination
+    mov rbx, rax                ; node index
+    mov eax, [node_bin_len + rbx*4]
+    mov r13, rax                ; length
+    mov eax, [node_first_block + rbx*4]
+    mov r12, rax                ; first cluster
+    mov rax, rbx
+    call fs_node_slot           ; rdx = slot
+    push rdx
+    mov rdi, rdx
+    call fs_slot_device
+    call disk_select_device
+    pop rdx
+    mov rdi, r14
+    mov rbx, r13
+    mov rax, r12
+    call fs_read_run
+    jc .io_fail
+    mov rax, r13
+    jmp .done
+.io_fail:
+    xor eax, eax
+.done:
+    pop r14
+    pop r13
+    pop r12
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
     ret
 
 ; fs_delete_tree: rax = node index. Recursively frees the node and, if
@@ -8555,8 +9191,6 @@ fs_delete_tree:
     jae .leaf
     cmp byte [node_type + r13], 0
     je .next
-    cmp byte [node_type + r13], NODE_TYPE_CHAIN
-    je .next
     movzx rax, word [node_parent + r13*2]
     cmp rax, r8
     jne .next
@@ -8566,12 +9200,25 @@ fs_delete_tree:
     inc r13
     jmp .loop
 .leaf:
-    ; a file may own a chain of continuation nodes - free it first
+    ; a file owns a cluster run - free it before freeing the node
     cmp byte [node_type + r8], 2
-    jne .no_chain
+    jne .no_run
+    mov eax, [node_first_block + r8*4]
+    cmp eax, EMPTY_CLUSTER
+    je .no_run
+    mov r13d, eax               ; first cluster (r13 is preserved by the fn)
+    mov eax, [node_bin_len + r8*4]
+    add rax, CLUSTER_BYTES - 1
+    shr rax, 12                 ; cluster count
+    push r8
+    push rax
     mov rax, r8
-    call fs_free_chain
-.no_chain:
+    call fs_node_slot           ; rdx = slot
+    pop rbx                     ; count
+    pop r8
+    mov rax, r13                ; first
+    call fs_free_run            ; rdx = slot preserved by fs_node_slot
+.no_run:
     mov rax, r8
     call fs_delete_node
     pop r13
@@ -8613,7 +9260,7 @@ fs_copy_node:
 
     cmp r11, 2
     jne .isfolder
-    ; copy the whole file (possibly a multi-node chain) through staging
+    ; copy the whole file through staging
     mov rax, r8
     lea rdi, [fs_io_buf]
     call fs_read_file
@@ -8627,8 +9274,6 @@ fs_copy_node:
     cmp r13, MAX_NODES
     jae .done
     cmp byte [node_type + r13], 0
-    je .childnext
-    cmp byte [node_type + r13], NODE_TYPE_CHAIN
     je .childnext
     movzx rax, word [node_parent + r13*2]
     cmp rax, r8
@@ -9579,11 +10224,11 @@ ahci_rw_common:
 ; ------------------------------------------------------------------
 
 ; vol_read: al = device id (0..3), rdi = base node index.
-; Loads an SFFS volume from that device into the node table at
-; [base .. base+VOL_NODES). For the OS volume (base 0) parents are
-; copied verbatim; for mounted volumes, on-disk relative parent indices
-; are remapped to the mount's global slice and the volume root becomes a
-; child of the OS root (parent 0).
+; Loads an SFFS v5 volume from that device into the node table at
+; [base .. base+VOL_NODES) plus that volume's cached free-block bitmap.
+; For the OS volume (base 0) parents are copied verbatim; for mounted
+; volumes, on-disk relative parent indices are remapped to the mount's
+; global slice and the volume root becomes a child of the OS root (parent 0).
 ; returns rax = 0 on success, -1 on failure (absent device, bad magic,
 ; or an I/O error). Sets fs_disk_available=0 when the device never
 ; responded (i.e. there's no drive at that slot).
@@ -9610,25 +10255,10 @@ vol_read:
     jne .fail
     cmp byte [fs_super_buf+3], 'S'
     jne .fail
-    ; accept v4 (current, 256-node), legacy v3 (64-node), and v2 (old
-    ; single-block) formats. fs_layout_ver records which one so the
-    ; name/content sections below know which LBAs/sector counts to use;
-    ; the node_next section below still just needs "does this format even
-    ; have a chain sector" (true for v3 and v4, false for v2).
-    mov byte [fs_layout_ver], 0
+    ; accept only v5 (cluster-based) volumes - the old chain-based formats
+    ; are deliberately gone.
     cmp byte [fs_super_buf+4], SFFS_VERSION
-    je .is_v4
-    cmp byte [fs_super_buf+4], SFFS_VERSION_V3
-    je .is_v3
-    cmp byte [fs_super_buf+4], SFFS_VERSION_V2
-    je .version_ok
-    jmp .fail
-.is_v4:
-    mov byte [fs_layout_ver], 2
-    jmp .version_ok
-.is_v3:
-    mov byte [fs_layout_ver], 1
-.version_ok:
+    jne .fail
     ; node_type
     mov rax, TYPE_LBA
     lea rdi, [node_type]
@@ -9666,41 +10296,9 @@ vol_read:
     inc r9
     jmp .remap
 .remap_done:
-    ; node_next (v3/v4 only) - a v2 volume gets a fresh no-chain slice instead
-    cmp byte [fs_layout_ver], 0
-    je .next_v2
-    mov rax, NEXT_LBA
-    lea rdi, [fs_next_scratch]
-    call disk_read_sector
-    jc .fail
-    lea rsi, [fs_next_scratch]
-    lea rdi, [node_next + r8*2]
-    mov rcx, VOL_NODES
-    rep movsw
-    jmp .next_loaded
-.next_v2:
-    lea rdi, [node_next + r8*2]
-    mov rcx, VOL_NODES
-    mov ax, 0xFFFF
-    rep stosw
-.next_loaded:
-    ; node_name: LBA/sector-count depends on layout version
-    cmp byte [fs_layout_ver], 0
-    jne .name_not_v2
-    mov rax, SUPER_LBA + 3
-    mov r10, 1                   ; v2 packed all names into a single sector
-    jmp .name_go
-.name_not_v2:
-    cmp byte [fs_layout_ver], 1
-    jne .name_v4
-    mov rax, OLD_NAME_LBA
-    mov r10, OLD_NAME_SECTORS
-    jmp .name_go
-.name_v4:
+    ; node_name
     mov rax, NAME_LBA
-    mov r10, NAME_SECTORS
-.name_go:
-    mov rcx, r10
+    mov rcx, NAME_SECTORS
     lea rdi, [node_name]
     mov r9, r8
     imul r9, NAME_LEN
@@ -9717,51 +10315,14 @@ vol_read:
     add rdi, 512
     inc rax
     loop .name_loop
-    ; node_content: LBA/sector-count depends on layout version
-    cmp byte [fs_layout_ver], 0
-    jne .content_not_v2
-    mov rax, SUPER_LBA + 7
-    mov r10, 1
-    jmp .content_go
-.content_not_v2:
-    cmp byte [fs_layout_ver], 1
-    jne .content_v4
-    mov rax, OLD_CONTENT_LBA
-    mov r10, OLD_CONTENT_SECTORS
-    jmp .content_go
-.content_v4:
-    mov rax, CONTENT_LBA
-    mov r10, CONTENT_SECTORS
-.content_go:
-    mov rcx, r10
-    lea rdi, [node_content]
-    mov r9, r8
-    imul r9, CONTENT_LEN
-    add rdi, r9
-.content_loop:
-    push rax
-    push rcx
-    push rdi
-    call disk_read_sector
-    pop rdi
-    pop rcx
-    pop rax
-    jc .fail
-    add rdi, 512
-    inc rax
-    loop .content_loop
-    ; node_bin_len: only the v4 layout carries it; v2/v3 volumes predate
-    ; binary files, so zero the whole table - stale memory must never
-    ; look like a valid length for a binary file read.
-    cmp byte [fs_layout_ver], 2
-    jne .binlen_zero
+    ; node_bin_len (exact byte count of every file)
     mov rax, BINLEN_LBA
     mov rcx, BINLEN_SECTORS
     lea rdi, [node_bin_len]
     mov r9, r8
     imul r9, 4
     add rdi, r9
-.binlen_read_loop:
+.binlen_loop:
     push rax
     push rcx
     push rdi
@@ -9772,53 +10333,47 @@ vol_read:
     jc .fail
     add rdi, 512
     inc rax
-    loop .binlen_read_loop
-    jmp .binlen_done
-.binlen_zero:
-    lea rdi, [node_bin_len]
+    loop .binlen_loop
+    ; node_first_block (starting cluster of each file's content run)
+    mov rax, FIRSTBLOCK_LBA
+    mov rcx, FIRSTBLOCK_SECTORS
+    lea rdi, [node_first_block]
     mov r9, r8
     imul r9, 4
     add rdi, r9
+.firstblk_loop:
+    push rax
+    push rcx
+    push rdi
+    call disk_read_sector
+    pop rdi
+    pop rcx
+    pop rax
+    jc .fail
+    add rdi, 512
+    inc rax
+    loop .firstblk_loop
+    ; free-block bitmap for this volume's slot (base / VOL_NODES)
+    mov rax, r8
     mov rcx, VOL_NODES
-    xor eax, eax
-    rep stosd
-.binlen_done:
-    ; v2/v3 volumes only ever had OLD_VOL_NODES(64) real slots on disk -
-    ; explicitly free the newly-available 64..255 range for this volume
-    ; instead of trusting whatever bytes happened to land there, so the
-    ; extra v4 capacity is guaranteed clean rather than full of stale
-    ; leftovers from disk. A v4 volume already has all 256 slots valid
-    ; as read, so this is skipped for it.
-    cmp byte [fs_layout_ver], 2
-    je .no_extend
-    mov rcx, OLD_VOL_NODES
-.extend_loop:
-    cmp rcx, VOL_NODES
-    jae .no_extend
-    mov r9, r8
-    add r9, rcx
-    mov byte [node_type + r9], 0
-    mov word [node_parent + r9*2], 0
-    mov word [node_next + r9*2], 0xFFFF
-    mov rdi, r9
-    imul rdi, NAME_LEN
-    lea rdi, [node_name + rdi]
+    xor rdx, rdx
+    div rcx
+    imul rax, BITMAP_BYTES
+    lea rdi, [fs_bitmap + rax]
+    mov rax, BITMAP_LBA
+    mov rcx, BITMAP_SECTORS
+.bmp_loop:
+    push rax
     push rcx
-    mov rcx, NAME_LEN
-    xor al, al
-    rep stosb
+    push rdi
+    call disk_read_sector
+    pop rdi
     pop rcx
-    mov rdi, r9
-    imul rdi, CONTENT_LEN
-    lea rdi, [node_content + rdi]
-    push rcx
-    mov rcx, CONTENT_LEN
-    xor al, al
-    rep stosb
-    pop rcx
-    inc rcx
-    jmp .extend_loop
-.no_extend:
+    pop rax
+    jc .fail
+    add rdi, 512
+    inc rax
+    loop .bmp_loop
     xor rax, rax
     jmp .done
 .nodisk:
@@ -9839,7 +10394,8 @@ vol_read:
 ; vol_write: al = device id, rdi = base node index, rsi = label ptr.
 ; Writes the volume at [base .. base+VOL_NODES) plus a fresh superblock
 ; (magic + version + label) to that device. Parents are remapped back to
-; on-disk relative indices (the volume root is stored as 0xFFFF).
+; on-disk relative indices (the volume root is stored as 0xFFFF); the
+; volume's cached free-block bitmap is flushed out too.
 ; returns CF=0 on success, CF=1 on failure.
 vol_write:
     push rax
@@ -9917,19 +10473,26 @@ vol_write:
     lea rsi, [fs_parent_scratch]
     call disk_write_sector
     jc .fail
-    ; --- node_next: this volume's 64 words padded to a full 0xFFFF sector ---
-    mov rdi, fs_next_scratch
-    mov rcx, 512 / 2
-    mov ax, 0xFFFF
-    rep stosw
-    lea rsi, [node_next + r8*2]
-    lea rdi, [fs_next_scratch]
-    mov rcx, VOL_NODES
-    rep movsw
-    mov rax, NEXT_LBA
-    lea rsi, [fs_next_scratch]
+    ; --- node_first_block (starting cluster of each file's content run) ---
+    mov rax, FIRSTBLOCK_LBA
+    mov rcx, FIRSTBLOCK_SECTORS
+    lea rsi, [node_first_block]
+    mov rdi, r8
+    imul rdi, 4
+    add rsi, rdi
+.firstblk_loop:
+    push rax
+    push rcx
+    push rsi
+    call spinner_step
     call disk_write_sector
+    pop rsi
+    pop rcx
+    pop rax
     jc .fail
+    add rsi, 512
+    inc rax
+    loop .firstblk_loop
     ; --- node_name ---
     mov rax, NAME_LBA
     mov rcx, NAME_SECTORS
@@ -9950,14 +10513,16 @@ vol_write:
     add rsi, 512
     inc rax
     loop .name_loop
-    ; --- node_content ---
-    mov rax, CONTENT_LBA
-    mov rcx, CONTENT_SECTORS
-    lea rsi, [node_content]
-    mov rdi, r8
-    imul rdi, CONTENT_LEN
-    add rsi, rdi
-.content_loop:
+    ; --- free-block bitmap for this volume's slot (base / VOL_NODES) ---
+    mov rax, r8
+    mov rcx, VOL_NODES
+    xor rdx, rdx
+    div rcx
+    imul rax, BITMAP_BYTES
+    lea rsi, [fs_bitmap + rax]
+    mov rax, BITMAP_LBA
+    mov rcx, BITMAP_SECTORS
+.bmp_loop:
     push rax
     push rcx
     push rsi
@@ -9969,10 +10534,10 @@ vol_write:
     jc .fail
     add rsi, 512
     inc rax
-    loop .content_loop
-    ; --- node_bin_len: exact byte count of binary files (written by
-    ; fs_write_binary_file, e.g. compiled .run programs). Without it the
-    ; length is lost on a reboot and fs_read_binary_file returns 0 bytes.
+    loop .bmp_loop
+    ; --- node_bin_len: exact byte count of every file (written by
+    ; fs_write_file/fs_write_binary_file). Without it the length is lost
+    ; on a reboot and fs_read_file/fs_read_binary_file return 0 bytes.
     mov rax, BINLEN_LBA
     mov rcx, BINLEN_SECTORS
     lea rsi, [node_bin_len]
@@ -16557,9 +17122,9 @@ wig_str_buf:   times 16 db 0    ; scratch for the wig clock widget
 wig_last_sec:  db 0             ; last second the widget drew (redraw gate)
 
 banner:
-    db "ShellyForever v0.1.11 -- 'help' for commands", 10, 0
+    db "ShellyForever v0.1.12 -- 'help' for commands", 10, 0
 build_stamp:
-    db "build 20260811 -- Party v0.1.11: % && || read, multi-var vars", 10, 0
+    db "build 20260813 -- Party v0.1.12: background scripts no longer eat keystrokes", 10, 0
 
 prompt_head: db "rush>", 0
 prompt_tail: db ": ", 0
@@ -16707,7 +17272,7 @@ SHELLY_PAL_LEN equ 6
 shelly_palette: db 0x0E, 0x0B, 0x0A, 0x0D, 0x09, 0x0F   ; yel, cyan, grn, mag, lblu, wht
 shelly_rule:  db "  ============================================================", 10, 0
 shelly_title: db "         ShellyForever OS", 0
-shelly_version: db "         v0.1.11", 10, 0
+shelly_version: db "         v0.1.12", 10, 0
 shelly_by:    db "         Developed by Sourasish Das", 10, 0
 shelly_cr:    db "         Copyright 2026. All rights reserved.", 10, 0
 str_col_black:    db "black", 0
@@ -16767,6 +17332,7 @@ empty_str:  db 0
 str_syscmd:    db "sys", 0        ; the "sys" command word (sys reset)
 str_sys_reset: db "reset", 0
 str_dscan:  db "dscan", 0
+str_storage: db "storage", 0
 str_format: db "fmt", 0
 str_mount:  db "mount", 0
 str_unmount: db "unmount", 0
@@ -16802,6 +17368,7 @@ completion_cmds:
     dq str_auth
     dq str_vars
     dq str_dscan
+    dq str_storage
     dq str_format
     dq str_mount
     dq str_unmount
@@ -16841,9 +17408,9 @@ msg_type_file:    db "file", 10, 0
 msg_type_folder:  db "folder", 10, 0
 msg_about_size:   db "  size:     ", 0
 msg_about_bytes:  db " bytes", 10, 0
-msg_about_blocks: db "  blocks:   ", 0
-msg_about_blocks_singular: db " node (this file fits with no chain continuations)", 10, 0
-msg_about_blocks_plural:   db " nodes (1 head + chain continuations - each ~159 bytes)", 10, 0
+msg_about_blocks: db "  clusters:  ", 0
+msg_about_blocks_singular: db " cluster (4096 bytes) on disk", 10, 0
+msg_about_blocks_plural:   db " clusters (4096 bytes each) on disk", 10, 0
 msg_about_items:  db "  items:    ", 0
 msg_about_items_singular: db " entry", 10, 0
 msg_about_items_plural:   db " entries", 10, 0
@@ -16999,6 +17566,16 @@ msg_unmount_busy1:  db "unmount: cannot detach ", 0
 msg_unmount_busy2:  db " while inside it - 'cf /home' first", 10, 0
 msg_label_usage:  db "label: use 'label <old> <new>' to rename a drive", 10, 0
 msg_label_long:   db "label: new label too long (max 31 characters)", 10, 0
+
+msg_storage_header:   db "Storage:", 10, 0
+msg_storage_slash:    db "  /", 0
+msg_storage_colon:    db ": ", 0
+msg_storage_used_kb:  db " KB used, ", 0
+msg_storage_free_kb:  db " KB free of ", 0
+msg_storage_total_kb: db " KB total (", 0
+msg_storage_pct_used: db "% used)", 10, 0
+msg_storage_none1:    db "storage: no drive labeled '", 0
+msg_storage_none2:    db "' is mounted. Run 'mount <label>' first (or 'dscan' to see what's available).", 10, 0
 msg_label_none1:  db "label: no drive labeled '", 0
 msg_label_none2:  db "' found. Run 'dscan'.", 10, 0
 msg_label_inuse1: db "label: '", 0
@@ -17032,8 +17609,12 @@ msg_prs_noid:     db "prs: no such process", 10, 0
 msg_prs_header:   db "PID  Name", 10, 0
 prs_spaces:      db "   ", 0
 str_peek:        db "peek", 0
+str_upper:       db "upper", 0
 msg_prs_peek_notbg: db "prs: that process is not a background process", 10, 0
 msg_prs_peek_usage: db "prs: usage: prs peek <pid|name> [lower|last] <N>", 10, 0
+msg_peek_usage:   db "peek: usage: peek <pid|name> <N> [lower|upper]", 10, 0
+msg_peek_notbg:   db "peek: that process is not a background process", 10, 0
+msg_peek_noproc:  db "peek: no such process", 10, 0
 
 ; --- auth / vars / flags messages ---
 msg_auth_required: db "error: this command requires authentication. Use 'auth <command>' first.", 10, 0
@@ -17100,6 +17681,8 @@ help_text:
     db "  fmt <label>        format a drive with the SFFS format (-force reuses one)", 10
     db "  fmt <target> <lbl> format a SPECIFIC drive (see dscan's 'fmt target:')", 10
     db "  dscan              scan for SFFS drives attached to the ATA bus", 10
+    db "  storage            show used/free space for every mounted volume", 10
+    db "  storage <label>    show used/free space for just that volume", 10
     db "  mount <label>      mount a formatted drive at /<label>/", 10
     db "  unmount <label>    detach a mounted drive (data stays on disk)", 10
     db "  label <old> <new>  rename a formatted drive without touching its data", 10
@@ -17330,6 +17913,14 @@ help_dscan:
     db "  Scan all four ATA drive slots for SFFS volumes and report", 10
     db "  which ones are formatted.", 10, 0
 
+help_storage:
+    db "storage | storage <label>", 10
+    db "  With no argument, show used/free space for every volume", 10
+    db "  currently in the tree (the OS volume 'home' plus any mounted", 10
+    db "  drives). With a label, show just that one volume. Reads the", 10
+    db "  in-RAM free-block bitmap, so figures are as of the last", 10
+    db "  mount/format/write - run 'sync' first if in doubt.", 10, 0
+
 help_fmt:
     db "fmt <label> [-force] | fmt <target> <label> [-force]", 10
     db "  fmt <label>            formats the first unformatted drive.", 10
@@ -17450,16 +18041,21 @@ mount_used:    times MAX_MOUNTS db 0        ; 1 = slot in use
 node_type:    times 512 * (1 + MAX_MOUNTS) db 0
 node_parent:  times MAX_NODES dw 0
 node_name:    times MAX_NODES*NAME_LEN db 0
-node_content: times MAX_NODES*CONTENT_LEN db 0
-node_next:    times MAX_NODES dw 0xFFFF   ; 0xFFFF = end of chain (or no chain)
-; node_bin_len: exact byte count for files written via fs_write_binary_file,
-; recorded on the file's head node only. Lets fs_read_binary_file copy back
-; the precise length instead of guessing from NUL bytes (which real binary
-; content - e.g. compiled .run programs - can legitimately contain).
-; NOTE: not part of the on-disk SFFS format yet, so this resets on
-; remount/reboot - a freshly compiled .run works immediately, but won't
-; survive a reboot until this is added to the persisted layout too.
+; node_first_block: starting data cluster of each file's content run. EMPTY_CLUSTER
+; (0xFFFFFFFF) = the file is empty (no clusters owned). 4 bytes per node - a single
+; cluster index reaches the whole 256 MiB data area.
+node_first_block: times MAX_NODES dd EMPTY_CLUSTER
+; node_bin_len: exact byte count for every file (text and binary alike) written via
+; fs_write_file/fs_write_binary_file, recorded on the file's head node only. Lets
+; fs_read_file/fs_read_binary_file copy back the precise length instead of guessing
+; from NUL bytes (which real binary content - e.g. compiled .run programs - can
+; legitimately contain). Persisted with the volume.
 node_bin_len: times MAX_NODES dd 0
+; fs_bitmap: cached free-block bitmap, one 8KB slice per volume (OS volume first,
+; then each mount slot, matching the node table's slot partitioning). Bit set = cluster
+; in use, clear = free. Loaded by vol_read, flushed by vol_write, edited by the
+; cluster allocator (fs_alloc_run/fs_free_run).
+fs_bitmap:    times (1 + MAX_MOUNTS) * BITMAP_BYTES db 0
 
 fs_loaded_from_disk: db 0
 fs_disk_available:   db 1     ; optimistic default; cleared on first ATA failure
@@ -17468,7 +18064,8 @@ boot_device:         db 0     ; device id holding the OS volume - normally 0
                                ; this to an AHCI slot (4+) when device 0 never
                                ; responds and a SATA disk was found instead
 fs_name_too_long:    db 0     ; set by fs_create_node when a name won't fit
-fs_layout_ver:       db 0     ; set by vol_read: 0=v2, 1=legacy v3 (64-node), 2=v4 (256-node)
+fs_cur_slot:         db 0     ; set by the fs disk routines: slot (0 = OS, 1.. = mounts)
+                              ; of the node currently being read/written
 
 mkfl_test_flag:      db 0     ; set by cmd_mkfl when -test appears in arg2/3/4
 ALIGN 8
@@ -17790,8 +18387,14 @@ bg_notice_pending:  db 0        ; 1 while a notice is waiting to be printed
 prs_peek_buf:       times BG_RING_CAP+1 db 0   ; linearized output for 'prs peek'
 sched_slot:         db 0        ; round-robin cursor for the bg scheduler
 
-; --- large staging buffers. A file can span a whole VOL_NODES-node volume slice, so
-; these are sized to hold a full file's content (EDIT_MAX). Declared at the
-; very end of the file, after all code, so any growth doesn't move anything. ---
-fs_next_scratch: times 512 db 0     ; staging for one full node_next sector
+; --- large staging buffers. A file can span the whole data area, but interactive
+; view/edit/run stage content through these fixed-size buffers (EDIT_MAX). Declared
+; at the very end of the file, after all code, so any growth doesn't move anything. ---
+fs_io_scratch: times 512 db 0     ; zero-pad staging for the tail sector of a cluster write
+rr_buf_idx:    db 0               ; toggles which rr_script_buf half the current runrush uses
+                                  ; (so a script that launches another script doesn't clobber
+                                  ; the outer script's content - each nesting depth gets its own)
+rr_script_buf: times 2 * EDIT_MAX db 0   ; resident copy of a runrush script (runrush used to
+                                  ; stream straight from node_content, which no longer holds
+                                  ; file bytes - the script is read here once at startup)
 fs_io_buf:  times EDIT_MAX db 0     ; editor + view/read/copy staging for multi-block files
