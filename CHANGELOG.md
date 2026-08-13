@@ -4,6 +4,85 @@ All notable changes to ShellyForever are documented here. The format is
 loosely based on [Keep a Changelog](https://keepachangelog.com/); the
 project does not yet follow strict SemVer.
 
+## [0.1.14] - 2026-08-14
+
+### Added
+
+- **Native software installer**: `install <file.sin>` and
+  `uninstall <id>` (`install.asm`, new). A `.sin` package is a
+  stored-mode `.zip` (reuses `zip.asm`'s `zip_find_eocd`/
+  `zip_unpack_validate` as-is) containing `whattodo.inst` and a
+  `files/` folder. `install` parses and runs the script line by line;
+  unknown instructions abort the install with an error rather than
+  being passed to Rush. Programs are tracked in a new registry file,
+  `/home/sys/programs.sly` (`program = <id>` / `path = <path>` pairs,
+  blank-line separated); `uninstall <id>` removes the one file
+  recorded as that program's entry point plus its registry entry
+  (not every file a `copy` instruction wrote, since the registry
+  keeps no manifest of those — matches the spec's "SHOULD preserve
+  unrelated files" rather than risking deleting something unrelated).
+- **`whattodo.inst` instruction language**: `name`, `version`,
+  `mkdir`, `copy`, `delete`, `program`, `finish`, plus `#` comments.
+  Deliberately small — no variables, loops, conditionals, or shell
+  access, so the installer can parse and run it directly without a
+  general-purpose interpreter. `delete` is idempotent (a no-op if the
+  target is already missing) and refuses to remove a folder.
+- **Bare registered-program-id dispatch fallback**. Typing a
+  program's id at the prompt (e.g. `calculator`, optionally with a
+  trailing `-back`) now launches it via `reg_lookup_path`, the same
+  way a bare `name.run` already did — wired into `kernel.asm`'s
+  dispatch right before the "unknown command" fallthrough.
+- **`mksin <folder>`** — builds a `.sin` package from a folder already
+  laid out as one (`<folder>/whattodo.inst` + `<folder>/files/`),
+  entirely inside the OS. Validates the folder shape and every line
+  of `whattodo.inst` first — unknown instructions, missing arguments,
+  non-absolute `mkdir`/`copy`/`delete`/`program` destinations, and any
+  `copy` source missing from `files/` are all reported with a line
+  number before anything is written — then hands off to the existing
+  `pack` command to do the actual stored-mode zipping and renames the
+  result from `<folder>.zip` to `<folder>.sin` in place (the same
+  in-place `node_name` edit `rname` already uses). Deliberately
+  doesn't reimplement archive writing: `zip.asm`'s actual byte-level
+  ZIP writer wasn't available to hand-splice against safely, so
+  `mksin` calls the real, already-tested `cmd_pack` instead of
+  guessing at CRC32/header logic.
+- **`INST_SPEC.md`** — a from-scratch tutorial covering the `.sin`
+  package shape, every `whattodo.inst` instruction, a worked example,
+  the `mksin` → `install` → `uninstall` workflow, what the registry
+  looks like on disk, and a quick-reference cheat sheet.
+
+### Changed
+
+- Banner and build stamp bumped to `v0.1.14` (`kernel.asm`).
+- README: new "Installing programs: `.sin` packages" section; `pack`/
+  `unpack`/`install`/`uninstall`/`mksin`/bare-program-id rows added to
+  the command table (the first two had never been documented despite
+  already existing); a new top-level bullet under "What's actually in
+  here"; a "Native software installer (v0.1.14)" entry at the top of
+  "What's new".
+- Party's two "Not in v0.1.14" deferred-feature callouts (bracket-
+  syntax array indexing, growable arrays, `{<expr>}` interpolation,
+  string concatenation, server-side networking) renumbered to "Not in
+  v0.1.15" — those Party gaps are unchanged this release, just
+  relabeled to keep pointing at the next version, per the project's
+  usual convention of rolling that list forward each cycle.
+
+### Verified
+
+- `kernel.asm`/`install.asm` syntax-checked by symbol cross-reference
+  (every label, message string, and buffer the new code touches
+  confirmed defined exactly once, called from exactly where expected)
+  rather than a real `nasm` build — `splash.asm`, `party.asm`,
+  `tcp.asm`, `http.asm`, `browse.asm`, `mouse.asm`, and `zip.asm`
+  weren't present in this sandbox to assemble against.
+- Not exercised in a real boot/QEMU environment. Before relying on
+  this release, worth running through: `mksin` on a small package
+  (including an intentionally broken `whattodo.inst`, to check the
+  line-numbered validation errors), `install` on the result, typing
+  the bare id to launch it, and `uninstall` to remove it — plus
+  confirming a pre-existing `name.run` bare-launch still works
+  unchanged now that the dispatch fallback sits next to it.
+
 ## [0.1.13] - 2026-08-14
 
 ### Added

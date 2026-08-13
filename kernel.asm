@@ -1097,6 +1097,36 @@ dispatch:
     cmp al, 1
     je cmd_mouse
 
+    mov rsi, cmd_buf
+    mov rdi, str_pack
+    call str_eq
+    cmp al, 1
+    je cmd_pack
+
+    mov rsi, cmd_buf
+    mov rdi, str_unpack
+    call str_eq
+    cmp al, 1
+    je cmd_unpack
+
+    mov rsi, cmd_buf
+    mov rdi, str_install
+    call str_eq
+    cmp al, 1
+    je cmd_install
+
+    mov rsi, cmd_buf
+    mov rdi, str_uninstall
+    call str_eq
+    cmp al, 1
+    je cmd_uninstall
+
+    mov rsi, cmd_buf
+    mov rdi, str_mksin
+    call str_eq
+    cmp al, 1
+    je cmd_mksin
+
     ; --- typed a bare "<name>.run" filename directly? treat it the
     ; same as "run <name>.run" so scripts double as executables ---
     lea rax, [cmd_buf]
@@ -1141,6 +1171,26 @@ dispatch:
     mov [alias_match_idx], al
     jmp cmd_alias_invoke
 .no_alias_match:
+
+    ; --- bare registered program identifier? (spec section 8:
+    ; "Program Execution" - typing a program's id, with or without
+    ; a "-back" flag already tokenized into arg1_buf, launches it
+    ; the same way a bare "<name>.run" does above) ---
+    mov rsi, cmd_buf
+    mov rdi, dbr_prog_path_buf
+    call reg_lookup_path
+    cmp al, 1
+    jne .not_registered_program
+
+    mov rsi, arg1_buf
+    mov rdi, arg2_buf
+    call str_copy
+
+    mov rsi, dbr_prog_path_buf
+    mov rdi, arg1_buf
+    call str_copy
+    jmp cmd_run
+.not_registered_program:
 
     ; unknown command
     mov rsi, msg_unknown1
@@ -2600,6 +2650,36 @@ help_lookup:
     cmp al, 1
     je .h_mouse
 
+    mov rsi, arg1_buf
+    mov rdi, str_pack
+    call str_eq
+    cmp al, 1
+    je .h_pack
+
+    mov rsi, arg1_buf
+    mov rdi, str_unpack
+    call str_eq
+    cmp al, 1
+    je .h_unpack
+
+    mov rsi, arg1_buf
+    mov rdi, str_install
+    call str_eq
+    cmp al, 1
+    je .h_install
+
+    mov rsi, arg1_buf
+    mov rdi, str_uninstall
+    call str_eq
+    cmp al, 1
+    je .h_uninstall
+
+    mov rsi, arg1_buf
+    mov rdi, str_mksin
+    call str_eq
+    cmp al, 1
+    je .h_mksin
+
     ; unknown command name
     mov rsi, msg_help_unknown1
     mov al, ATTR_ERROR
@@ -2754,6 +2834,26 @@ help_lookup:
 
 .h_mouse:
     mov rsi, help_mouse
+    jmp .h_print
+
+.h_pack:
+    mov rsi, help_pack
+    jmp .h_print
+
+.h_unpack:
+    mov rsi, help_unpack
+    jmp .h_print
+
+.h_install:
+    mov rsi, help_install
+    jmp .h_print
+
+.h_uninstall:
+    mov rsi, help_uninstall
+    jmp .h_print
+
+.h_mksin:
+    mov rsi, help_mksin
     jmp .h_print
 
 .h_print:
@@ -15400,6 +15500,8 @@ cmd_shelly_rainbow:
 %include "http.asm"
 %include "browse.asm"
 %include "mouse.asm"
+%include "zip.asm"
+%include "install.asm"
 
 ; print_prompt: prints "rush>" + current path + ": "
 print_prompt:
@@ -17122,9 +17224,9 @@ wig_str_buf:   times 16 db 0    ; scratch for the wig clock widget
 wig_last_sec:  db 0             ; last second the widget drew (redraw gate)
 
 banner:
-    db "ShellyForever v0.1.13 -- 'help' for commands", 10, 0
+    db "ShellyForever v0.1.14 -- 'help' for commands", 10, 0
 build_stamp:
-    db "build 20260814 -- Party v0.1.13: language expansion (rush, interpolation, file access, arrays)", 10, 0
+    db "build 20260814 -- Installer system: install/uninstall/mksin (.sin packages, whattodo.inst)", 10, 0
 
 prompt_head: db "rush>", 0
 prompt_tail: db ": ", 0
@@ -17272,7 +17374,7 @@ SHELLY_PAL_LEN equ 6
 shelly_palette: db 0x0E, 0x0B, 0x0A, 0x0D, 0x09, 0x0F   ; yel, cyan, grn, mag, lblu, wht
 shelly_rule:  db "  ============================================================", 10, 0
 shelly_title: db "         ShellyForever OS", 0
-shelly_version: db "         v0.1.13", 10, 0
+shelly_version: db "         v0.1.14", 10, 0
 shelly_by:    db "         Developed by Sourasish Das", 10, 0
 shelly_cr:    db "         Copyright 2026. All rights reserved.", 10, 0
 str_col_black:    db "black", 0
@@ -17382,6 +17484,11 @@ completion_cmds:
     dq str_wig
     dq str_shelly
     dq str_syscmd
+    dq str_pack
+    dq str_unpack
+    dq str_install
+    dq str_uninstall
+    dq str_mksin
     dq 0
 comp_matches: times 96 dw 0
 
@@ -17705,6 +17812,12 @@ help_text:
     db "  give <url> <file>  HTTP POST, send a file to a server", 10
     db "  browse <url>       text-based web browser", 10
     db "  mouse              toggle the PS/2 mouse cursor on/off", 10
+    db "  pack <folder>      zip a folder into <folder>.zip (stored, uncompressed)", 10
+    db "  unpack <file.zip>  extract a .zip file into the current folder", 10
+    db "  install <file.sin> install a Shelly Installer package", 10
+    db "  uninstall <id>     remove an installed program by its registered id", 10
+    db "  mksin <folder>     build <folder>.sin from a folder holding whattodo.inst + files/", 10
+    db "  <program-id>       launch an installed program by its registered id", 10
     db "  help <command>     show detailed help for one command", 10, 10, 0
 
 ; --- per-command detail text for "help <command>" (see help_lookup) ---
@@ -17902,6 +18015,62 @@ help_mouse:
     db "  Ctrl+V pastes it at the prompt or into the browse URL field.", 10
     db "  The wheel scrolls: the page in browse view, the terminal's", 10
     db "  scrollback elsewhere (same as Ctrl+Up/Ctrl+Down).", 10, 0
+
+help_pack:
+    db "pack <folder>", 10
+    db "  Zip a folder in the current directory into <folder>.zip,", 10
+    db "  written into the current directory. Stored (uncompressed)", 10
+    db "  entries only - a normal, valid .zip any unzip tool can open.", 10
+    db "  Refuses if <folder>.zip already exists (del it first).", 10
+    db "  Whole archive is capped at 40 KB / 64 files.", 10
+    db "  e.g. pack docs        (writes docs.zip)", 10, 0
+
+help_unpack:
+    db "unpack <file.zip>", 10
+    db "  Extract a .zip file into the current directory, recreating", 10
+    db "  any folders it contains. Only stored (uncompressed) .zip", 10
+    db "  files are supported - one with a DEFLATE'd entry is refused", 10
+    db "  cleanly rather than producing garbage output. Each file's", 10
+    db "  CRC-32 is checked after extraction; a mismatch is reported", 10
+    db "  and that one file is skipped. Overwrites a same-named FILE", 10
+    db "  in place; refuses if a same-named FOLDER is in the way.", 10
+    db "  e.g. unpack docs.zip", 10, 0
+
+help_install:
+    db "install <file.sin>", 10
+    db "  Install a Shelly Installer package (a .sin file - a stored-", 10
+    db "  mode .zip containing whattodo.inst and a files/ folder).", 10
+    db "  Runs the package's instructions: creates folders, copies", 10
+    db "  files onto the filesystem, and registers the program in", 10
+    db "  /home/sys/programs.sly so it can be launched later just by", 10
+    db "  typing its id (see 'uninstall' below). Unknown instructions", 10
+    db "  or a missing/invalid package are rejected with an error and", 10
+    db "  the install stops; steps already applied before an error", 10
+    db "  are not rolled back. Esc cancels an install in progress.", 10
+    db "  e.g. install calculator.sin", 10, 0
+
+help_uninstall:
+    db "uninstall <id>", 10
+    db "  Remove a program previously installed with 'install', by", 10
+    db "  the id it was registered under. Deletes that program's", 10
+    db "  registered executable and its /home/sys/programs.sly entry;", 10
+    db "  other files the package may have copied are left in place.", 10
+    db "  e.g. uninstall calculator", 10, 0
+
+help_mksin:
+    db "mksin <folder>", 10
+    db "  Build <folder>.sin from a folder you've already laid out as", 10
+    db "  a Shelly Installer package: <folder>/whattodo.inst plus a", 10
+    db "  <folder>/files/ folder holding whatever whattodo.inst copies", 10
+    db "  onto the target machine. Checks the folder shape and the", 10
+    db "  whattodo.inst script itself first - unknown instructions,", 10
+    db "  missing arguments, non-absolute destination paths, and any", 10
+    db "  'copy' source missing from files/ are all reported (with a", 10
+    db "  line number) before anything is written. Once that passes,", 10
+    db "  it zips the folder exactly the way 'pack' does and names the", 10
+    db "  result <folder>.sin. Refuses if <folder>.sin (or a colliding", 10
+    db "  <folder>.zip) already exists here - remove it first.", 10
+    db "  e.g. mksin calculator      (then: install calculator.sin)", 10, 0
 
 help_help:
     db "help | help <command>", 10
@@ -18295,6 +18464,7 @@ chain_scan_buf: times LINE_MAX db 0  ; scratch copy for ; chaining
 cmd_buf:  times 32  db 0
 arg1_buf: times 96  db 0
 arg2_buf: times 160 db 0
+dbr_prog_path_buf: times 160 db 0  ; scratch for the bare-registered-id dispatch fallback
 arg3_buf: times 32  db 0             ; for flags (-force, -silent, -info)
 arg4_buf: times 32  db 0             ; for additional flags
 
