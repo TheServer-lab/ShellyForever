@@ -4,6 +4,92 @@ All notable changes to ShellyForever are documented here. The format is
 loosely based on [Keep a Changelog](https://keepachangelog.com/); the
 project does not yet follow strict SemVer.
 
+## [0.1.13] - 2026-08-14
+
+### Added
+
+- **`rush <expr>` in Party**. Shells out to one Rush/ShellyForever
+  command line from inside a Party script (`<expr>` must be a string;
+  runtime type error otherwise). Runs through the kernel's
+  `process_chain`, so `;` chaining and quoted args work the same as
+  typing the line at the prompt. No output capture yet — a rushed
+  command prints straight to the screen, with no way to pull that text
+  back into a Party variable (a `rushcap` variant is a candidate for a
+  later phase).
+- **String interpolation in Party**. `"hello {name}"` splices an
+  already-declared variable's string form into a literal; `{{` / `}}`
+  escape a literal brace. Scoped to bare `{identifier}` only — no
+  `{<expr>}` or `{fn(...)}` yet. An undeclared name inside `{}`, an
+  empty `{}`, or an unterminated `{` are runtime errors rather than a
+  silent blank. The lexer is unchanged (one `TOK_STR` per literal); the
+  scan/substitution happens when the literal becomes a runtime value,
+  so plain strings with no `{` are unaffected.
+- **In-language file access API in Party**: `fopen(path, "r"|"w"|"a")`,
+  `fread(h)` (whole-file read), `fwrite(h, text)`, `fclose(h)`,
+  `fexists(path)`, `fdelete(path)`. Backed by a 12-entry handle table
+  and the same `fs_resolve_path`/`fs_find_child`/`fs_create_node`/
+  `fs_read_binary_file`/`fs_write_binary_file` calls `cmd_cat`/`cmd_mkfl`
+  already use, so scripts get real file I/O without shelling out via
+  `rush`. The builtin dispatcher (`party_call_builtin`) and builtin
+  bodies already existed in the tree unwired; this release connects
+  `party_parse_call` to it and adds the handle table, name strings, and
+  error messages the bodies referenced but that didn't exist yet.
+- **Fixed-size arrays in Party**: `arr_new(n)`, `arr_len(a)`,
+  `arr_get(a, i)`, `arr_set(a, i, value)`, `arr_free(a)`. New `PV_ARRAY`
+  value type; up to 4 arrays alive at once, 16 elements each
+  (deliberately conservative — the array table is duplicated per
+  background-process context by `run -back`, and `kernel.asm`'s
+  `MAX_PROCESSES` was already trimmed to fit real-mode BSS under
+  `0xA0000`). Elements are ordinary Party values, including nested
+  arrays; `display` prints an array as `[e0, e1, ...]`, recursively.
+  Function-shaped builtins rather than `[...]`/`a[i]` syntax, and
+  handle/reference semantics rather than growable/deep-copy — both
+  locked in up front to keep the diff small; bracket syntax and
+  growable arrays are the first two items on the deferred list now.
+  `party_ctx_table`/`PARTY_CTX_SIZE` (the background-process
+  suspend/resume mechanism) updated to include the new array state,
+  bumped `20226` → `22342`.
+
+None of the four features need `party compile` changes — the compiler
+embeds Party source into the `.run` file rather than ahead-of-time
+compiling statements, so anything the interpreter can do, a compiled
+script can do too, automatically.
+
+### Changed
+
+- Banner and build stamp bumped to `v0.1.13` (`kernel.asm`).
+- `PARTY_SPEC.md` gets new sections for `rush` (8), file access (10,
+  with a `files.pa` example), and arrays (11, with an `arrays.pa`
+  example); string interpolation folds into section 1's rule set. The
+  deferred-features list is renumbered and trimmed to "Not in v0.1.14":
+  bracket-syntax array indexing, growable arrays, `{<expr>}`
+  interpolation, string concatenation, and server-side networking
+  (listen/accept — a larger, kernel-level `tcp.asm` feature, tracked
+  separately).
+- README's Party section updated: the new `rush`/interpolation/file
+  API/array bullets, and a new "Party language expansion (0.1.13)"
+  subsection with examples for all four features.
+
+### Verified
+
+- `party.asm` syntax-checked standalone with `nasm` after each
+  feature; for `rush`/interpolation/file-access, the undefined-symbol
+  set was diffed against an unmodified copy of the upload to confirm
+  each fix resolved exactly its own symbols and introduced nothing new
+  (a plain error count wasn't enough for the file-access fix, since its
+  actual bug was a missing call site, not a syntax error — `nasm` only
+  surfaces that as extra undefined symbols).
+- None of the four features were exercised in a real boot/QEMU
+  environment this release (none was available); see `phases.txt` for
+  the specific smoke tests recommended before relying on each one
+  (`rush "mkf x ; ls"`, interpolation with declared/undeclared names
+  and `{{}}`, an `fopen`/`fwrite`/`fclose`/`fexists`/`fread` round
+  trip, and an `arr_new`/`arr_set`/`arr_get`/`display` sequence).
+- A full real `nasm` build in the actual dev tree (with `splash.asm`/
+  `browse.asm`/`mouse.asm`/`boot.asm` present) is still outstanding —
+  this sandbox only had `party.asm`, `kernel.asm`, `tcp.asm`, and
+  `http.asm` to check standalone.
+
 ## [0.1.12] - 2026-08-13
 
 ### Fixed

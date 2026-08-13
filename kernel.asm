@@ -17122,9 +17122,9 @@ wig_str_buf:   times 16 db 0    ; scratch for the wig clock widget
 wig_last_sec:  db 0             ; last second the widget drew (redraw gate)
 
 banner:
-    db "ShellyForever v0.1.12 -- 'help' for commands", 10, 0
+    db "ShellyForever v0.1.13 -- 'help' for commands", 10, 0
 build_stamp:
-    db "build 20260813 -- Party v0.1.12: background scripts no longer eat keystrokes", 10, 0
+    db "build 20260814 -- Party v0.1.13: language expansion (rush, interpolation, file access, arrays)", 10, 0
 
 prompt_head: db "rush>", 0
 prompt_tail: db ": ", 0
@@ -17272,7 +17272,7 @@ SHELLY_PAL_LEN equ 6
 shelly_palette: db 0x0E, 0x0B, 0x0A, 0x0D, 0x09, 0x0F   ; yel, cyan, grn, mag, lblu, wht
 shelly_rule:  db "  ============================================================", 10, 0
 shelly_title: db "         ShellyForever OS", 0
-shelly_version: db "         v0.1.12", 10, 0
+shelly_version: db "         v0.1.13", 10, 0
 shelly_by:    db "         Developed by Sourasish Das", 10, 0
 shelly_cr:    db "         Copyright 2026. All rights reserved.", 10, 0
 str_col_black:    db "black", 0

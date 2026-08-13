@@ -57,7 +57,10 @@ TOK_LTE     equ 27
 TOK_GT      equ 28
 TOK_GTE     equ 29
 TOK_COMMA   equ 30
-TOK_COUNT_KNOWN equ 31       ; number of entries in party_tok_names
+TOK_PERCENT equ 31
+TOK_READ    equ 32
+TOK_RUSH    equ 33          ; `rush <expr>` - run a Rush/ShellyForever shell command line
+TOK_COUNT_KNOWN equ 34       ; number of entries in party_tok_names
 TOK_ERROR   equ 255
 
 ; ------------------------------------------------------------
@@ -270,6 +273,8 @@ party_lex:
     je .pl_minus
     cmp al, '*'
     je .pl_star
+    cmp al, '%'
+    je .pl_percent
     cmp al, '='
     je .pl_eq
     cmp al, '!'
@@ -479,6 +484,11 @@ party_lex:
     cmp al, 1
     je .pl_kw_display
     lea rsi, [party_ident_buf]
+    lea rdi, [kw_read]
+    call str_eq
+    cmp al, 1
+    je .pl_kw_read
+    lea rsi, [party_ident_buf]
     lea rdi, [kw_true]
     call str_eq
     cmp al, 1
@@ -488,6 +498,11 @@ party_lex:
     call str_eq
     cmp al, 1
     je .pl_kw_false
+    lea rsi, [party_ident_buf]
+    lea rdi, [kw_rush]
+    call str_eq
+    cmp al, 1
+    je .pl_kw_rush
     mov r8, TOK_IDENT
     jmp .pl_ident_emit
 .pl_kw_vars:
@@ -511,11 +526,17 @@ party_lex:
 .pl_kw_display:
     mov r8, TOK_DISPLAY
     jmp .pl_ident_emit
+.pl_kw_read:
+    mov r8, TOK_READ
+    jmp .pl_ident_emit
 .pl_kw_true:
     mov r8, TOK_TRUE
     jmp .pl_ident_emit
 .pl_kw_false:
     mov r8, TOK_FALSE
+    jmp .pl_ident_emit
+.pl_kw_rush:
+    mov r8, TOK_RUSH
 .pl_ident_emit:
     call party_emit
     cmp al, 0
@@ -542,6 +563,9 @@ party_lex:
     jmp .pl_sym1
 .pl_star:
     mov r8, TOK_STAR
+    jmp .pl_sym1
+.pl_percent:
+    mov r8, TOK_PERCENT
     jmp .pl_sym1
 .pl_comma:
     mov r8, TOK_COMMA
@@ -705,6 +729,10 @@ PV_INT   equ 1
 PV_FLOAT equ 2
 PV_BOOL  equ 3
 PV_STR   equ 4
+PV_ARRAY equ 5      ; Phase 4: data field ([+8]) holds a handle - an index
+                     ; into the party_arr_* table (party_arr_alloc/_check),
+                     ; the same handle-into-a-fixed-table model PARTY_FH_*
+                     ; already uses for file handles. No str fields used.
 
 ; ---- interpreter capacities ----
 MAXVSTACK equ 64
@@ -747,6 +775,9 @@ party_exec:
     call party_memzero
     lea rdi, [party_frame_returned]
     mov rcx, MAXCALLS
+    call party_memzero
+    lea rdi, [party_arr_used]
+    mov rcx, PARTY_ARR_MAX
     call party_memzero
 
     call party_collect_funcs
@@ -816,8 +847,16 @@ party_boot_compiled:
 ;  first step) and party_bg_suspend (parks a mid-run state at a yield).
 ;  Both clobber rax, rbx, rcx, rsi, rdi, r8-r15.
 ; ------------------------------------------------------------
-PARTY_CTX_REGS_OFFS equ 20226 - 24
-PARTY_CTX_SIZE      equ 20226
+; PARTY_CTX_SIZE was 20226 through Phase 3. Phase 4 adds 32 bytes
+; (party_scratch3, folded into the existing party_scratch region
+; below) + 2084 bytes (the new party_arr_used/count/data regions:
+; PARTY_ARR_MAX + PARTY_ARR_MAX*8 + PARTY_ARR_MAX*PARTY_ARR_CAP*32 =
+; 4 + 32 + 2048), so 20226 + 32 + 2084 = 22342. This constant is NOT
+; auto-derived from party_ctx_table below - if that table's per-entry
+; sizes change again, update this by hand to match, the same way this
+; session had to.
+PARTY_CTX_REGS_OFFS equ 22342 - 24
+PARTY_CTX_SIZE      equ 22342
 
 party_ctx_table:
     dq party_lex_ok, 7             ; lex_ok, exec_ok, killed, error_line
@@ -827,7 +866,7 @@ party_ctx_table:
     dq party_returning, 1
     dq party_err_msg_ptr, 40       ; err_msg_ptr, vsp, call_depth, loc_count, func_count
     dq party_while_cond_tok, 8
-    dq party_scratch, 96           ; scratch, scratch1, scratch2
+    dq party_scratch, 128          ; scratch, scratch1, scratch2, scratch3
     dq party_ftmp_i, 20            ; ftmp_i, tmp_i, fp_cw, fp_cw2
     dq party_num_buf, 32
     dq party_vstack, 2048
@@ -837,6 +876,9 @@ party_ctx_table:
     dq party_loc_val, 4608         ; loc_val + loc_name
     dq party_func_name, 2592       ; func_name + nparams + paramtok + bodytok + bodyend
     dq party_frame_ret_r13, 1344   ; call frames incl. the retval block
+    dq party_arr_used, 4           ; Phase 4: array-slot table (used flags)
+    dq party_arr_count, 32         ; Phase 4: array-slot table (element counts)
+    dq party_arr_data, 2048        ; Phase 4: array-slot table (element storage)
     dq 0, 0
 
 party_ctx_save:                    ; rdi = dst ctx base
@@ -1139,6 +1181,10 @@ party_exec_stmts:
     je .pes_skip_func
     cmp eax, TOK_RETURN
     je .pes_return
+    cmp eax, TOK_READ
+    je .pes_read
+    cmp eax, TOK_RUSH
+    je .pes_rush
     cmp eax, TOK_IDENT
     je .pes_ident
     jmp .pes_err_stmt
@@ -1157,6 +1203,77 @@ party_exec_stmts:
     call party_print_value
     mov rsi, newline_str
     call print_string
+    jmp .pes_stmt_loop
+
+; ---- read <ident> ----
+; Reads one line from the keyboard into an already-declared variable
+; as a string. The text lands in a single shared buffer
+; (party_read_buf), so - like string literals sharing the source
+; buffer - a later `read` overwrites what an earlier one produced.
+.pes_read:
+    inc r13
+    call party_tok_ptr
+    movzx eax, byte [rbx]
+    cmp eax, TOK_IDENT
+    jne .pes_err_stmt
+    call party_copy_tok_text_cur
+    inc r13
+    lea rsi, [party_ident_buf]
+    lea rdi, [party_stmt_name_buf]
+    call party_strcpy_save
+    lea rdi, [party_read_buf]
+    mov rcx, PARTY_READ_MAX - 1
+    call read_line
+    lea rsi, [party_read_buf]
+    call str_len
+    mov rcx, rax
+    lea rsi, [party_stmt_name_buf]
+    call party_var_get_ptr
+    cmp al, 1
+    jne .pes_read_undef
+    mov rdi, rbx
+    lea rsi, [party_read_buf]
+    call party_val_set_str
+    jmp .pes_stmt_loop
+.pes_read_undef:
+    lea rsi, [msg_party_undef_var]
+    call party_set_err
+    jmp .pes_out
+
+; ---- rush <expr> ----
+; Evaluates <expr> (must be a string) and feeds it to the Rush/
+; ShellyForever shell exactly the way a typed prompt line would be:
+; through process_chain, so ';' chaining, quoted args, aliases and
+; every existing cmd_* handler (file creation/editing, http, net,
+; the party compiler itself via "party compile x.pa", etc.) all just
+; work with no separate reimplementation here. Party scripts still
+; can't reach the shell any other way - this is the one deliberate
+; door, and it only opens for a string the script itself built.
+.pes_rush:
+    inc r13
+    call party_parse_expr
+    cmp byte [party_exec_ok], 1
+    jne .pes_out
+    lea rdi, [party_scratch]
+    call party_pop_val
+    cmp byte [party_exec_ok], 1
+    jne .pes_out
+    cmp byte [party_scratch], PV_STR
+    je .pes_rush_run
+    lea rsi, [msg_party_rush_type]
+    call party_set_err
+    jmp .pes_out
+.pes_rush_run:
+    mov rsi, [party_scratch+16]    ; source text pointer (slice, not NUL-terminated)
+    mov rcx, [party_scratch+24]    ; slice length
+    cmp rcx, LINE_MAX-1
+    jb .pes_rush_len_ok
+    mov rcx, LINE_MAX-1            ; truncate rather than overrun line_buf
+.pes_rush_len_ok:
+    lea rdi, [line_buf]
+    rep movsb
+    mov byte [rdi], 0
+    call process_chain
     jmp .pes_stmt_loop
 
 ; ---- vars <ident> = <expr> ----
@@ -1812,6 +1929,9 @@ party_reset_runtime:
     lea rdi, [party_frame_returned]
     mov rcx, MAXCALLS
     call party_memzero
+    lea rdi, [party_arr_used]
+    mov rcx, PARTY_ARR_MAX
+    call party_memzero
 
     pop rbx
     ret
@@ -1942,6 +2062,43 @@ party_print_value:
     je .pv_float
     cmp eax, PV_BOOL
     je .pv_bool
+    cmp eax, PV_ARRAY
+    je .pv_array
+    jmp .pv_done
+.pv_array:
+    ; [e0, e1, ...] - each element printed with a recursive call (the
+    ; register save/restore at the top/bottom of this routine makes
+    ; that safe; elements are never more than one array deep in
+    ; practice, but nothing stops a nested array and this handles it
+    ; correctly either way since each recursion level owns its rbx).
+    push r12
+    push r13
+    mov rax, [rbx+8]                ; handle
+    call party_arr_check
+    cmp al, 1
+    jne .pv_array_done              ; a stale/invalid handle just prints nothing
+    mov r13, rcx                    ; slot index (rbx now = element-0 ptr)
+    mov rsi, lbracket_str
+    call print_string
+    xor r12, r12                    ; element index
+.pv_array_loop:
+    cmp r12, [party_arr_count+r13*8]
+    jae .pv_array_done_bracket
+    cmp r12, 0
+    je .pv_array_no_comma
+    mov rsi, comma_sp_str
+    call print_string
+.pv_array_no_comma:
+    call party_print_value
+    add rbx, 32
+    inc r12
+    jmp .pv_array_loop
+.pv_array_done_bracket:
+    mov rsi, rbracket_str
+    call print_string
+.pv_array_done:
+    pop r13
+    pop r12
     jmp .pv_done
 .pv_str:
     mov rsi, [rbx+16]
@@ -2277,6 +2434,8 @@ party_parse_mul:
     je .pm_op
     cmp eax, TOK_SLASH
     je .pm_op
+    cmp eax, TOK_PERCENT
+    je .pm_op
     jmp .out
 .pm_op:
     inc r13
@@ -2331,6 +2490,299 @@ party_parse_unary:
     lea rsi, [msg_party_bad_unary]
     call party_set_err
 .out:
+    ret
+
+; ------------------------------------------------------------
+; STRING INTERPOLATION (Phase 2)
+;
+; "hello {name}" embeds the string form of the variable `name`
+; inline. Scope for this phase: `{identifier}` only - a bare,
+; already-declared variable name, first char [a-zA-Z_], rest
+; [a-zA-Z0-9_] (same rule as any other identifier). `{{` and `}}`
+; escape to a literal brace. Full `{<expr>}` / `{ident(...)}` calls
+; are deferred - see phases.txt Phase 2 notes - since re-entering
+; party_parse_expr on text that was never tokenized is a bigger diff
+; than this phase needs.
+;
+; Evaluated lazily, per the recommended approach in phases.txt: the
+; lexer still emits one plain TOK_STR per literal (token count/shape
+; unchanged); the scan for `{`/`}` and the actual substitution happen
+; here, when the literal is turned into a runtime value.
+; ------------------------------------------------------------
+
+; party_val_to_string: rbx = value pointer. Formats the value as
+; text. Out: rsi = ptr to text, rcx = length. PV_STR values pass
+; their existing slice straight through (no copy). Numeric/bool text
+; is written into the shared party_num_buf scratch buffer (the same
+; one party_print_value uses) - copy it out (as party_pel_append
+; below does) before formatting another value if it must survive
+; that. PV_NONE yields length 0.
+; Clobbers rax, rcx, rdx, rsi, rdi.
+; ------------------------------------------------------------
+party_val_to_string:
+    movzx eax, byte [rbx]
+    cmp eax, PV_STR
+    je .vts_str
+    cmp eax, PV_INT
+    je .vts_int
+    cmp eax, PV_FLOAT
+    je .vts_float
+    cmp eax, PV_BOOL
+    je .vts_bool
+    xor rsi, rsi
+    xor rcx, rcx
+    ret
+.vts_str:
+    mov rsi, [rbx+16]
+    mov rcx, [rbx+24]
+    ret
+.vts_int:
+    mov rax, [rbx+8]
+    lea rdi, [party_num_buf]
+    call int_to_str
+    lea rsi, [party_num_buf]
+    call str_len
+    mov rcx, rax
+    lea rsi, [party_num_buf]
+    ret
+.vts_float:
+    lea rsi, [party_num_buf]
+    call party_float_to_str
+    lea rsi, [party_num_buf]
+    call str_len
+    mov rcx, rax
+    lea rsi, [party_num_buf]
+    ret
+.vts_bool:
+    cmp qword [rbx+8], 0
+    jne .vts_bool_t
+    mov rsi, kw_false
+    call str_len
+    mov rcx, rax
+    mov rsi, kw_false
+    ret
+.vts_bool_t:
+    mov rsi, kw_true
+    call str_len
+    mov rcx, rax
+    mov rsi, kw_true
+    ret
+
+; party_str_has_lbrace: rsi = ptr, rcx = len -> al = 1 if the slice
+; contains a '{' byte, else al = 0. Cheap pre-check so a plain
+; literal (the overwhelming common case) skips interpolation
+; entirely and keeps pointing straight into the source buffer,
+; exactly as before this phase - only literals that opt in via '{'
+; pay the party_eval_string_literal cost.
+; Clobbers rax, rcx, rsi.
+party_str_has_lbrace:
+.phl_loop:
+    cmp rcx, 0
+    je .phl_no
+    mov al, [rsi]
+    cmp al, '{'
+    je .phl_yes
+    inc rsi
+    dec rcx
+    jmp .phl_loop
+.phl_yes:
+    mov al, 1
+    ret
+.phl_no:
+    xor al, al
+    ret
+
+; party_pel_append: appends rcx bytes from rsi to the interpolation
+; output cursor (r10 = write pointer, r11 = bytes of capacity left),
+; advancing both in place. On overflow, sets party_exec_ok = 0 via
+; party_set_err (msg_party_interp_overflow) - caller must check
+; party_exec_ok after return either way.
+; Clobbers rax, rcx, rsi.
+party_pel_append:
+.ppa_loop:
+    cmp rcx, 0
+    je .ppa_done
+    cmp r11, 0
+    je .ppa_overflow
+    mov al, [rsi]
+    mov [r10], al
+    inc rsi
+    inc r10
+    dec r11
+    dec rcx
+    jmp .ppa_loop
+.ppa_overflow:
+    lea rsi, [msg_party_interp_overflow]
+    call party_set_err
+    ret
+.ppa_done:
+    ret
+
+; party_eval_string_literal: rsi = ptr to string literal content
+; (raw slice into party_src_base, same as a TOK_STR token's text),
+; rcx = length. Expands {identifier} substitutions and {{ / }}
+; brace escapes into party_interp_buf.
+; Out: on success, party_exec_ok stays 1, rdi = party_interp_buf,
+; rcx = result length. On error, sets party_exec_ok = 0 via
+; party_set_err (caller's r13 must still point at the TOK_STR token
+; so the reported line number is right) and rdi/rcx are undefined -
+; caller must check party_exec_ok before using them.
+; NOTE: party_interp_buf is a single shared scratch buffer, same
+; aliasing caveat PARTY_SPEC.md already documents for `read` and for
+; string literals sharing the source buffer - a later interpolated
+; literal overwrites an earlier one's text, so a var holding an
+; interpolated string needs to be consumed (displayed, rushed,
+; compared, etc.) before the next interpolated literal is evaluated
+; if the old text must still be around.
+; Clobbers rax, rbx, rcx, rdx, rsi, rdi, r8, r9, r10, r11.
+party_eval_string_literal:
+    mov r8, rsi                    ; src cursor
+    mov r9, rcx                    ; src bytes remaining
+    lea r10, [party_interp_buf]    ; dst cursor
+    mov r11, PARTY_INTERP_MAX-1    ; dst capacity (room left for NUL)
+.pel_loop:
+    cmp r9, 0
+    je .pel_done
+    mov al, [r8]
+    cmp al, '{'
+    je .pel_lbrace
+    cmp al, '}'
+    je .pel_rbrace
+    mov [party_pel_char_scratch], al
+    lea rsi, [party_pel_char_scratch]
+    mov rcx, 1
+    call party_pel_append
+    cmp byte [party_exec_ok], 0
+    je .pel_out
+    inc r8
+    dec r9
+    jmp .pel_loop
+.pel_rbrace:
+    cmp r9, 1
+    jbe .pel_rbrace_lit
+    cmp byte [r8+1], '}'
+    jne .pel_rbrace_lit
+    mov byte [party_pel_char_scratch], '}'
+    lea rsi, [party_pel_char_scratch]
+    mov rcx, 1
+    call party_pel_append
+    cmp byte [party_exec_ok], 0
+    je .pel_out
+    add r8, 2
+    sub r9, 2
+    jmp .pel_loop
+.pel_rbrace_lit:
+    mov [party_pel_char_scratch], al
+    lea rsi, [party_pel_char_scratch]
+    mov rcx, 1
+    call party_pel_append
+    cmp byte [party_exec_ok], 0
+    je .pel_out
+    inc r8
+    dec r9
+    jmp .pel_loop
+.pel_lbrace:
+    cmp r9, 1
+    jbe .pel_lbrace_open
+    cmp byte [r8+1], '{'
+    jne .pel_lbrace_open
+    mov byte [party_pel_char_scratch], '{'
+    lea rsi, [party_pel_char_scratch]
+    mov rcx, 1
+    call party_pel_append
+    cmp byte [party_exec_ok], 0
+    je .pel_out
+    add r8, 2
+    sub r9, 2
+    jmp .pel_loop
+.pel_lbrace_open:
+    inc r8                          ; consume '{'
+    dec r9
+    mov rdx, r8                     ; identifier start
+    xor rcx, rcx                    ; identifier length so far
+.pel_ident_scan:
+    cmp r9, 0
+    je .pel_unterminated
+    mov al, [r8]
+    cmp al, '}'
+    je .pel_ident_end
+    cmp al, 'a'
+    jb .pel_ic_upper
+    cmp al, 'z'
+    jbe .pel_ic_ok
+    jmp .pel_ic_digit
+.pel_ic_upper:
+    cmp al, 'A'
+    jb .pel_ic_us
+    cmp al, 'Z'
+    jbe .pel_ic_ok
+    jmp .pel_ic_us
+.pel_ic_digit:
+    cmp al, '0'
+    jb .pel_ic_us
+    cmp al, '9'
+    ja .pel_ic_us
+    cmp rcx, 0                      ; digits can't start an identifier
+    je .pel_badident
+    jmp .pel_ic_ok
+.pel_ic_us:
+    cmp al, '_'
+    jne .pel_badident
+.pel_ic_ok:
+    inc r8
+    dec r9
+    inc rcx
+    jmp .pel_ident_scan
+.pel_ident_end:
+    cmp rcx, 0                      ; empty "{}"
+    je .pel_badident
+    cmp rcx, PARTY_IDENT_MAX-1
+    jbe .pel_ident_len_ok
+    mov rcx, PARTY_IDENT_MAX-1
+.pel_ident_len_ok:
+    mov rsi, rdx
+    lea rdi, [party_interp_ident_buf]
+.pel_copy_ident:
+    cmp rcx, 0
+    je .pel_copy_ident_done
+    mov al, [rsi]
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    dec rcx
+    jmp .pel_copy_ident
+.pel_copy_ident_done:
+    mov byte [rdi], 0
+    lea rsi, [party_interp_ident_buf]
+    call party_var_get_ptr
+    cmp al, 1
+    jne .pel_undef
+    call party_val_to_string       ; rbx (from var_get_ptr) -> rsi, rcx
+    call party_pel_append
+    cmp byte [party_exec_ok], 0
+    je .pel_out
+    inc r8                         ; consume the closing '}'
+    dec r9
+    jmp .pel_loop
+.pel_done:
+    mov byte [r10], 0
+    lea rax, [party_interp_buf]
+    mov rcx, r10
+    sub rcx, rax
+    lea rdi, [party_interp_buf]
+    ret
+.pel_unterminated:
+    lea rsi, [msg_party_interp_unterm]
+    call party_set_err
+    jmp .pel_out
+.pel_badident:
+    lea rsi, [msg_party_interp_badident]
+    call party_set_err
+    jmp .pel_out
+.pel_undef:
+    lea rsi, [msg_party_undef_var]
+    call party_set_err
+.pel_out:
     ret
 
 party_parse_primary:
@@ -2388,8 +2840,28 @@ party_parse_primary:
     mov eax, [rbx+4]
     mov rsi, [party_src_base]
     add rsi, rax
+    ; Plain literals (no '{') keep pointing straight into the source
+    ; buffer, exactly as before Phase 2 - only literals that opt in
+    ; via '{' pay the interpolation cost (and its shared-buffer
+    ; aliasing caveat, see PARTY_SPEC.md section 1).
+    push rsi
+    push rcx
+    call party_str_has_lbrace
+    pop rcx
+    pop rsi
+    cmp al, 1
+    je .pp_str_interp
     lea rdi, [party_scratch]
     call party_val_set_str
+    jmp .pp_str_push
+.pp_str_interp:
+    call party_eval_string_literal
+    cmp byte [party_exec_ok], 1
+    jne .pp_out
+    mov rsi, rdi
+    lea rdi, [party_scratch]
+    call party_val_set_str
+.pp_str_push:
     lea rsi, [party_scratch]
     call party_push_val
     cmp byte [party_exec_ok], 1
@@ -2436,21 +2908,6 @@ party_parse_primary:
     lea rdi, [party_scratch]
     mov rsi, rbx
     call party_val_copy
-    push rax
-    push rbx
-    push rsi
-    push rdi
-    movzx eax, byte [party_scratch]
-    lea rdi, [show_num_buf]
-    call int_to_str
-    mov rsi, show_num_buf
-    call print_string
-    mov rsi, newline_str
-    call print_string
-    pop rdi
-    pop rsi
-    pop rbx
-    pop rax
     lea rsi, [party_scratch]
     call party_push_val
     jmp .pp_out
@@ -2535,6 +2992,17 @@ party_parse_call:
     jne .ppc_err_rparen
 .ppc_args_done:
     inc r13                        ; past ')'
+    ; Builtins (fopen/fread/fwrite/fclose/fexists/fdelete - Phase 3)
+    ; are checked before user-defined functions, so a script can't
+    ; shadow them. party_call_builtin clobbers r8-r13 on a match (see
+    ; its header comment), so r13 - the token cursor, which must
+    ; survive past this call either way - is saved/restored around it.
+    push r13
+    call party_call_builtin
+    pop r13
+    cmp al, 1
+    je .ppc_out                    ; builtin handled everything (result
+                                    ; pushed, or exec_ok cleared on error)
     lea rsi, [party_call_name_buf]
     call party_func_find
     cmp r15, -1
@@ -2560,6 +3028,940 @@ party_parse_call:
     pop r14
     pop r12
 .out:
+    ret
+
+; ============================================================
+;  IN-LANGUAGE FILE ACCESS API (Phase 3)
+;
+; fopen/fread/fwrite/fclose/fexists/fdelete: real file I/O without
+; shelling out via `rush`. These are the first "builtin functions" -
+; before this phase every call name went straight to party_func_find
+; (user-defined functions only); party_call_builtin below is checked
+; first and, on a name match, handles arg-count checking, argument
+; popping, and pushing exactly one result value itself (matching
+; party_invoke_func's contract), the same way a user function call
+; leaves one value on the stack whether or not the caller uses it.
+; A user script cannot redefine these names - the builtin check runs
+; before party_func_find ever sees them.
+;
+; All routed straight to the fs_* primitives (kernel.asm ~8251+) -
+; the same calls cmd_cat/cmd_mkfl/cmd_edit/cmd_rm already use, not
+; reimplemented and not shelled out to `rush`.
+; ============================================================
+
+PARTY_FH_MAX equ 12          ; open-file-handle table capacity
+PARTY_PATH_MAX equ 200       ; NUL-terminated path staging buffer size
+
+; party_call_builtin: dispatches to a builtin function if
+; party_call_name_buf names one. In: r14 = evaluated arg count (args
+; already pushed onto party_vstack, first arg first - same
+; convention party_invoke_func documents).
+; Out: al = 1 if the name matched a builtin - whether it then
+; succeeded or errored, check party_exec_ok either way, and exactly
+; one value (a real result, or PV_NONE) has been pushed on success.
+; al = 0 if the name isn't a builtin; args are left untouched on the
+; stack for the normal user-function path.
+; Clobbers rax, rbx, rcx, rdx, rsi, rdi, r8-r13 when al=1; untouched
+; when al=0 (no builtin matched, nothing was done).
+party_call_builtin:
+    lea rsi, [party_call_name_buf]
+    lea rdi, [str_fn_fopen]
+    call str_eq
+    cmp al, 1
+    je .pcb_fopen
+    lea rsi, [party_call_name_buf]
+    lea rdi, [str_fn_fread]
+    call str_eq
+    cmp al, 1
+    je .pcb_fread
+    lea rsi, [party_call_name_buf]
+    lea rdi, [str_fn_fwrite]
+    call str_eq
+    cmp al, 1
+    je .pcb_fwrite
+    lea rsi, [party_call_name_buf]
+    lea rdi, [str_fn_fclose]
+    call str_eq
+    cmp al, 1
+    je .pcb_fclose
+    lea rsi, [party_call_name_buf]
+    lea rdi, [str_fn_fexists]
+    call str_eq
+    cmp al, 1
+    je .pcb_fexists
+    lea rsi, [party_call_name_buf]
+    lea rdi, [str_fn_fdelete]
+    call str_eq
+    cmp al, 1
+    je .pcb_fdelete
+    lea rsi, [party_call_name_buf]
+    lea rdi, [str_fn_arr_new]
+    call str_eq
+    cmp al, 1
+    je .pcb_arr_new
+    lea rsi, [party_call_name_buf]
+    lea rdi, [str_fn_arr_len]
+    call str_eq
+    cmp al, 1
+    je .pcb_arr_len
+    lea rsi, [party_call_name_buf]
+    lea rdi, [str_fn_arr_get]
+    call str_eq
+    cmp al, 1
+    je .pcb_arr_get
+    lea rsi, [party_call_name_buf]
+    lea rdi, [str_fn_arr_set]
+    call str_eq
+    cmp al, 1
+    je .pcb_arr_set
+    lea rsi, [party_call_name_buf]
+    lea rdi, [str_fn_arr_free]
+    call str_eq
+    cmp al, 1
+    je .pcb_arr_free
+    xor al, al
+    ret
+.pcb_arr_new:
+    call party_bi_arr_new
+    mov al, 1
+    ret
+.pcb_arr_len:
+    call party_bi_arr_len
+    mov al, 1
+    ret
+.pcb_arr_get:
+    call party_bi_arr_get
+    mov al, 1
+    ret
+.pcb_arr_set:
+    call party_bi_arr_set
+    mov al, 1
+    ret
+.pcb_arr_free:
+    call party_bi_arr_free
+    mov al, 1
+    ret
+.pcb_fopen:
+    call party_bi_fopen
+    mov al, 1
+    ret
+.pcb_fread:
+    call party_bi_fread
+    mov al, 1
+    ret
+.pcb_fwrite:
+    call party_bi_fwrite
+    mov al, 1
+    ret
+.pcb_fclose:
+    call party_bi_fclose
+    mov al, 1
+    ret
+.pcb_fexists:
+    call party_bi_fexists
+    mov al, 1
+    ret
+.pcb_fdelete:
+    call party_bi_fdelete
+    mov al, 1
+    ret
+
+; party_fh_alloc: finds a free handle slot. Out: rax = slot index, or
+; -1 if the table is full (msg_party_fh_full via party_set_err - the
+; -1 is informational for the caller's own branch, exec_ok is already
+; false). Clobbers rax, rcx.
+party_fh_alloc:
+    xor rcx, rcx
+.pfa_loop:
+    cmp rcx, PARTY_FH_MAX
+    jae .pfa_full
+    cmp byte [party_fh_used+rcx], 0
+    je .pfa_found
+    inc rcx
+    jmp .pfa_loop
+.pfa_found:
+    mov byte [party_fh_used+rcx], 1
+    mov rax, rcx
+    ret
+.pfa_full:
+    lea rsi, [msg_party_fh_full]
+    call party_set_err
+    mov rax, -1
+    ret
+
+; party_fh_check: rax = handle value (int64). Validates it's in range
+; and currently open.
+; Out: on success, rbx = the file's node index, rcx = handle slot
+; index, al = 1. On failure, sets party_exec_ok = 0 via party_set_err
+; (msg_party_fh_invalid) and al = 0.
+; Clobbers rax, rbx, rcx, rsi.
+party_fh_check:
+    cmp rax, 0
+    jl .fhc_bad
+    cmp rax, PARTY_FH_MAX
+    jae .fhc_bad
+    mov rcx, rax
+    cmp byte [party_fh_used+rcx], 0
+    je .fhc_bad
+    mov ebx, [party_fh_node+rcx*4]
+    mov al, 1
+    ret
+.fhc_bad:
+    lea rsi, [msg_party_fh_invalid]
+    call party_set_err
+    xor al, al
+    ret
+
+; party_copy_str_to_cpath: rsi = ptr, rcx = len (a PV_STR's raw
+; slice). Copies it into party_fh_path_buf, NUL-terminated, for
+; passing to fs_resolve_path (which expects a C string).
+; Out: al = 1 on success. al = 0 if it doesn't fit (sets
+; party_exec_ok = 0 via party_set_err, msg_party_path_too_long).
+; Clobbers rax, rcx, rsi, rdi.
+party_copy_str_to_cpath:
+    cmp rcx, PARTY_PATH_MAX-1
+    jb .pctc_ok
+    lea rsi, [msg_party_path_too_long]
+    call party_set_err
+    xor al, al
+    ret
+.pctc_ok:
+    lea rdi, [party_fh_path_buf]
+.pctc_loop:
+    cmp rcx, 0
+    je .pctc_done
+    mov al, [rsi]
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    dec rcx
+    jmp .pctc_loop
+.pctc_done:
+    mov byte [rdi], 0
+    mov al, 1
+    ret
+
+; ---- fopen(path, mode) -> int handle ----
+; mode is "r" (must already exist), "w" (create if missing, truncate
+; if it exists), or "a" (create if missing, keep existing content).
+; Errors (bad arg types/count, bad mode, path doesn't resolve, path
+; names a folder not a file, handle table full, node table full) are
+; all runtime errors - fopen never returns an invalid handle.
+party_bi_fopen:
+    cmp r14, 2
+    je .bfo_argc_ok
+    lea rsi, [msg_party_arg_count]
+    call party_set_err
+    ret
+.bfo_argc_ok:
+    lea rdi, [party_scratch2]      ; mode (pushed last = on top)
+    call party_pop_val
+    lea rdi, [party_scratch1]      ; path
+    call party_pop_val
+    cmp byte [party_exec_ok], 1
+    jne .bfo_out
+    cmp byte [party_scratch1], PV_STR
+    jne .bfo_err_argtype
+    cmp byte [party_scratch2], PV_STR
+    jne .bfo_err_argtype
+    ; mode must be exactly one of "r" / "w" / "a"
+    cmp qword [party_scratch2+24], 1
+    jne .bfo_err_mode
+    mov rsi, [party_scratch2+16]
+    mov al, [rsi]
+    mov [party_fh_pending_mode], al
+    cmp al, 'r'
+    je .bfo_mode_ok
+    cmp al, 'w'
+    je .bfo_mode_ok
+    cmp al, 'a'
+    je .bfo_mode_ok
+    jmp .bfo_err_mode
+.bfo_mode_ok:
+    mov rsi, [party_scratch1+16]
+    mov rcx, [party_scratch1+24]
+    call party_copy_str_to_cpath
+    cmp al, 1
+    jne .bfo_out
+    mov rax, [cur_dir]
+    lea rsi, [party_fh_path_buf]
+    lea rdi, [leaf1_buf]
+    call fs_resolve_path
+    cmp rax, -1
+    je .bfo_err_path
+    mov r11, rax                   ; parent dir
+    mov rax, r11
+    lea rsi, [leaf1_buf]
+    mov r10, -1                    ; any type - need to notice folder collisions
+    call fs_find_child
+    cmp rax, -1
+    je .bfo_notfound
+    ; something with this name already exists
+    movzx rdx, byte [node_type + rax]
+    cmp rdx, 2
+    jne .bfo_err_isdir
+    mov r12, rax                   ; existing file node
+    cmp byte [party_fh_pending_mode], 'w'
+    jne .bfo_have_node
+    ; "w" on an existing file: truncate immediately
+    mov rax, r12
+    xor rsi, rsi
+    xor rcx, rcx
+    call fs_write_binary_file
+    call maybe_auto_sync
+    jmp .bfo_have_node
+.bfo_notfound:
+    cmp byte [party_fh_pending_mode], 'r'
+    je .bfo_err_notfound
+    mov rax, r11
+    lea rsi, [leaf1_buf]
+    mov r10, 2                     ; type file
+    call fs_create_node
+    cmp rax, -1
+    je .bfo_err_full
+    mov r12, rax
+    call maybe_auto_sync
+.bfo_have_node:
+    call party_fh_alloc
+    cmp rax, -1
+    je .bfo_out                    ; party_fh_alloc already set the error
+    mov rcx, rax                   ; slot index
+    mov [party_fh_node+rcx*4], r12d
+    mov al, [party_fh_pending_mode]
+    mov [party_fh_mode+rcx], al
+    lea rdi, [party_scratch]
+    mov rax, rcx
+    call party_val_set_int
+    lea rsi, [party_scratch]
+    call party_push_val
+    jmp .bfo_out
+.bfo_err_argtype:
+    lea rsi, [msg_party_fopen_args]
+    call party_set_err
+    jmp .bfo_out
+.bfo_err_mode:
+    lea rsi, [msg_party_fopen_mode]
+    call party_set_err
+    jmp .bfo_out
+.bfo_err_path:
+    lea rsi, [msg_party_fopen_path]
+    call party_set_err
+    jmp .bfo_out
+.bfo_err_notfound:
+    lea rsi, [msg_party_fopen_notfound]
+    call party_set_err
+    jmp .bfo_out
+.bfo_err_isdir:
+    lea rsi, [msg_party_fopen_isdir]
+    call party_set_err
+    jmp .bfo_out
+.bfo_err_full:
+    lea rsi, [msg_party_fopen_full]
+    call party_set_err
+.bfo_out:
+    ret
+
+; ---- fread(h) -> whole file content as a string ----
+party_bi_fread:
+    cmp r14, 1
+    je .bfr_argc_ok
+    lea rsi, [msg_party_arg_count]
+    call party_set_err
+    ret
+.bfr_argc_ok:
+    lea rdi, [party_scratch1]
+    call party_pop_val
+    cmp byte [party_exec_ok], 1
+    jne .bfr_out
+    cmp byte [party_scratch1], PV_INT
+    jne .bfr_err_type
+    mov rax, [party_scratch1+8]
+    call party_fh_check
+    cmp al, 1
+    jne .bfr_out
+    mov rax, rbx                   ; node index
+    call fs_file_len
+    cmp rax, EDIT_MAX
+    jae .bfr_err_toobig
+    mov r12, rax                   ; length
+    mov rbx, rax
+    mov rax, [party_scratch1+8]
+    call party_fh_check             ; rbx clobbered above - re-fetch node idx
+    mov rax, rbx
+    lea rdi, [fs_io_buf]
+    call fs_read_binary_file        ; rax = bytes actually copied
+    lea rdi, [party_scratch]
+    mov rsi, fs_io_buf
+    mov rcx, rax
+    call party_val_set_str
+    lea rsi, [party_scratch]
+    call party_push_val
+    jmp .bfr_out
+.bfr_err_type:
+    lea rsi, [msg_party_fh_type]
+    call party_set_err
+    jmp .bfr_out
+.bfr_err_toobig:
+    lea rsi, [msg_party_fread_toobig]
+    call party_set_err
+.bfr_out:
+    ret
+
+; ---- fwrite(h, text) -> none ----
+; Appends `text` to the file's current content (read-modify-write:
+; there's no incremental-append primitive in the fs_* layer, so this
+; reads the existing bytes, concatenates, and writes the whole run
+; back via fs_write_binary_file, same as fs_write_file/
+; fs_write_binary_file always replacing the full content).
+party_bi_fwrite:
+    cmp r14, 2
+    je .bfw_argc_ok
+    lea rsi, [msg_party_arg_count]
+    call party_set_err
+    ret
+.bfw_argc_ok:
+    lea rdi, [party_scratch2]      ; text (on top)
+    call party_pop_val
+    lea rdi, [party_scratch1]      ; handle
+    call party_pop_val
+    cmp byte [party_exec_ok], 1
+    jne .bfw_out
+    cmp byte [party_scratch1], PV_INT
+    jne .bfw_err_htype
+    cmp byte [party_scratch2], PV_STR
+    jne .bfw_err_ttype
+    mov rax, [party_scratch1+8]
+    call party_fh_check
+    cmp al, 1
+    jne .bfw_out
+    cmp byte [party_fh_mode+rcx], 'r'
+    jne .bfw_mode_ok
+    lea rsi, [msg_party_fh_readonly]
+    call party_set_err
+    jmp .bfw_out
+.bfw_mode_ok:
+    mov r12, rbx                    ; node index
+    mov rax, r12
+    call fs_file_len
+    cmp rax, EDIT_MAX
+    jae .bfw_err_toobig
+    mov r13, rax                    ; current length
+    mov rax, r12
+    lea rdi, [fs_io_buf]
+    call fs_read_binary_file        ; rax = bytes actually read back
+    mov r13, rax
+    mov rax, r13
+    add rax, [party_scratch2+24]
+    cmp rax, EDIT_MAX
+    ja .bfw_err_toobig
+    lea rdi, [fs_io_buf]
+    add rdi, r13
+    mov rsi, [party_scratch2+16]
+    mov rcx, [party_scratch2+24]
+    push rcx
+.bfw_copy:
+    cmp rcx, 0
+    je .bfw_copy_done
+    mov al, [rsi]
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    dec rcx
+    jmp .bfw_copy
+.bfw_copy_done:
+    pop rcx
+    mov rax, r13
+    add rax, rcx                    ; total length
+    mov r13, rax
+    mov rax, r12
+    mov rsi, fs_io_buf
+    mov rcx, r13
+    call fs_write_binary_file
+    call maybe_auto_sync
+    lea rdi, [party_scratch]
+    call party_val_set_none
+    lea rsi, [party_scratch]
+    call party_push_val
+    jmp .bfw_out
+.bfw_err_htype:
+    lea rsi, [msg_party_fh_type]
+    call party_set_err
+    jmp .bfw_out
+.bfw_err_ttype:
+    lea rsi, [msg_party_fwrite_type]
+    call party_set_err
+    jmp .bfw_out
+.bfw_err_toobig:
+    lea rsi, [msg_party_fwrite_toobig]
+    call party_set_err
+.bfw_out:
+    ret
+
+; ---- fclose(h) -> none ----
+party_bi_fclose:
+    cmp r14, 1
+    je .bfc_argc_ok
+    lea rsi, [msg_party_arg_count]
+    call party_set_err
+    ret
+.bfc_argc_ok:
+    lea rdi, [party_scratch1]
+    call party_pop_val
+    cmp byte [party_exec_ok], 1
+    jne .bfc_out
+    cmp byte [party_scratch1], PV_INT
+    jne .bfc_err_type
+    mov rax, [party_scratch1+8]
+    call party_fh_check
+    cmp al, 1
+    jne .bfc_out
+    mov byte [party_fh_used+rcx], 0
+    lea rdi, [party_scratch]
+    call party_val_set_none
+    lea rsi, [party_scratch]
+    call party_push_val
+    jmp .bfc_out
+.bfc_err_type:
+    lea rsi, [msg_party_fh_type]
+    call party_set_err
+.bfc_out:
+    ret
+
+; ---- fexists(path) -> bool ----
+; Deliberately never errors on a nonexistent path (unlike the rest of
+; this API) - testing existence is the whole point, so a path that
+; simply doesn't resolve just yields `false`, matching the usual
+; meaning of an "exists" check in other languages. A wrong argument
+; type is still a runtime error like everywhere else.
+party_bi_fexists:
+    cmp r14, 1
+    je .bfe_argc_ok
+    lea rsi, [msg_party_arg_count]
+    call party_set_err
+    ret
+.bfe_argc_ok:
+    lea rdi, [party_scratch1]
+    call party_pop_val
+    cmp byte [party_exec_ok], 1
+    jne .bfe_out
+    cmp byte [party_scratch1], PV_STR
+    jne .bfe_err_type
+    mov rsi, [party_scratch1+16]
+    mov rcx, [party_scratch1+24]
+    call party_copy_str_to_cpath
+    cmp al, 1
+    jne .bfe_out
+    mov rax, [cur_dir]
+    lea rsi, [party_fh_path_buf]
+    lea rdi, [leaf1_buf]
+    call fs_resolve_path
+    cmp rax, -1
+    je .bfe_false
+    mov r11, rax
+    lea rsi, [leaf1_buf]
+    mov r10, -1
+    call fs_find_child
+    cmp rax, -1
+    je .bfe_false
+    lea rdi, [party_scratch]
+    call party_val_set_bool_true
+    jmp .bfe_push
+.bfe_false:
+    lea rdi, [party_scratch]
+    call party_val_set_bool_false
+.bfe_push:
+    lea rsi, [party_scratch]
+    call party_push_val
+    jmp .bfe_out
+.bfe_err_type:
+    lea rsi, [msg_party_fexists_type]
+    call party_set_err
+.bfe_out:
+    ret
+
+; ---- fdelete(path) -> none ----
+; Unlike fexists, deleting a path that doesn't exist IS a runtime
+; error - fdelete is an action the script expects to have an effect,
+; so silently no-op'ing on a bad path would hide a bug (same "error,
+; not silent" philosophy as everywhere else in this language). Uses
+; fs_delete_tree, so deleting a folder path removes its contents too.
+party_bi_fdelete:
+    cmp r14, 1
+    je .bfd_argc_ok
+    lea rsi, [msg_party_arg_count]
+    call party_set_err
+    ret
+.bfd_argc_ok:
+    lea rdi, [party_scratch1]
+    call party_pop_val
+    cmp byte [party_exec_ok], 1
+    jne .bfd_out
+    cmp byte [party_scratch1], PV_STR
+    jne .bfd_err_type
+    mov rsi, [party_scratch1+16]
+    mov rcx, [party_scratch1+24]
+    call party_copy_str_to_cpath
+    cmp al, 1
+    jne .bfd_out
+    mov rax, [cur_dir]
+    lea rsi, [party_fh_path_buf]
+    lea rdi, [leaf1_buf]
+    call fs_resolve_path
+    cmp rax, -1
+    je .bfd_err_notfound
+    mov r11, rax
+    lea rsi, [leaf1_buf]
+    mov r10, -1
+    call fs_find_child
+    cmp rax, -1
+    je .bfd_err_notfound
+    call fs_delete_tree
+    call maybe_auto_sync
+    lea rdi, [party_scratch]
+    call party_val_set_none
+    lea rsi, [party_scratch]
+    call party_push_val
+    jmp .bfd_out
+.bfd_err_type:
+    lea rsi, [msg_party_fexists_type]
+    call party_set_err
+    jmp .bfd_out
+.bfd_err_notfound:
+    lea rsi, [msg_party_fdelete_notfound]
+    call party_set_err
+.bfd_out:
+    ret
+
+; ============================================================
+;  IN-LANGUAGE ARRAYS (Phase 4)
+;
+; Surface (PARTY_SPEC.md section 10): builtin functions, the same
+; function-call-shaped "cannot be shadowed by a user func" mechanism
+; Phase 3's file API uses - no new syntax, no TOK_LBRACKET/RBRACKET,
+; no postfix-indexing parser work. This was a deliberate scope call
+; (see phases.txt for the tradeoff): `a[i]` / `a[i] = x` / `[1,2,3]`
+; literal syntax is real parser work (a new expression production,
+; and a new assignment-target grammar alongside the existing
+; ident-only `.pes_assign`) that a later phase can add on top of this
+; one without touching the underlying storage below.
+;
+;     vars a = arr_new(3)     ; new array, 3 elements, each int 0
+;     arr_set(a, 0, "hi")     ; statement only, like fwrite
+;     display arr_get(a, 0)  ; "hi"
+;     display arr_len(a)     ; 3
+;     arr_free(a)             ; releases the slot
+;
+; Storage: a fixed pool of PARTY_ARR_MAX array "slots", each holding
+; up to PARTY_ARR_CAP elements (ordinary 32-byte Party values, so an
+; array can hold any type, including nested arrays - nothing in the
+; value model prevents it, it just wasn't a design goal this phase).
+; A PV_ARRAY value's [+8] field is the slot index - the same
+; handle-into-a-fixed-table shape PARTY_FH_* already uses for file
+; handles - so copying a PV_ARRAY value (assignment, passing it as a
+; function argument, returning it) copies the handle only: arrays
+; are reference types, every alias sees the same underlying storage.
+; This was the OTHER locked-in scope decision (avoids needing a deep
+; -copy pass through party_val_copy, which stays a flat 32-byte copy
+; for every value type, arrays included).
+;
+; PARTY_ARR_MAX=4 / PARTY_ARR_CAP=16 are deliberately small - see the
+; sizing note by the equ's below. No arr_grow/append: an array's size
+; is fixed at arr_new and never changes, matching "fixed-size" from
+; the two options phases.txt raised as the very first open design
+; question (growable was the other option; not done here).
+; ============================================================
+
+PARTY_ARR_MAX equ 4     ; concurrently-alive arrays. Kept deliberately
+                         ; tiny: this table gets copied into EVERY
+                         ; party_ctx_table save/restore (background
+                         ; processes), which is itself replicated
+                         ; MAX_PROCESSES times in kernel.asm's
+                         ; proc_bg_ctx - and kernel.asm already trimmed
+                         ; MAX_PROCESSES from 4 to 2 "to fit the
+                         ; kernel's BSS under 0xA0000" (kernel.asm
+                         ; ~18343). A bigger array table here directly
+                         ; eats into that same tight budget. 4 arrays x
+                         ; 16 elements was picked to keep the total
+                         ; addition small (see party_arr_data below);
+                         ; raise it only after confirming real
+                         ; link-time BSS headroom in the full dev tree
+                         ; ("nasm party.asm standalone" only checks
+                         ; syntax, not final image size) - not done
+                         ; this session, no boot/link environment here.
+PARTY_ARR_CAP equ 16    ; elements per array
+
+; party_arr_alloc: finds a free array slot. Out: rax = slot index, or
+; -1 if the table is full (msg_party_arr_full via party_set_err).
+; Clobbers rax, rcx. Mirrors party_fh_alloc exactly.
+party_arr_alloc:
+    xor rcx, rcx
+.paa_loop:
+    cmp rcx, PARTY_ARR_MAX
+    jae .paa_full
+    cmp byte [party_arr_used+rcx], 0
+    je .paa_found
+    inc rcx
+    jmp .paa_loop
+.paa_found:
+    mov byte [party_arr_used+rcx], 1
+    mov rax, rcx
+    ret
+.paa_full:
+    lea rsi, [msg_party_arr_full]
+    call party_set_err
+    mov rax, -1
+    ret
+
+; party_arr_check: rax = handle value (a PV_ARRAY value's [+8] field).
+; Validates it's in range and currently allocated.
+; Out: on success, rbx = pointer to the array's element-0 slot inside
+; party_arr_data, rcx = handle/slot index, al = 1. On failure, sets
+; party_exec_ok = 0 via party_set_err (msg_party_arr_invalid) and
+; al = 0. Clobbers rax, rbx, rcx, rdx, rsi.
+party_arr_check:
+    cmp rax, 0
+    jl .pac_bad
+    cmp rax, PARTY_ARR_MAX
+    jae .pac_bad
+    mov rcx, rax
+    cmp byte [party_arr_used+rcx], 0
+    je .pac_bad
+    mov rbx, rcx
+    imul rbx, PARTY_ARR_CAP*32
+    lea rdx, [party_arr_data]
+    add rbx, rdx
+    mov al, 1
+    ret
+.pac_bad:
+    lea rsi, [msg_party_arr_invalid]
+    call party_set_err
+    xor al, al
+    ret
+
+; ---- arr_new(n) -> array; n elements, each initialized to int 0 ----
+party_bi_arr_new:
+    cmp r14, 1
+    je .ban_argc_ok
+    lea rsi, [msg_party_arg_count]
+    call party_set_err
+    ret
+.ban_argc_ok:
+    lea rdi, [party_scratch1]
+    call party_pop_val
+    cmp byte [party_exec_ok], 1
+    jne .ban_out
+    cmp byte [party_scratch1], PV_INT
+    jne .ban_err_type
+    mov rax, [party_scratch1+8]
+    cmp rax, 0
+    jl .ban_err_range
+    cmp rax, PARTY_ARR_CAP
+    ja .ban_err_range
+    mov r12, rax                   ; requested count
+    call party_arr_alloc
+    cmp rax, -1
+    je .ban_out                    ; party_arr_alloc already set the error
+    mov rcx, rax                   ; slot index
+    mov [party_arr_count+rcx*8], r12
+    mov rbx, rcx
+    imul rbx, PARTY_ARR_CAP*32
+    lea rdx, [party_arr_data]
+    add rbx, rdx                   ; rbx = element-0 slot
+    xor r8, r8
+.ban_zero_loop:
+    cmp r8, r12
+    jae .ban_zero_done
+    lea rdi, [rbx]
+    xor rax, rax
+    call party_val_set_int
+    add rbx, 32
+    inc r8
+    jmp .ban_zero_loop
+.ban_zero_done:
+    lea rdi, [party_scratch]
+    mov byte [rdi], PV_ARRAY
+    mov qword [rdi+8], rcx
+    mov qword [rdi+16], 0
+    mov qword [rdi+24], 0
+    lea rsi, [party_scratch]
+    call party_push_val
+    jmp .ban_out
+.ban_err_type:
+    lea rsi, [msg_party_arr_new_args]
+    call party_set_err
+    jmp .ban_out
+.ban_err_range:
+    lea rsi, [msg_party_arr_new_range]
+    call party_set_err
+.ban_out:
+    ret
+
+; ---- arr_len(a) -> int ----
+party_bi_arr_len:
+    cmp r14, 1
+    je .bal_argc_ok
+    lea rsi, [msg_party_arg_count]
+    call party_set_err
+    ret
+.bal_argc_ok:
+    lea rdi, [party_scratch1]
+    call party_pop_val
+    cmp byte [party_exec_ok], 1
+    jne .bal_out
+    cmp byte [party_scratch1], PV_ARRAY
+    jne .bal_err_type
+    mov rax, [party_scratch1+8]
+    call party_arr_check
+    cmp al, 1
+    jne .bal_out
+    mov rax, [party_arr_count+rcx*8]
+    lea rdi, [party_scratch]
+    call party_val_set_int
+    lea rsi, [party_scratch]
+    call party_push_val
+    jmp .bal_out
+.bal_err_type:
+    lea rsi, [msg_party_arr_argtype]
+    call party_set_err
+.bal_out:
+    ret
+
+; ---- arr_get(a, i) -> value (a copy of the element - any type) ----
+party_bi_arr_get:
+    cmp r14, 2
+    je .bag_argc_ok
+    lea rsi, [msg_party_arg_count]
+    call party_set_err
+    ret
+.bag_argc_ok:
+    lea rdi, [party_scratch2]      ; index (on top)
+    call party_pop_val
+    lea rdi, [party_scratch1]      ; array
+    call party_pop_val
+    cmp byte [party_exec_ok], 1
+    jne .bag_out
+    cmp byte [party_scratch1], PV_ARRAY
+    jne .bag_err_argtype
+    cmp byte [party_scratch2], PV_INT
+    jne .bag_err_idxtype
+    mov rax, [party_scratch1+8]
+    call party_arr_check
+    cmp al, 1
+    jne .bag_out
+    mov rdx, rcx                   ; slot index (party_arr_check clobbers rcx below)
+    mov rax, [party_scratch2+8]    ; requested index
+    cmp rax, 0
+    jl .bag_err_bounds
+    cmp rax, [party_arr_count+rdx*8]
+    jae .bag_err_bounds
+    imul rax, 32
+    add rbx, rax                   ; rbx = element pointer (base from party_arr_check)
+    lea rdi, [party_scratch]
+    mov rsi, rbx
+    call party_val_copy
+    lea rsi, [party_scratch]
+    call party_push_val
+    jmp .bag_out
+.bag_err_argtype:
+    lea rsi, [msg_party_arr_argtype]
+    call party_set_err
+    jmp .bag_out
+.bag_err_idxtype:
+    lea rsi, [msg_party_arr_index_type]
+    call party_set_err
+    jmp .bag_out
+.bag_err_bounds:
+    lea rsi, [msg_party_arr_bounds]
+    call party_set_err
+.bag_out:
+    ret
+
+; ---- arr_set(a, i, v) -> none (statement only, like fwrite) ----
+party_bi_arr_set:
+    cmp r14, 3
+    je .bas_argc_ok
+    lea rsi, [msg_party_arg_count]
+    call party_set_err
+    ret
+.bas_argc_ok:
+    lea rdi, [party_scratch3]      ; value (on top)
+    call party_pop_val
+    lea rdi, [party_scratch2]      ; index
+    call party_pop_val
+    lea rdi, [party_scratch1]      ; array
+    call party_pop_val
+    cmp byte [party_exec_ok], 1
+    jne .bas_out
+    cmp byte [party_scratch1], PV_ARRAY
+    jne .bas_err_argtype
+    cmp byte [party_scratch2], PV_INT
+    jne .bas_err_idxtype
+    mov rax, [party_scratch1+8]
+    call party_arr_check
+    cmp al, 1
+    jne .bas_out
+    mov rdx, rcx                   ; slot index
+    mov rax, [party_scratch2+8]    ; requested index
+    cmp rax, 0
+    jl .bas_err_bounds
+    cmp rax, [party_arr_count+rdx*8]
+    jae .bas_err_bounds
+    imul rax, 32
+    add rbx, rax                   ; rbx = element pointer
+    mov rdi, rbx
+    lea rsi, [party_scratch3]
+    call party_val_copy
+    lea rdi, [party_scratch]
+    call party_val_set_none
+    lea rsi, [party_scratch]
+    call party_push_val
+    jmp .bas_out
+.bas_err_argtype:
+    lea rsi, [msg_party_arr_argtype]
+    call party_set_err
+    jmp .bas_out
+.bas_err_idxtype:
+    lea rsi, [msg_party_arr_index_type]
+    call party_set_err
+    jmp .bas_out
+.bas_err_bounds:
+    lea rsi, [msg_party_arr_bounds]
+    call party_set_err
+.bas_out:
+    ret
+
+; ---- arr_free(a) -> none; releases the slot back to the pool ----
+; Using the handle again afterwards (arr_len/arr_get/arr_set/
+; arr_free on it) is a runtime error, same as an already-fclose'd
+; file handle - party_arr_check has no way to tell "stale" from
+; "never valid" and doesn't need to.
+party_bi_arr_free:
+    cmp r14, 1
+    je .baf_argc_ok
+    lea rsi, [msg_party_arg_count]
+    call party_set_err
+    ret
+.baf_argc_ok:
+    lea rdi, [party_scratch1]
+    call party_pop_val
+    cmp byte [party_exec_ok], 1
+    jne .baf_out
+    cmp byte [party_scratch1], PV_ARRAY
+    jne .baf_err_type
+    mov rax, [party_scratch1+8]
+    call party_arr_check
+    cmp al, 1
+    jne .baf_out
+    mov byte [party_arr_used+rcx], 0
+    lea rdi, [party_scratch]
+    call party_val_set_none
+    lea rsi, [party_scratch]
+    call party_push_val
+    jmp .baf_out
+.baf_err_type:
+    lea rsi, [msg_party_arr_argtype]
+    call party_set_err
+.baf_out:
     ret
 
 ; ============================================================
@@ -2604,10 +4006,14 @@ party_op_bin:
 .bop_l2_ok:
     xor r14, r14                   ; r14 = 1 -> float mode
     cmp byte [party_scratch1], PV_FLOAT
-    je .bop_fmode
+    je .bop_check_pct_float
     cmp byte [party_scratch2], PV_FLOAT
     jne .bop_do_int
-.bop_fmode:
+.bop_check_pct_float:
+    ; '%' is int-only: a float operand on either side is an error,
+    ; caught here before falling into the shared float path.
+    cmp r12, TOK_PERCENT
+    je .bop_err_type
     mov r14, 1
     jmp .bop_do_float
 .bop_do_int:
@@ -2623,6 +4029,11 @@ party_op_bin:
     je .bop_err_div0
     cqo
     idiv rbx
+    cmp r12, TOK_PERCENT
+    je .bop_imod
+    jmp .bop_istore
+.bop_imod:
+    mov rax, rdx                   ; idiv leaves the remainder in rdx
     jmp .bop_istore
 .bop_iadd:
     add rax, rbx
@@ -2849,53 +4260,6 @@ party_op_rel:
     call party_pop_val
     cmp byte [party_exec_ok], 1
     jne .out2
-    push rax
-    push rbx
-    push rcx
-    push rsi
-    push rdi
-    movzx eax, byte [party_scratch1]
-    lea rdi, [show_num_buf]
-    call int_to_str
-    mov rsi, show_num_buf
-    call print_string
-    mov rsi, newline_str
-    call print_string
-    mov rax, [party_scratch1+8]
-    lea rdi, [show_num_buf]
-    call int_to_str
-    mov rsi, show_num_buf
-    call print_string
-    mov rsi, newline_str
-    call print_string
-    movzx eax, byte [party_scratch2]
-    lea rdi, [show_num_buf]
-    call int_to_str
-    mov rsi, show_num_buf
-    call print_string
-    mov rsi, newline_str
-    call print_string
-    mov rax, [party_scratch2+8]
-    lea rdi, [show_num_buf]
-    call int_to_str
-    mov rsi, show_num_buf
-    call print_string
-    mov rsi, newline_str
-    call print_string
-    mov rsi, str_rel_dbgpre
-    call print_string
-    mov rax, r12
-    lea rdi, [show_num_buf]
-    call int_to_str
-    mov rsi, show_num_buf
-    call print_string
-    mov rsi, newline_str
-    call print_string
-    pop rdi
-    pop rsi
-    pop rcx
-    pop rbx
-    pop rax
     mov al, [party_scratch1]
     cmp al, PV_BOOL
     je .rl_lhs_ok
@@ -2975,71 +4339,6 @@ party_op_rel:
     call party_push_val
     jmp .out2
 .rl_err_type:
-    push rax
-    push rbx
-    push rsi
-    push rdi
-    mov rsi, party_ident_buf
-    call print_string
-    mov rsi, newline_str
-    call print_string
-    mov rax, [party_call_depth]
-    lea rdi, [show_num_buf]
-    call int_to_str
-    mov rsi, show_num_buf
-    call print_string
-    mov rsi, newline_str
-    call print_string
-    mov rax, [party_loc_count]
-    lea rdi, [show_num_buf]
-    call int_to_str
-    mov rsi, show_num_buf
-    call print_string
-    mov rsi, newline_str
-    call print_string
-    mov eax, [party_frame_locbase]
-    lea rdi, [show_num_buf]
-    call int_to_str
-    mov rsi, show_num_buf
-    call print_string
-    mov rsi, newline_str
-    call print_string
-    movzx eax, byte [party_loc_used]
-    lea rdi, [show_num_buf]
-    call int_to_str
-    mov rsi, show_num_buf
-    call print_string
-    mov rsi, newline_str
-    call print_string
-    movzx eax, byte [party_var_used]
-    lea rdi, [show_num_buf]
-    call int_to_str
-    mov rsi, show_num_buf
-    call print_string
-    mov rsi, newline_str
-    call print_string
-    movzx eax, byte [party_loc_val]
-    lea rdi, [show_num_buf]
-    call int_to_str
-    mov rsi, show_num_buf
-    call print_string
-    mov rsi, newline_str
-    call print_string
-    mov rsi, party_loc_name
-    call print_string
-    mov rsi, newline_str
-    call print_string
-    movzx eax, byte [party_loc_val+32]
-    lea rdi, [show_num_buf]
-    call int_to_str
-    mov rsi, show_num_buf
-    call print_string
-    mov rsi, newline_str
-    call print_string
-    pop rdi
-    pop rsi
-    pop rbx
-    pop rax
     lea rsi, [msg_party_cmp_num]
     call party_set_err
 .out2:
@@ -3144,52 +4443,6 @@ party_var_get_ptr:
     dec rbx
     jmp .vgl_loop
 .vgl_found:
-    push rax
-    push rbx
-    push rsi
-    push rdi
-    push r8
-    mov r8, rbx                    ; save slot index
-    call party_tok_ptr
-    movzx eax, byte [rbx]
-    lea rdi, [show_num_buf]
-    call int_to_str
-    mov rsi, show_num_buf
-    call print_string
-    mov rsi, newline_str
-    call print_string
-    mov rsi, str_tok_dbgpre
-    call print_string
-    mov rax, r13
-    lea rdi, [show_num_buf]
-    call int_to_str
-    mov rsi, show_num_buf
-    call print_string
-    mov rsi, newline_str
-    call print_string
-    mov rax, r8
-    lea rdi, [show_num_buf]
-    call int_to_str
-    mov rsi, show_num_buf
-    call print_string
-    mov rsi, newline_str
-    call print_string
-    lea rdi, [party_loc_val]
-    mov rbx, r8
-    imul rbx, 32
-    add rdi, rbx
-    movzx eax, byte [rdi]
-    lea rdi, [show_num_buf]
-    call int_to_str
-    mov rsi, show_num_buf
-    call print_string
-    mov rsi, newline_str
-    call print_string
-    pop r8
-    pop rdi
-    pop rsi
-    pop rbx
-    pop rax
     imul rdx, rbx, 32
     lea rbx, [party_loc_val]
     add rbx, rdx
@@ -3215,25 +4468,6 @@ party_var_get_ptr:
     inc rcx
     jmp .vgg_loop
 .vgg_found:
-    push rax
-    push rbx
-    push rsi
-    push rdi
-    lea rdi, [party_var_val]
-    mov rbx, rcx
-    imul rbx, 32
-    add rdi, rbx
-    movzx eax, byte [rdi]
-    lea rdi, [show_num_buf]
-    call int_to_str
-    mov rsi, show_num_buf
-    call print_string
-    mov rsi, newline_str
-    call print_string
-    pop rdi
-    pop rsi
-    pop rbx
-    pop rax
     lea rbx, [party_var_val]
     imul rdx, rcx, 32
     add rbx, rdx
@@ -3437,44 +4671,6 @@ party_invoke_func:
     jne .pif_abort
     jmp .pif_bind_loop
 .pif_bind_done:
-    ; --- DEBUG: dump local table ---
-    push rax
-    push rbx
-    push rsi
-    push rdi
-    mov rax, r15
-    lea rdi, [show_num_buf]
-    call int_to_str
-    mov rsi, show_num_buf
-    call print_string
-    mov rsi, newline_str
-    call print_string
-    mov rax, [party_loc_count]
-    lea rdi, [show_num_buf]
-    call int_to_str
-    mov rsi, show_num_buf
-    call print_string
-    mov rsi, newline_str
-    call print_string
-    movzx eax, byte [party_loc_val]
-    lea rdi, [show_num_buf]
-    call int_to_str
-    mov rsi, show_num_buf
-    call print_string
-    mov rsi, newline_str
-    call print_string
-    movzx eax, byte [party_loc_val+32]
-    lea rdi, [show_num_buf]
-    call int_to_str
-    mov rsi, show_num_buf
-    call print_string
-    mov rsi, newline_str
-    call print_string
-    pop rdi
-    pop rsi
-    pop rbx
-    pop rax
-    ; --- DEBUG END ---
     mov r13d, [party_func_bodytok + r15*4]
     mov r14, TOK_RBRACE
     call party_exec_stmts
@@ -3727,8 +4923,15 @@ kw_while:   db 'while', 0
 kw_func:    db 'func', 0
 kw_return:  db 'return', 0
 kw_display: db 'display', 0
+kw_read:    db 'read', 0
 kw_true:    db 'true', 0
 kw_false:   db 'false', 0
+
+; Phase 4: `display` formatting for PV_ARRAY (party_print_value)
+lbracket_str: db '[', 0
+rbracket_str: db ']', 0
+comma_sp_str: db ', ', 0
+kw_rush:    db 'rush', 0
 
 str_tok_eof:     db 'EOF', 0
 str_tok_ident:   db 'IDENT', 0
@@ -3761,6 +4964,9 @@ str_tok_lte:     db 'LTE', 0
 str_tok_gt:      db 'GT', 0
 str_tok_gte:     db 'GTE', 0
 str_tok_comma:   db 'COMMA', 0
+str_tok_percent: db 'PERCENT', 0
+str_tok_read:    db 'READ', 0
+str_tok_rush:    db 'RUSH', 0
 str_tok_error:   db 'ERROR', 0
 str_tok_dbgpre:  db 'VGL tok=', 0
 str_rel_dbgpre:  db 'REL op=', 0
@@ -3776,6 +4982,7 @@ party_tok_names:
     dq str_tok_rparen, str_tok_plus, str_tok_minus, str_tok_star
     dq str_tok_slash, str_tok_eq, str_tok_eqeq, str_tok_neq, str_tok_lt
     dq str_tok_lte, str_tok_gt, str_tok_gte, str_tok_comma
+    dq str_tok_percent, str_tok_read, str_tok_rush
 
 party_lex_ok:      db 0
 party_exec_ok:     db 0
@@ -3784,8 +4991,57 @@ party_error_line:  dd 0
 party_src_base:    dq 0     ; source base that token text offsets are relative to
 party_ident_buf:   times PARTY_IDENT_MAX db 0
 party_call_name_buf: times PARTY_IDENT_MAX db 0
+
+; Phase 3 builtin function names, compared against party_call_name_buf
+; by party_call_builtin. These are not keywords - a call to any of
+; them reaches the parser as a plain TOK_IDENT followed by '(',
+; exactly like a call to a user-defined function; party_call_builtin
+; intercepts the name before party_func_find ever sees it.
+str_fn_fopen:    db 'fopen', 0
+str_fn_fread:    db 'fread', 0
+str_fn_fwrite:   db 'fwrite', 0
+str_fn_fclose:   db 'fclose', 0
+str_fn_fexists:  db 'fexists', 0
+str_fn_fdelete:  db 'fdelete', 0
+
+; Phase 4 builtin function names (in-language arrays), same
+; not-a-keyword / can't-be-shadowed mechanism as the Phase 3 names
+; just above.
+str_fn_arr_new:  db 'arr_new', 0
+str_fn_arr_len:  db 'arr_len', 0
+str_fn_arr_get:  db 'arr_get', 0
+str_fn_arr_set:  db 'arr_set', 0
+str_fn_arr_free: db 'arr_free', 0
+
+; Phase 3 open-file-handle table, parallel arrays indexed by handle
+; slot (party_fh_alloc/party_fh_check). party_fh_pending_mode is
+; scratch used only inside party_bi_fopen, between validating the
+; mode argument and allocating the slot that will store it.
+party_fh_used:  times PARTY_FH_MAX db 0
+ALIGN 4
+party_fh_node:  times PARTY_FH_MAX dd 0
+party_fh_mode:  times PARTY_FH_MAX db 0
+party_fh_pending_mode: db 0
+party_fh_path_buf: times PARTY_PATH_MAX db 0
+
+; Phase 4 array-slot table, indexed by handle (party_arr_alloc/
+; party_arr_check). See PARTY_ARR_MAX/PARTY_ARR_CAP comments (up by
+; the Phase 4 code) for why these are sized so small - kernel.asm's
+; BSS budget is tight and this table is replicated into every
+; background process's saved ctx.
+party_arr_used:  times PARTY_ARR_MAX db 0
+ALIGN 8
+party_arr_count: times PARTY_ARR_MAX dq 0
+party_arr_data:  times PARTY_ARR_MAX*PARTY_ARR_CAP*32 db 0
+
 party_stmt_name_buf: times PARTY_IDENT_MAX db 0
 party_text_buf:    times 64 db 0
+PARTY_READ_MAX equ 256
+party_read_buf:    times PARTY_READ_MAX db 0
+PARTY_INTERP_MAX equ 1024   ; string-interpolation output buffer capacity
+party_interp_buf: times PARTY_INTERP_MAX db 0
+party_interp_ident_buf: times PARTY_IDENT_MAX db 0
+party_pel_char_scratch: db 0
 ALIGN 8
 party_token_count:  dw 0
 party_tokens:       times PARTY_MAX_TOKENS*8 db 0
@@ -3814,8 +5070,41 @@ msg_party_bad_arith:      db 'bad operand type', 0
 msg_party_div0:           db 'division by zero', 0
 msg_party_bad_unary:      db 'cannot negate this value', 0
 msg_party_var_declared:   db 'variable already declared', 0
+msg_party_rush_type:      db 'rush requires a string', 0
+msg_party_interp_unterm:    db "unterminated '{' in string", 0
+msg_party_interp_badident:  db 'invalid {name} in string', 0
+msg_party_interp_overflow:  db 'interpolated string too long', 0
 msg_party_eof:            db 'unexpected end of script', 0
 msg_party_err_near:        db ' near line ', 0
+
+; ---- Phase 3: in-language file access API (fopen/fread/fwrite/
+; fclose/fexists/fdelete) ----
+msg_party_fh_full:          db 'too many open files', 0
+msg_party_fh_invalid:       db 'invalid file handle', 0
+msg_party_fh_type:          db 'file handle must be an int', 0
+msg_party_fh_readonly:      db 'file not opened for writing', 0
+msg_party_fopen_args:       db 'fopen requires (string, string)', 0
+msg_party_fopen_mode:       db 'fopen mode must be "r", "w", or "a"', 0
+msg_party_fopen_path:       db "fopen: path doesn't resolve", 0
+msg_party_fopen_notfound:   db 'fopen: file does not exist', 0
+msg_party_fopen_isdir:      db 'fopen: path is a folder', 0
+msg_party_fopen_full:       db 'fopen: filesystem is full', 0
+msg_party_fread_toobig:     db 'file too large to read', 0
+msg_party_fwrite_type:      db 'fwrite requires a string', 0
+msg_party_fwrite_toobig:    db 'file too large to write', 0
+msg_party_fexists_type:     db 'path argument must be a string', 0
+msg_party_fdelete_notfound: db "fdelete: path doesn't exist", 0
+msg_party_path_too_long:    db 'path too long', 0
+
+; ---- Phase 4: in-language arrays (arr_new/arr_len/arr_get/arr_set/
+; arr_free) ----
+msg_party_arr_full:         db 'too many arrays open', 0
+msg_party_arr_invalid:      db 'invalid array handle', 0
+msg_party_arr_argtype:      db 'expected an array', 0
+msg_party_arr_new_args:     db 'arr_new requires an int', 0
+msg_party_arr_new_range:    db 'arr_new size out of range', 0
+msg_party_arr_index_type:   db 'array index must be an int', 0
+msg_party_arr_bounds:       db 'array index out of bounds', 0
 
 party_returning:         db 0     ; 1 while a `return` is unwinding
 ALIGN 8
@@ -3831,6 +5120,8 @@ party_while_body_tok:    dd 0     ; first body-token index of an active while
 party_scratch:   times 32 db 0    ; temp value slots used by the interpreter
 party_scratch1:  times 32 db 0
 party_scratch2:  times 32 db 0
+party_scratch3:  times 32 db 0    ; Phase 4: arr_set(a, i, v) is the first
+                                  ; builtin with 3 args, needing a 3rd slot
 
 party_ftmp_i:    dq 0             ; int/float temp for x87 loads
 party_tmp_i:     dq 0             ; int temp for float formatting

@@ -1,6 +1,6 @@
 # ShellyForever
 
-**Version:** 0.1.12
+**Version:** 0.1.13
 
 A 64-bit shell-based OS written entirely in x86-64 NASM assembly, from scratch —
 no C, no BIOS libraries beyond boot-time disk/keyboard calls, no existing kernel.
@@ -339,10 +339,14 @@ with `owrite: no such file: <path>` otherwise) and never creates one.
 ### Party: the built-in scripting language
 
 `party <file.pa>` runs a program in **Party**, a small scripting language
-with its own variables, expression evaluator, and control flow — no shell
-command access from inside a script. The full spec is in `PARTY_SPEC.md`.
-As of 0.1.11 the interpreter adds `%`, `&&`/`||`, multi-name `vars`, and
-user input to the v0.1 feature set.
+with its own variables, expression evaluator, and control flow. The full
+spec is in `PARTY_SPEC.md`. As of 0.1.11 the interpreter adds `%`, `&&`/
+`||`, multi-name `vars`, and user input to the v0.1 feature set; 0.1.13
+expands it further with `rush` (shelling out to a Rush command line from
+inside a script), `"{identifier}"` string interpolation, an in-language
+file API (`fopen`/`fread`/`fwrite`/`fclose`/`fexists`/`fdelete`), and
+fixed-size arrays (`arr_new`/`arr_len`/`arr_get`/`arr_set`/`arr_free`).
+See "Party language expansion (0.1.13)" below for details.
 
 ```
 vars a = "hi"
@@ -377,7 +381,25 @@ What's in there:
 - **Input:** `read <var>` reads one keyboard line into a declared variable
   as a string (Esc aborts the script); the read string shares a single
   buffer, so a later `read` overwrites an earlier one.
-- **Not in v0.1.11:** no arrays or collection types (see `PARTY_SPEC.md`).
+- **Shelling out:** `rush <expr>` (`<expr>` must be a string) runs one
+  Rush command line — including `;`-chains and quoted args — from inside
+  a script, e.g. `rush "mkf docs ; cf docs"`.
+- **String interpolation:** `"hello {name}"` splices an already-declared
+  variable's string form into a literal; `{{`/`}}` escape a literal
+  brace. `{<expr>}` and `{fn(...)}` aren't supported yet — identifiers
+  only.
+- **File access:** `fopen(path, "r"|"w"|"a")`, `fread(h)` (whole-file),
+  `fwrite(h, text)`, `fclose(h)`, `fexists(path)`, `fdelete(path)` give a
+  script real file I/O without shelling out to `rush`.
+- **Arrays:** `arr_new(n)` makes a fixed-size array (up to
+  `PARTY_ARR_CAP` elements, up to `PARTY_ARR_MAX` concurrently-alive
+  arrays), `arr_get`/`arr_set` index it, `arr_len` reports its size,
+  `arr_free` releases the slot. Elements are ordinary Party values,
+  including nested arrays; `display` prints an array as `[e0, e1, ...]`.
+- **Not in v0.1.14:** no `[...]`/`a[i]` bracket syntax for arrays (use
+  the `arr_*` builtins above), no growable arrays, no `{<expr>}` string
+  interpolation, no string concatenation with `+`, no server-side
+  networking (see `PARTY_SPEC.md`).
 
 `party foo.pa -tokens` dumps the raw token stream instead of executing, and
 **Esc** interrupts a running script.
@@ -400,6 +422,49 @@ API table (print/input/kill-check) as any other compiled program — see
 "Compiled programs: `run`" below — so it's a normal `prs`-visible,
 `prs kill`-able process, and a bare `foo.run` at the prompt runs it
 too, exactly like a hand-assembled `.run` file.
+
+#### Party language expansion (0.1.13)
+
+Four features landed this release, all interpreter-level (no changes
+needed to `party compile` — anything the interpreter can do, a compiled
+`.run` script can do too):
+
+- **`rush <expr>`** — shells out to one Rush command line from inside a
+  script (`<expr>` must evaluate to a string). `;`-chains and quoted
+  args work the same as typing the line at the prompt:
+  ```
+  rush "mkf backups ; cpy notes.txt backups"
+  ```
+  There's no output capture yet — a rushed command prints straight to
+  the screen, with no way to pull that text back into a Party variable.
+- **String interpolation** — `"hello {name}"` splices the string form of
+  an already-declared variable into a literal; `{{` / `}}` escape a
+  literal brace. Only bare `{identifier}` is supported — no `{<expr>}`
+  or `{fn(...)}` yet, and using an undeclared name, an empty `{}`, or an
+  unterminated `{` is a runtime error rather than a silent blank.
+- **File access** — `fopen`/`fread`/`fwrite`/`fclose`/`fexists`/
+  `fdelete` give a script real file I/O without shelling out to `rush`:
+  ```
+  vars h = fopen("notes.txt", "w")
+  fwrite(h, "hello from party")
+  fclose(h)
+  display fread(fopen("notes.txt", "r"))
+  ```
+- **Arrays** — `arr_new(n)` allocates a fixed-size array; `arr_get`/
+  `arr_set`/`arr_len`/`arr_free` round it out. Arrays are handle-based
+  (like file handles), not deep-copied, and up to 4 can be alive at
+  once, each up to 16 elements — deliberately small, since the same
+  table is duplicated per background-process context by `run -back`.
+  ```
+  vars a = arr_new(3)
+  arr_set(a, 0, "hi")
+  display a          $ [hi, 0, 0]
+  ```
+
+See `PARTY_SPEC.md` sections 8-11 for the full grammar, and the
+"Not in v0.1.14" list above for what's still deferred (bracket-syntax
+array indexing, growable arrays, `{<expr>}` interpolation, string
+concatenation, and server-side networking).
 
 ### Compiled programs: `run` and the `.run` format
 
@@ -957,6 +1022,16 @@ message and then nothing, which is your cue to power off manually.
 
 ## What's new
 
+- **Party language expansion (v0.1.13)** — four interpreter-level
+  features: `rush <expr>` shells out to a Rush command line from inside
+  a script; `"{identifier}"` string interpolation splices a variable's
+  string form into a literal; an in-language file API (`fopen`/`fread`/
+  `fwrite`/`fclose`/`fexists`/`fdelete`) gives scripts real file I/O
+  without shelling out; and fixed-size arrays (`arr_new`/`arr_get`/
+  `arr_set`/`arr_len`/`arr_free`, up to 4 alive at once, 16 elements
+  each). All four compile through `party compile` for free, with no
+  compiler changes needed. See "Party language expansion (0.1.13)"
+  above.
 - **Fixed: background scripts eating keystrokes (v0.1.12)** — a
   background process's `while` loop called `kbd_poll` on every
   iteration unconditionally, which reads and discards whatever byte is
