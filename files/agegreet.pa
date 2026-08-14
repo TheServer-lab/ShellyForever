@@ -1,0 +1,21 @@
+func greet(name) {
+    display "Hello, "
+    display name
+}
+
+vars name = ""
+vars age = 0
+
+display "What is your name?"
+read name
+
+display "How old are you?"
+read age
+
+greet(name)
+
+if (age >= 18) {
+    display "You are an adult."
+} else {
+    display "You are a minor."
+}

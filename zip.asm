@@ -26,7 +26,7 @@
 ; staging buffer while packing, the same way cmd_cat/edit do.
 ;
 ; A whole packed archive - or a whole archive being unpacked - is
-; staged in zip_buf, a single EDIT_MAX (40960-byte) buffer, mirroring
+; staged in zip_buf, a single EDIT_MAX (20480-byte) buffer, mirroring
 ; the same per-file size cap every other file operation in this OS
 ; already has (mkfl/edit/cat/take/give). A folder that packs to more
 ; than that, or a .zip bigger than that, is a clean "too big" error,

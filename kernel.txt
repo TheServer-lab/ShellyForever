@@ -27,23 +27,9 @@ ATTR_WIG        equ 0x0B          ; light cyan - used by the wig clock widget
 ; cmd_edit redraws its whole viewport from scratch on every keystroke (see
 ; cmd_edit below); the first EDIT_HEADER_ROWS screen rows are always the
 ; "-- editing <name> ... --" banner and a blank line, so the scrollable
-; body only gets EDIT_BODY_ROWS rows (see below - one short of the
-; physical remainder on purpose). Must match the number of newlines
-; msg_edit_header1+msg_edit_header2 print before file content.
+; body only gets VGA_ROWS-EDIT_HEADER_ROWS rows. Must match the number of
+; newlines msg_edit_header1+msg_edit_header2 print before file content.
 EDIT_HEADER_ROWS equ 2
-
-; The body must never be allowed to completely fill the screen's last
-; physical row (row VGA_ROWS-1): putchar has no idea it's being driven by
-; a fixed-viewport editor, so finishing that row (via an 80-col wrap or a
-; real newline) makes it advance the cursor past the bottom exactly like
-; a scrolling terminal - triggering scroll_screen mid-render. That shifts
-; everything .ce_render already drew (including the header just printed
-; moments earlier in this same call) up and off-screen, while the
-; render's own row bookkeeping (r12/r9) has no idea it happened - the
-; next call's cursor-position capture ends up stale/misplaced. Reserving
-; one unused row at the bottom keeps every row .ce_render draws strictly
-; above VGA_ROWS-1, so that transition can never happen.
-EDIT_BODY_ROWS  equ VGA_ROWS - EDIT_HEADER_ROWS - 1
 
 ; SFFS v5 removes the old chain-of-nodes content storage entirely: the
 ; node table used to hold file bytes (160 bytes per node, chained through
@@ -2163,25 +2149,13 @@ cmd_edit:
 ; than O(1), which is fine for a polled-keyboard editor. Clobbers
 ; rax/rbx/rcx/rdx/rsi/rdi/r8/r9/r11.
 .ce_render:
-    mov rcx, r13
-    call .ce_row_of                  ; rax = cursor's row number
-    mov r11, rax
-    cmp r11, r12
-    jl .cer_scroll_up
-    mov rbx, r12
-    add rbx, (EDIT_BODY_ROWS - 1)
-    cmp r11, rbx
-    jle .cer_have_top
-    mov r12, r11
-    sub r12, (EDIT_BODY_ROWS - 1)
-    jmp .cer_have_top
-.cer_scroll_up:
-    mov r12, r11
-.cer_have_top:
-    mov rcx, r12
-    call .ce_offset_of_row           ; rax = buffer offset of the top row
-    push rax
-
+    ; Print the header FIRST and measure how many screen rows it actually
+    ; took, rather than assuming EDIT_HEADER_ROWS. msg_edit_header1 +
+    ; arg1_buf + msg_edit_header2 is one unbroken line before its trailing
+    ; \n\n - a long filename/path can push that past VGA_COLS and wrap it
+    ; onto an extra row, which used to desync the body's row budget below,
+    ; overrun the screen, and trigger a scroll that shoved the cursor (and
+    ; the header itself) out from under the position we'd computed.
     call clear_screen
     mov rsi, msg_edit_header1
     mov al, ATTR_PROMPT
@@ -2191,9 +2165,38 @@ cmd_edit:
     call print_string_attr
     mov rsi, msg_edit_header2
     mov al, ATTR_PROMPT
-    call print_string_attr           ; ends in \n\n -> cursor now at row EDIT_HEADER_ROWS, col 0
+    call print_string_attr           ; ends in \n\n -> cursor now at whatever
+                                      ; row the header actually finished on
+    movzx r8, byte [cursor_row]      ; r8 = real header height in screen rows
+                                      ; (putchar/.ce_row_of/.ce_offset_of_row
+                                      ; all preserve r8, so it's safe to hold
+                                      ; this across the calls below)
 
-    pop rbx                          ; rbx = i, walks the buffer from the top-row offset
+    mov rcx, r13
+    call .ce_row_of                  ; rax = cursor's row number
+    mov r11, rax
+    cmp r11, r12
+    jl .cer_scroll_up
+    mov rbx, r12
+    mov rax, VGA_ROWS
+    sub rax, r8
+    dec rax
+    add rbx, rax
+    cmp r11, rbx
+    jle .cer_have_top
+    mov r12, r11
+    mov rax, VGA_ROWS
+    sub rax, r8
+    dec rax
+    sub r12, rax
+    jmp .cer_have_top
+.cer_scroll_up:
+    mov r12, r11
+.cer_have_top:
+    mov rcx, r12
+    call .ce_offset_of_row           ; rax = buffer offset of the top row
+    mov rbx, rax                     ; rbx = i, walks the buffer from the top-row offset
+
     mov byte [ce_cursor_captured], 0
     lea rsi, [fs_io_buf]
     xor r9, r9                       ; rows drawn so far in the body (relative to top)
@@ -2210,7 +2213,9 @@ cmd_edit:
     mov [ce_saved_col], al
     mov byte [ce_cursor_captured], 1
 .cer_no_capture:
-    cmp r9, EDIT_BODY_ROWS
+    mov rax, VGA_ROWS
+    sub rax, r8
+    cmp r9, rax
     jae .cer_done                    ; body's full - rest of the file stays off-screen
     movzx eax, byte [rsi + rbx]
     push rbx

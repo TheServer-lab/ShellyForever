@@ -1,0 +1,41 @@
+// ShellyForever Number Guessing Game
+
+vars secret = 42
+vars guess = ""
+vars number = 0
+vars attempts = 0
+vars won = false
+
+display "=============================="
+display "   ShellyForever Guess Game"
+display "=============================="
+display "I'm thinking of a number from 1 to 100."
+display "Try to guess it!"
+
+while (!won) {
+    display ""
+    display "Enter your guess:"
+    read guess
+
+    // Convert the entered text through the shell's calc.
+    // TODO: replace this once Party gets string-to-int conversion.
+    rush "calc " + guess
+
+    attempts = attempts + 1
+
+    // Temporary numeric input handling:
+    // Party's current read stores a string, so direct comparison
+    // with the numeric secret is not currently possible.
+    display "You guessed: {guess}"
+
+    if (guess == "42") {
+        won = true
+    } else {
+        display "Wrong! Try again."
+    }
+}
+
+display ""
+display "Congratulations!"
+display "You got it in {attempts} attempts!"
+display "Thanks for playing!"

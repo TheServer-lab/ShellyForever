@@ -1,6 +1,6 @@
 # ShellyForever
 
-**Version:** 0.1.14
+**Version:** 0.1.13
 
 A 64-bit shell-based OS written entirely in x86-64 NASM assembly, from scratch —
 no C, no BIOS libraries beyond boot-time disk/keyboard calls, no existing kernel.
@@ -52,13 +52,6 @@ no C, no BIOS libraries beyond boot-time disk/keyboard calls, no existing kernel
     and recreates the default `/sys` files, for when a system's state
     is badly wrong and you want a clean slate. See "Factory reset:
     `sys reset`" below.
-  - A native program and software installer: `.sin` packages (stored-
-    mode ZIPs containing a `whattodo.inst` script and a `files/`
-    folder), `install`/`uninstall` to apply and remove them, a program
-    registry (`/home/sys/programs.sly`) so an installed program can be
-    launched just by typing its id, and `mksin` to build a `.sin`
-    package from a prepared folder without leaving the OS. See
-    "Installing programs: `.sin` packages" below and `INST_SPEC.md`.
 
 ## Commands implemented
 
@@ -120,12 +113,6 @@ no C, no BIOS libraries beyond boot-time disk/keyboard calls, no existing kernel
 | `take` | `take http://10.0.2.2:8000/notes.txt notes.txt` | HTTP GET a file from a server, save to local file |
 | `give` | `give http://10.0.2.2:8000/upload notes.txt` | HTTP POST a local file to a server endpoint |
 | `browse` | `browse http://10.0.2.2:8000/` | fetch a page over HTTP, strip HTML to text, follow `[N]` links, back/forward/bookmarks (see below) |
-| `pack` | `pack docs` | zip a folder into `docs.zip` (stored/uncompressed) in the current folder |
-| `unpack` | `unpack docs.zip` | extract a stored-mode `.zip` file into the current folder |
-| `install` | `install calculator.sin` | install a `.sin` package: run its `whattodo.inst`, copy files, register the program (see below) |
-| `uninstall` | `uninstall calculator` | remove a program previously installed under that id (see below) |
-| `mksin` | `mksin calculator` | build `calculator.sin` from a folder holding `whattodo.inst` + `files/` (see below) |
-| `<program-id>` | `calculator` | launch an installed program by its registered id, same as typing its `.run` path |
 
 ### Line editing: history, tab completion, cursor movement, and scrollback
 
@@ -299,87 +286,6 @@ What it does:
 This is destructive and cannot be undone — there's no `-force`-style
 confirmation beyond the `auth` gate itself, same as `sdown`/`rboot`/`del`.
 
-### Installing programs: `.sin` packages
-
-ShellyForever has a native software installer, built entirely on top of
-the existing filesystem and `pack`/`unpack` ZIP support — no external
-tooling required.
-
-A **`.sin`** package is just a stored-mode (uncompressed) `.zip` archive
-with a fixed shape:
-
-```
-calculator.sin
-    |
-    +-- whattodo.inst      <- the install script
-    |
-    +-- files/             <- what gets copied onto the target machine
-         +-- calculator.run
-         +-- README.txt
-```
-
-**`whattodo.inst`** is a small, deliberately restricted instruction
-language — not a general scripting language. It has no variables, no
-loops, no shell access; every install script is built from six
-keywords:
-
-```
-name "Program Name"                          informational
-version "1.0"                                informational
-mkdir "/absolute/path"                       create a folder
-copy "pkg-relative-file" "/absolute/dest"    copy a file out of files/
-delete "/absolute/path"                      remove one file (never a folder)
-program "id" "/absolute/path-to/executable"  register the program
-finish                                       end of script
-```
-
-Unknown instructions are rejected outright — the installer never hands
-anything off to Rush or executes arbitrary code. See `INST_SPEC.md` for
-the full tutorial and reference.
-
-**Installing and removing:**
-
-```
-rush>/home: install calculator.sin
-install: installing calculator.sin
-install: package: Example Calculator
-install: installed calculator.sin
-rush>/home: calculator
-```
-
-Installing runs the package's script (creating folders, copying files)
-and registers the program's id in `/home/sys/programs.sly`, so from then
-on typing that id at the prompt launches it directly — no separate `run`
-command needed.
-
-```
-rush>/home: uninstall calculator
-uninstall: removed calculator
-```
-
-`uninstall <id>` removes the one file recorded as that program's entry
-point plus its registry entry. It does not track every file a `copy`
-instruction wrote during install, so other files the package placed are
-left behind on purpose — deleting files with no record of them would
-risk removing something unrelated.
-
-**Building a package with `mksin`:**
-
-```
-mkf calculator
-mkf calculator/files
-mkfl calculator/whattodo.inst "name \"Example Calculator\" ..."
-cpy calculator.run calculator/files/calculator.run
-mksin calculator
-```
-
-`mksin <folder>` checks the folder has both `whattodo.inst` and
-`files/`, validates every line of the script (known instruction,
-required arguments, absolute destination paths, and that every `copy`
-source actually exists under `files/` — reporting the line number of
-any problem), and only then zips it — reusing `pack`'s own archive
-writer — into `<folder>.sin`, ready for `install`.
-
 ### Flags: `-force`, `-silent`, `-info`, `-test`
 
 `mkfl` supports four flags (passed as extra arguments after the content):
@@ -490,7 +396,7 @@ What's in there:
   arrays), `arr_get`/`arr_set` index it, `arr_len` reports its size,
   `arr_free` releases the slot. Elements are ordinary Party values,
   including nested arrays; `display` prints an array as `[e0, e1, ...]`.
-- **Not in v0.1.15:** no `[...]`/`a[i]` bracket syntax for arrays (use
+- **Not in v0.1.14:** no `[...]`/`a[i]` bracket syntax for arrays (use
   the `arr_*` builtins above), no growable arrays, no `{<expr>}` string
   interpolation, no string concatenation with `+`, no server-side
   networking (see `PARTY_SPEC.md`).
@@ -556,7 +462,7 @@ needed to `party compile` — anything the interpreter can do, a compiled
   ```
 
 See `PARTY_SPEC.md` sections 8-11 for the full grammar, and the
-"Not in v0.1.15" list above for what's still deferred (bracket-syntax
+"Not in v0.1.14" list above for what's still deferred (bracket-syntax
 array indexing, growable arrays, `{<expr>}` interpolation, string
 concatenation, and server-side networking).
 
@@ -1116,22 +1022,6 @@ message and then nothing, which is your cue to power off manually.
 
 ## What's new
 
-- **Native software installer (v0.1.14)** — `install <file.sin>` and
-  `uninstall <id>` bring a program/package system to ShellyForever, on
-  top of the existing `pack`/`unpack` ZIP support: a `.sin` package is
-  a stored-mode `.zip` containing `whattodo.inst` (a small, restricted
-  install-script language — `name`/`version`/`mkdir`/`copy`/`delete`/
-  `program`/`finish`, no shell access, no arbitrary code) and a
-  `files/` folder. Installing runs the script, copies files, and
-  registers the program's id in a new `/home/sys/programs.sly`
-  registry, so a bare `<id>` at the prompt launches it afterward — the
-  same fallback path a bare `name.run` already used. `mksin <folder>`
-  builds a `.sin` from a prepared folder entirely inside the OS,
-  validating `whattodo.inst` line-by-line (unknown instructions,
-  missing arguments, non-absolute destinations, and missing `copy`
-  sources are all caught before anything is written) and reusing
-  `pack`'s own archive writer rather than a new one. See "Installing
-  programs: `.sin` packages" above and the new `INST_SPEC.md`.
 - **Party language expansion (v0.1.13)** — four interpreter-level
   features: `rush <expr>` shells out to a Rush command line from inside
   a script; `"{identifier}"` string interpolation splices a variable's

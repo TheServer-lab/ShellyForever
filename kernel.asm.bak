@@ -27,23 +27,9 @@ ATTR_WIG        equ 0x0B          ; light cyan - used by the wig clock widget
 ; cmd_edit redraws its whole viewport from scratch on every keystroke (see
 ; cmd_edit below); the first EDIT_HEADER_ROWS screen rows are always the
 ; "-- editing <name> ... --" banner and a blank line, so the scrollable
-; body only gets EDIT_BODY_ROWS rows (see below - one short of the
-; physical remainder on purpose). Must match the number of newlines
-; msg_edit_header1+msg_edit_header2 print before file content.
+; body only gets VGA_ROWS-EDIT_HEADER_ROWS rows. Must match the number of
+; newlines msg_edit_header1+msg_edit_header2 print before file content.
 EDIT_HEADER_ROWS equ 2
-
-; The body must never be allowed to completely fill the screen's last
-; physical row (row VGA_ROWS-1): putchar has no idea it's being driven by
-; a fixed-viewport editor, so finishing that row (via an 80-col wrap or a
-; real newline) makes it advance the cursor past the bottom exactly like
-; a scrolling terminal - triggering scroll_screen mid-render. That shifts
-; everything .ce_render already drew (including the header just printed
-; moments earlier in this same call) up and off-screen, while the
-; render's own row bookkeeping (r12/r9) has no idea it happened - the
-; next call's cursor-position capture ends up stale/misplaced. Reserving
-; one unused row at the bottom keeps every row .ce_render draws strictly
-; above VGA_ROWS-1, so that transition can never happen.
-EDIT_BODY_ROWS  equ VGA_ROWS - EDIT_HEADER_ROWS - 1
 
 ; SFFS v5 removes the old chain-of-nodes content storage entirely: the
 ; node table used to hold file bytes (160 bytes per node, chained through
@@ -2169,11 +2155,11 @@ cmd_edit:
     cmp r11, r12
     jl .cer_scroll_up
     mov rbx, r12
-    add rbx, (EDIT_BODY_ROWS - 1)
+    add rbx, (VGA_ROWS - EDIT_HEADER_ROWS - 1)
     cmp r11, rbx
     jle .cer_have_top
     mov r12, r11
-    sub r12, (EDIT_BODY_ROWS - 1)
+    sub r12, (VGA_ROWS - EDIT_HEADER_ROWS - 1)
     jmp .cer_have_top
 .cer_scroll_up:
     mov r12, r11
@@ -2210,7 +2196,7 @@ cmd_edit:
     mov [ce_saved_col], al
     mov byte [ce_cursor_captured], 1
 .cer_no_capture:
-    cmp r9, EDIT_BODY_ROWS
+    cmp r9, (VGA_ROWS - EDIT_HEADER_ROWS)
     jae .cer_done                    ; body's full - rest of the file stays off-screen
     movzx eax, byte [rsi + rbx]
     push rbx
