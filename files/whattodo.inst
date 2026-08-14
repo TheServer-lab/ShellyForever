@@ -1,0 +1,5 @@
+name "Number Guessing Game"
+mkdir "/home/programs/guess"
+copy "guess.run" "/home/programs/guess/guess.run"
+program "guess" "/home/programs/guess/guess.run"
+finish

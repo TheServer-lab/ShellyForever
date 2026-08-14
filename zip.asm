@@ -216,7 +216,16 @@ zip_walk_folder:
     movzx rax, word [node_parent + r12*2]
     cmp rax, r14
     jne .next
-    mov dword [zip_path_len], r13d   ; restore prefix before this child
+    mov dword [zip_path_len], r13d   ; restore prefix before this child - also
+    mov ecx, r13d                    ; truncate zip_path_buf itself right here:
+    mov byte [zip_path_buf + rcx], 0 ; zip_add_entry reads zip_path_buf as a
+                                      ; NUL-terminated string via str_copy, not
+                                      ; via zip_path_len, so if a PRIOR sibling
+                                      ; was a subfolder, its pushed "name/" is
+                                      ; still sitting in the buffer past this
+                                      ; point unless we NUL it here - otherwise
+                                      ; it leaks into this (shorter-prefix)
+                                      ; sibling's entry name
     cmp byte [node_type + r12], 2
     je .handle_file
     mov rax, r12
@@ -238,6 +247,8 @@ zip_walk_folder:
     jmp .loop
 .done_ok:
     mov dword [zip_path_len], r13d
+    mov ecx, r13d
+    mov byte [zip_path_buf + rcx], 0
     xor al, al
     jmp .out
 .fail:
