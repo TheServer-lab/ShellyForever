@@ -25,10 +25,14 @@ http_parse_url:
     push rdi
     push rsi
     mov word [http_port], HTTP_DEFAULT_PORT
+    mov byte [http_url_scheme], 0
     lea rdi, [http_path_buf]
     mov byte [rdi], '/'
     mov byte [rdi+1], 0
-    ; verify "http://"
+    ; verify scheme: accept "http://" (scheme 0, default port 80) or
+    ; "https://" (scheme 1, default port 443). "http://" is a leading
+    ; substring of "https://", so check the first 4 bytes ("http") once,
+    ; then branch on whether an 's' follows.
     cmp byte [rsi], 'h'
     jne .bad
     cmp byte [rsi+1], 't'
@@ -37,6 +41,19 @@ http_parse_url:
     jne .bad
     cmp byte [rsi+3], 'p'
     jne .bad
+    cmp byte [rsi+4], 's'
+    jne .try_http
+    cmp byte [rsi+5], ':'
+    jne .bad
+    cmp byte [rsi+6], '/'
+    jne .bad
+    cmp byte [rsi+7], '/'
+    jne .bad
+    mov byte [http_url_scheme], 1
+    mov word [http_port], 443
+    add rsi, 8
+    jmp .scheme_done
+.try_http:
     cmp byte [rsi+4], ':'
     jne .bad
     cmp byte [rsi+5], '/'
@@ -44,6 +61,7 @@ http_parse_url:
     cmp byte [rsi+6], '/'
     jne .bad
     add rsi, 7
+.scheme_done:
     ; extract hostname (up to ':', '/', '#', '?', or NUL)
     lea rdi, [http_host_buf]
     xor ecx, ecx
@@ -292,7 +310,18 @@ http_build_post:
     mov byte [rdi], 13
     mov byte [rdi+1], 10
     add rdi, 2
-    ; body
+    ; body - bounds-check BEFORE copying, so a large file can never overrun
+    ; http_tx_big (sized HTTP_TX_MAX) and never gets silently truncated
+    ; while the Content-Length header above still claims the full size.
+    ; header_len = bytes already written (everything up to and including
+    ; the blank line that ends the headers).
+    lea rax, [http_tx_big]
+    mov rbx, rdi
+    sub rbx, rax                ; rbx = header_len
+    add rbx, r13                ; rbx = header_len + body_len = total request size
+    cmp rbx, HTTP_TX_MAX
+    jae .bp_too_big
+
     test r13, r13
     jz .bp_nobody
     mov rsi, r12
@@ -307,17 +336,22 @@ http_build_post:
 .bp_nobody:
     lea rax, [http_tx_big]
     sub rdi, rax
-    ; copy to tcp_tx_buf (cap at 1024)
-    cmp rdi, 1024
-    jbe .bp_fit
-    mov rdi, 1024
-.bp_fit:
     mov [tcp_tx_len], edi
     lea rsi, [http_tx_big]
     lea rdi, [tcp_tx_buf]
     mov ecx, [tcp_tx_len]
     rep movsb
     mov eax, [tcp_tx_len]
+    clc
+    pop r13
+    pop r12
+    pop rsi
+    pop rdi
+    pop rbx
+    ret
+.bp_too_big:
+    mov dword [tcp_tx_len], 0
+    stc
     pop r13
     pop r12
     pop rsi
@@ -441,8 +475,12 @@ tcp_do_exchange:
     cmp byte [kill_flag], 0
     jne .de_cancel
     call netpoll
-    cmp byte [tcp_rx_got], 0
-    jne .de_reply
+    cmp byte [tcp_fin_got], 0
+    jne .de_reply                ; peer closed its side - the full response has
+                                  ; landed. (tcp_rx_got only means the FIRST
+                                  ; byte of payload has arrived, not all of it -
+                                  ; bailing out on that alone truncates any
+                                  ; reply bigger than a single TCP segment)
     cmp byte [tcp_rst_got], 0
     jne .de_reset
     call rtc_sec_now
@@ -624,6 +662,8 @@ cmd_take:
     lea rsi, [arg1_buf]
     call http_parse_url
     jc .bad_url
+    cmp byte [http_url_scheme], 1
+    je .bad_url                ; https:// -- use "stake" instead
 
     call http_build_get
     mov [tcp_tx_len], eax
@@ -785,6 +825,8 @@ cmd_give:
     lea rsi, [arg1_buf]
     call http_parse_url
     jc .bad_url
+    cmp byte [http_url_scheme], 1
+    je .bad_url                ; https:// -- use "sgive" instead
 
     ; resolve file and read its content
     mov rax, [cur_dir]
@@ -831,6 +873,7 @@ cmd_give:
     lea rsi, [http_rx_buf]
     mov rcx, r13
     call http_build_post
+    jc .too_big_to_send
 
     mov rsi, msg_give_posting
     call print_string
@@ -870,6 +913,12 @@ cmd_give:
 
 .nofile:
     mov rsi, msg_give_nofile
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+
+.too_big_to_send:
+    mov rsi, msg_give_too_big
     mov al, ATTR_ERROR
     call print_string_attr
     ret

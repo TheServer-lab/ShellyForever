@@ -2,15 +2,29 @@
 ;  ShellyForever  --  boot.asm
 ;  Stage-1 bootloader (fits in one 512-byte sector).
 ;  1) Loaded by BIOS at 0x7C00 in 16-bit real mode.
-;  2) Loads the kernel (kernel.bin) from disk sectors 2..N into
-;     memory at 0x8000 using BIOS INT 13h.
-;  3) Enables A20, builds a temporary GDT, enters 32-bit
-;     protected mode.
-;  4) Builds minimal page tables (identity-maps first 2MB using
-;     a single 2MB page), enables PAE + long mode + paging.
-;  5) Far-jumps into 64-bit long mode straight into the kernel
-;     entry point at 0x8000.
+;  2) Loads stage2.bin (splash + relocator + mode-transition code - see
+;     stage2.asm) from disk sectors STAGE2_LBA..STAGE2_LBA+STAGE2_SECTORS-1
+;     into memory at 0x8000 using BIOS INT 13h.
+;
+;  *** CHANGED (relocating loader rewrite): this file used to load the
+;  WHOLE kernel here, flat, capped at a hard ~1216-sector ceiling because
+;  conventional memory tops out at 0x9FFFF just above this load address
+;  (0xA0000 is the VGA framebuffer window, not RAM - BIOS INT 13h will
+;  "read" sectors past that boundary but real hardware silently drops
+;  them instead of storing them). That ceiling is gone: this file now
+;  only loads stage2, which is tiny (splash + loader code, not the whole
+;  OS), and stage2 itself loads and relocates the real kernel body above
+;  1MB in chunks (see stage2.asm's relocate_kernel_body) where there is
+;  no such ceiling. See layout.inc for the disk-layout constants shared
+;  by all three stages so they can't drift out of sync again.
+;
+;  3) Far-jumps into stage2 at 0000:8000, STILL IN REAL MODE. Everything
+;     past this point - A20, GDT, protected/long mode, page tables - now
+;     lives in stage2.asm (moved there originally so the splash could run
+;     first with BIOS still available; unchanged by this rewrite).
 ; ============================================================
+
+%include "layout.inc"
 
 BITS 16
 ORG 0x7C00
@@ -22,60 +36,16 @@ ORG 0x7C00
 ; no return address on the stack yet, jumping to garbage.
 jmp start
 
-KERNEL_LOAD_SEG   equ 0x0000
-KERNEL_LOAD_OFF   equ 0x8000
-KERNEL_SECTORS    equ 1200        ; how many 512B sectors to load. The background-process
-                                  ; scheduler added the per-slot proc_bg_* arrays (ctx
-                                  ; 20226B + src 16KB + stack 8KB + ring 4KB each, x4
-                                  ; slots), which took kernel.bin from ~970 sectors to
-                                  ; ~1373 sectors before MAX_PROCESSES was trimmed 4->2
-                                  ; (see kernel.asm), bringing it back down to ~1180.
-                                  ;
-                                  ; *** HARD CEILING, NOT JUST A HEADROOM NUMBER ***
-                                  ; The kernel is loaded flat at 0x8000 in real mode, and
-                                  ; conventional memory ends at 0x9FFFF - 0xA0000 is the VGA
-                                  ; framebuffer window, not RAM, and 0xC0000+ is typically
-                                  ; the video BIOS ROM shadow. That puts a hard limit of
-                                  ; (0xA0000 - 0x8000) / 512 = 1216 sectors on this constant
-                                  ; no matter how large KERNEL_SECTORS is set: BIOS INT 13h
-                                  ; will happily "read" sectors past that boundary, but real
-                                  ; hardware will not store them as normal RAM - they land on
-                                  ; the video card/ROM instead and are silently lost. This
-                                  ; previously bit us (via 1500, which was fine for the ~1180
-                                  ; actual sectors but would have quietly eaten a future
-                                  ; kernel.bin that regrew past ~1216, exactly like the
-                                  ; ata_port_base/ata_drive_sel/fs_disk_available truncation
-                                  ; that motivated the old headroom bumps - see git history).
-                                  ; 1200 leaves ~20 sectors of headroom above the current
-                                  ; ~1180-sector build while staying under the 1216 ceiling.
-                                  ; If the kernel needs to grow past ~1216 sectors, bumping
-                                  ; this constant further is NOT safe - the kernel needs to
-                                  ; be loaded somewhere other than conventional memory (e.g.
-                                  ; a relocation copy after entering protected mode, or an
-                                  ; unreal-mode/big-real-mode load straight to an
-                                  ; above-1MB buffer) instead.
-                                  ;
-                                  ; The CHS fallback reads at most 18
-                                  ; sectors per BIOS call (not limited by al directly - see
-                                  ; the .loop chunking below) and this total must stay clear
-                                  ; of the SFFS region - see kernel.asm's FS_LBA_START (now
-                                  ; 1560 to match), and leave real margin, not just enough
-                                  ; for today's build - and <= 2880 (media). If
-                                  ; KERNEL_SECTORS is ever bumped again, bump FS_LBA_START in
-                                  ; kernel.asm to match - the two are not shared constants,
-                                  ; so nothing else will catch a drift between them.
-
 ; ---- on-screen checkpoint markers ----
-; Each stage of the real->protected->long mode transition writes one
-; character to a fixed row near the top of the screen, in column order.
-; If boot hangs on real hardware, whichever checkpoint is the last one
-; visible tells us exactly which stage failed, instead of guessing blind.
-; Row 24 (bottom row) is used so it never collides with the boot messages.
-; Implemented as one shared subroutine (not a macro) so the call sites
-; don't each pay for their own copy of the setup code - every byte
-; matters in a 512-byte sector. Registers are intentionally left clobbered
-; (no push/pop): every call site reloads ax/bx/dx itself before relying on
-; them again.
+; Each stage of the boot process writes one character to a fixed row near
+; the top of the screen, in column order. If boot hangs on real hardware,
+; whichever checkpoint is the last one visible tells us exactly which
+; stage failed, instead of guessing blind. Row 24 (bottom row) is used so
+; it never collides with the boot messages. Implemented as one shared
+; subroutine (not a macro) so the call sites don't each pay for their own
+; copy of the setup code - every byte matters in a 512-byte sector.
+; Registers are intentionally left clobbered (no push/pop): every call
+; site reloads ax/bx/dx itself before relying on them again.
 ; in: bx = byte offset into VGA memory (row*80+col)*2, dl = char to show
 dbg16:
     mov ax, 0xB800
@@ -103,18 +73,18 @@ start:
     mov dl, '1'
     call dbg16
 
-    ; ---- load kernel from disk ----
-    ; The kernel is ~117 sectors (160 with headroom) - more than a floppy
-    ; track (18) and more than some BIOSes accept in one INT 13h call, so a
-    ; single-shot read fails with 'E' right after checkpoint '1' (that's the
+    ; ---- load stage2 from disk ----
+    ; stage2 is small but still usually more than a floppy track (18
+    ; sectors) and more than some BIOSes accept in one INT 13h call, so a
+    ; single-shot read can fail with 'E' right after checkpoint '1' (the
     ; "1E" screen). Fix: check for INT 13h extensions (AH=41h) and use the
-    ; LBA extended read when present; otherwise fall back to CHS. Either way
-    ; read in chunks and advance the buffer. One shared loop does both: the
-    ; read_mode byte picks LBA vs CHS, and the CHS path starts at LBA 0 so
-    ; the boot-sector copy lands harmlessly at 0x7E00 and the kernel still
-    ; begins at 0x8000.
+    ; LBA extended read when present; otherwise fall back to CHS. Either
+    ; way, read in chunks and advance the buffer. One shared loop does
+    ; both: the read_mode byte picks LBA vs CHS, and the CHS path starts
+    ; at LBA 0 so the boot-sector copy lands harmlessly at 0x7E00 and
+    ; stage2 still begins at 0x8000.
     xor di, di                  ; di = sectors read so far
-    mov dword [read_lin], 0x8000
+    mov dword [read_lin], STAGE2_LOAD_OFF
     mov ah, 0x41
     mov bx, 0x55AA
     mov dl, [boot_drive]
@@ -126,12 +96,12 @@ start:
     jmp .loop
 .chs:
     mov byte [read_mode], 0x02  ; CHS read
-    mov word [read_lin], 0x7E00 ; boot-sector copy lands here, kernel at 0x8000
+    mov word [read_lin], 0x7E00 ; boot-sector copy lands here, stage2 at 0x8000
     mov ch, 0                   ; cylinder
     mov dh, 0                   ; head
     mov cl, 1                   ; start at sector 1 of track 0
 .loop:
-    mov ax, KERNEL_SECTORS
+    mov ax, STAGE2_SECTORS
     sub ax, di
     jz read_done                ; everything loaded
     cmp byte [read_mode], 0x02
@@ -159,7 +129,7 @@ start:
     jmp .advance
 .ext_issue:
     mov ax, di
-    inc ax                      ; lba = 1 + sectors_done (fits 16 bits)
+    add ax, STAGE2_LBA          ; lba = STAGE2_LBA + sectors_done so far
     mov [dap_lba], ax
     mov si, dap
     mov dl, [boot_drive]
@@ -182,22 +152,21 @@ start:
     jmp .loop
 
 read_done:
-    mov bx, 2                   ; checkpoint 2: kernel sectors read OK (col 1)
+    mov bx, 2                   ; checkpoint 2: stage2 sectors read OK (col 1)
     mov dl, '2'
     call dbg16
 
-    ; ---- hand off to kernel.bin, STILL IN REAL MODE ----
-    ; kernel.bin now opens with its own small 16-bit stub (see kernel.asm's
-    ; splash_stub) that shows the boot splash (mode 13h) while BIOS INT 10h/
-    ; INT 16h are still available, then does the A20/GDT/protected-mode/
-    ; long-mode transition itself and finally jumps into kernel_entry. That
-    ; transition code used to live here in boot.asm; it moved to kernel.asm
-    ; so the splash can run before it, and so this sector - already tight -
-    ; doesn't have to grow to fit "set mode 13h, load palette, blit image,
-    ; wait for key, restore text mode" as well as the transition.
+    ; ---- hand off to stage2.bin, STILL IN REAL MODE ----
+    ; dbg16 clobbers dl (it's the char being printed), so restore dl to the
+    ; real boot drive number here - stage2 captures dl into its own
+    ; boot_drive at the top of splash_stub and relies on it for every disk
+    ; read it does later (relocate_kernel_body). Without this, stage2 would
+    ; inherit dl = '2' (0x32) instead of the actual drive number.
+    mov dl, [boot_drive]
+
     ; A far jump (not a near jump) so cs:ip is set explicitly to 0000:8000,
-    ; matching KERNEL_LOAD_SEG:KERNEL_LOAD_OFF exactly.
-    jmp KERNEL_LOAD_SEG:KERNEL_LOAD_OFF
+    ; matching STAGE2_LOAD_SEG:STAGE2_LOAD_OFF exactly.
+    jmp STAGE2_LOAD_SEG:STAGE2_LOAD_OFF
 
 disk_error:
     mov bx, 2                   ; 'E' at col 1 (same spot '2' would use): a real
@@ -209,28 +178,28 @@ disk_error:
 
 boot_drive: db 0
 read_mode: db 0                 ; 0x42 = LBA read, 0x02 = CHS read
-read_lin: dd 0x8000              ; linear address of the next free kernel buffer byte
+read_lin: dd STAGE2_LOAD_OFF     ; linear address of the next free stage2 buffer byte
 
 ; ---- Disk Address Packet for INT 13h AH=42h (LBA extended read) ----
-; Kernel starts right after the boot sector: MBR is LBA 0, so the kernel's
-; first sector is LBA 1 (equivalent to the old CHS "cylinder 0, head 0,
+; stage2 starts right after the boot sector: MBR is LBA 0, so its first
+; sector is LBA STAGE2_LBA (equivalent to the old CHS "cylinder 0, head 0,
 ; sector 2"). count/off/seg/lba are updated by the chunked reader.
 ALIGN 4
 dap:
     db 0x10                      ; packet size (16 bytes)
     db 0                         ; reserved
 dap_count:
-    dw KERNEL_SECTORS            ; number of sectors to transfer
+    dw STAGE2_SECTORS            ; number of sectors to transfer
 dap_off:
-    dw KERNEL_LOAD_OFF           ; transfer buffer offset
+    dw STAGE2_LOAD_OFF           ; transfer buffer offset
 dap_seg:
-    dw KERNEL_LOAD_SEG           ; transfer buffer segment
+    dw STAGE2_LOAD_SEG           ; transfer buffer segment
 dap_lba:
-    dq 1                         ; starting LBA (sector right after MBR)
+    dq STAGE2_LBA                ; starting LBA (sector right after MBR)
 
 ; ---- turn the 32-bit linear buffer pointer (read_lin) into a 16-bit
-; real-mode seg:off pair, since the kernel buffer grows past the 64K
-; segment boundary when reading 160 sectors ----
+; real-mode seg:off pair, since the stage2 buffer can in principle grow
+; past the 64K segment boundary ----
 dap_set_buf:
     mov eax, [read_lin]
     mov edx, eax

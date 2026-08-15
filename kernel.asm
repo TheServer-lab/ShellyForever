@@ -1,20 +1,32 @@
 ; ============================================================
 ;  ShellyForever  --  kernel.asm
-;  Loaded flat at physical address 0x8000 by boot.asm. boot.asm hands off
-;  here WHILE STILL IN REAL MODE (see splash_stub right below) so BIOS
-;  video/keyboard calls are still available for a boot splash; splash_stub
-;  then does the A20/GDT/protected-mode/long-mode transition itself (moved
-;  here from boot.asm - see boot.asm's read_done for why) and falls into
-;  kernel_entry, which is where actual 64-bit long-mode execution used to
-;  begin directly. No IDT/interrupts are set up - keyboard is polled.
+;  *** RELOCATED ABOVE 1MB (relocating loader rewrite) ***
+;  This used to be loaded flat at physical 0x8000 (conventional memory)
+;  together with splash.asm's %include, which is what capped the whole
+;  OS at ~1216 sectors (base RAM tops out at 0x9FFFF; 0xA0000 is the VGA
+;  framebuffer window, not RAM - see the old boot.asm/FS_LBA_START
+;  comments in git history). That's gone: this file is now a SEPARATE
+;  top-level build (kernel_body.bin) loaded at KERNEL_HIGH_BASE (2MB, see
+;  layout.inc), with essentially no ceiling below the 4GB identity map
+;  expand_identity_map builds a few instructions into kernel_entry.
+;
+;  boot.asm loads stage2.bin (splash + relocator + mode transition - see
+;  stage2.asm, formerly this file's splash.asm %include) to 0x8000 in
+;  real mode. stage2.asm's relocate_kernel_body then reads THIS binary
+;  off disk in chunks and moves it up to KERNEL_HIGH_BASE via BIOS
+;  INT 15h/AH=87h, still in real mode, before ever entering protected/
+;  long mode. Once that's done, stage2 does A20/GDT/paging/long-mode and
+;  jumps straight to KERNEL_HIGH_BASE, which is kernel_entry below - it's
+;  the very first thing after the ORG/equ block (nothing but equ
+;  constants, which emit no bytes, precedes it), so KERNEL_HIGH_BASE and
+;  kernel_entry's address are always identical by construction. No IDT/
+;  interrupts are set up - keyboard is polled.
 ; ============================================================
 
-BITS 64
-ORG 0x8000
-
-%include "splash.asm"
+%include "layout.inc"
 
 BITS 64
+ORG KERNEL_HIGH_BASE
 ; ---------------- constants ----------------
 VGA_BASE        equ 0xB8000
 VGA_COLS        equ 80
@@ -132,23 +144,22 @@ PIPE_CAP_MAX    equ 192       ; max bytes captured from a "~" pipe's left side
 ;  dscan probes all device slots for the magic, format writes a fresh
 ;  empty volume + label, and mount loads a volume's node table + bitmap
 ;  into memory (remapping its parent indices) rooted at /<label>/.
-;  The kernel occupies LBA 1..1500 (KERNEL_SECTORS in boot.asm; the real
-;  kernel.bin is ~1180 sectors, so 1500 leaves some slack). HARD CEILING:
-;  the image is loaded flat at 0x8000 and base RAM tops out at 0x9FFFF
-;  (0xA0000 is the VGA adapter window - not RAM - so anything past that
-;  boundary is silently lost). Keep kernel.bin under 0x98000 bytes. The
-;  filesystem region must start clear of KERNEL_SECTORS, so it starts at
-;  LBA 1560. v5 needs ~36 sectors of metadata per volume (was ~100) -
-;  tiny - and the data area spans the rest of the disk.
+;  The kernel now occupies LBA STAGE2_LBA..FS_LBA_START-1 (stage2.bin +
+;  kernel_body.bin, see layout.inc) - relocated above 1MB by
+;  relocate_kernel_body, so there is no more hard ceiling tied to
+;  0x8000/0xA0000 the way there used to be (see this file's header
+;  comment). FS_LBA_START is derived from KERNEL_BODY_SECTORS in
+;  layout.inc, not hand-copied here, so it can't silently drift out of
+;  sync with the kernel's actual on-disk footprint the way it used to.
+;  v5 needs ~36 sectors of metadata per volume (was ~100) - tiny - and
+;  the data area spans the rest of the disk.
 ; ------------------------------------------------------------------
-FS_LBA_START    equ 1560            ; bumped from 1150 - the background-process arrays
-                                    ; once grew kernel.bin to ~1373 sectors, so boot.asm's
-                                    ; KERNEL_SECTORS went 1100 -> 1500 and the filesystem
-                                    ; must start past LBA 1500. *** BREAKING CHANGE: any
-                                    ; image with a filesystem already written at the old
-                                    ; FS_LBA_START=1150 needs to be reformatted (dscan/fmt)
-                                    ; after this change, or that data is effectively at the
-                                    ; wrong LBA and won't be found. ***
+; FS_LBA_START now comes from layout.inc (KERNEL_BODY_LBA + KERNEL_BODY_SECTORS
+; + slack) so boot.asm/stage2.asm/kernel.asm can never disagree about where
+; the kernel ends and the filesystem begins. *** BREAKING CHANGE (unchanged
+; from before this rewrite): any image with a filesystem already written at
+; an old FS_LBA_START needs to be reformatted (dscan/fmt) after updating,
+; or that data is effectively at the wrong LBA and won't be found. ***
 SFFS_VERSION    equ 5               ; current on-disk format (cluster-based file storage)
 SUPER_LABEL_OFF equ 8               ; label lives at superblock offset 8..39
 SUPER_LBA       equ FS_LBA_START
@@ -192,12 +203,16 @@ kernel_entry:
     call serial_init
 
 
-    ; --- TEMPORARY diagnostic checkpoint A: proves boot.asm's real-mode ->
+    ; --- TEMPORARY diagnostic checkpoint A: proves stage2's real-mode ->
     ; protected-mode -> long-mode transition landed here at all, before
     ; expand_identity_map or ahci_init get a chance to run/crash. If you
-    ; only ever see "12" and never "A", the failure is inside boot.asm's
-    ; mode-switch code (A20/GDT/paging/long-mode jump), not in the kernel.
-    mov rdi, 0xB8000 + (24*80 + 6) * 2
+    ; only ever see up through "7" (stage2's last checkpoint) and never
+    ; "A", the failure is inside stage2's mode-switch code (A20/GDT/
+    ; paging/long-mode jump/relocation) or in the jump to KERNEL_HIGH_BASE,
+    ; not in the kernel body itself. Column shifted to 7 (was 6, pre-
+    ; relocation-rewrite) since stage2 now uses one more checkpoint column
+    ; for relocate_kernel_body - see stage2.asm.
+    mov rdi, 0xB8000 + (24*80 + 7) * 2
     mov byte [rdi], 'A'
     mov byte [rdi+1], 0x1F
 
@@ -211,7 +226,7 @@ kernel_entry:
     ; --- TEMPORARY diagnostic checkpoint X: expand_identity_map returned
     ; without crashing/hanging. If "A" shows but "X" doesn't, the 4GB
     ; identity-map rebuild is where things go wrong on this hardware.
-    mov rdi, 0xB8000 + (24*80 + 7) * 2
+    mov rdi, 0xB8000 + (24*80 + 8) * 2
     mov byte [rdi], 'X'
     mov byte [rdi+1], 0x1F
 
@@ -230,11 +245,12 @@ kernel_entry:
     ; QEMU can capture the whole session to a file via -serial file:.
     call serial_init
 
-    ; checkpoint 9: kernel code is executing (proves boot.asm's jump into
-    ; 0x8000 landed correctly). Matches the DBG16/32/64 checkpoints in
-    ; boot.asm - if you see 1..8 but not this, the kernel wasn't loaded/
-    ; jumped to correctly; if the OS otherwise looks fine you can ignore it.
-    mov rdi, 0xB8000 + (24*80 + 8) * 2
+    ; checkpoint K: kernel code is executing (proves stage2's jump to
+    ; KERNEL_HIGH_BASE landed correctly). Matches the DBG16/dbg_local
+    ; checkpoints in boot.asm/stage2.asm - if you see 1..7,A,X but not
+    ; this, something is wrong between expand_identity_map and here; if
+    ; the OS otherwise looks fine you can ignore it.
+    mov rdi, 0xB8000 + (24*80 + 9) * 2
     mov byte [rdi], 'K'
     mov byte [rdi+1], 0x0F
 
@@ -1106,6 +1122,18 @@ dispatch:
     call str_eq
     cmp al, 1
     je cmd_give
+
+    mov rsi, cmd_buf
+    mov rdi, str_stake
+    call str_eq
+    cmp al, 1
+    je cmd_stake
+
+    mov rsi, cmd_buf
+    mov rdi, str_sgive
+    call str_eq
+    cmp al, 1
+    je cmd_sgive
 
     mov rsi, cmd_buf
     mov rdi, str_browse
@@ -2782,6 +2810,18 @@ help_lookup:
     je .h_give
 
     mov rsi, arg1_buf
+    mov rdi, str_stake
+    call str_eq
+    cmp al, 1
+    je .h_stake
+
+    mov rsi, arg1_buf
+    mov rdi, str_sgive
+    call str_eq
+    cmp al, 1
+    je .h_sgive
+
+    mov rsi, arg1_buf
     mov rdi, str_browse
     call str_eq
     cmp al, 1
@@ -2969,6 +3009,14 @@ help_lookup:
 
 .h_give:
     mov rsi, help_give
+    jmp .h_print
+
+.h_stake:
+    mov rsi, help_stake
+    jmp .h_print
+
+.h_sgive:
+    mov rsi, help_sgive
     jmp .h_print
 
 .h_browse:
@@ -15673,6 +15721,9 @@ cmd_shelly_rainbow:
 %include "party.asm"
 %include "tcp.asm"
 %include "http.asm"
+%include "crypto.asm"
+%include "tls.asm"
+%include "https.asm"
 %include "browse.asm"
 %include "mouse.asm"
 %include "zip.asm"
@@ -17535,6 +17586,8 @@ str_dhcp:    db "dhcp", 0
 str_tcp:     db "tcp", 0
 str_take:    db "take", 0
 str_give:    db "give", 0
+str_stake:   db "stake", 0
+str_sgive:   db "sgive", 0
 str_browse:  db "browse", 0
 str_mouse:   db "mouse", 0
 str_net_ip:  db "ip", 0
@@ -17815,6 +17868,22 @@ msg_give_posting:   db "give: posting ", 0
 msg_give_to:        db " to ", 0
 msg_give_nofile:    db "give: no such file.", 10, 0
 msg_give_noreply:   db "give: no reply body.", 10, 0
+msg_give_too_big:   db "give: file too large to POST in one request (headers + body must fit in 1200 bytes).", 10, 0
+msg_stake_usage:     db "stake: usage: stake <url> <file>", 10, 0
+msg_stake_badurl:    db "stake: bad URL format. Use https://host[:port]/path", 10, 0
+msg_stake_createfail: db "stake: failed to create file.", 10, 0
+msg_stake_saved:     db "stake: saved to ", 0
+msg_stake_getting:   db "stake: getting ", 0
+msg_stake_from:      db " from ", 0
+msg_stake_badpath:   db "stake: bad file path.", 10, 0
+msg_stake_nobody:    db "stake: no body in response.", 10, 0
+msg_sgive_usage:     db "sgive: usage sgive <url> <file>", 10, 0
+msg_sgive_posting:   db "sgive: posting ", 0
+msg_sgive_to:        db " to ", 0
+msg_sgive_nofile:    db "sgive: no such file.", 10, 0
+msg_sgive_noreply:   db "sgive: no reply body.", 10, 0
+msg_sgive_too_big:   db "sgive: file too large to POST in one request (headers + body must fit in 1200 bytes).", 10, 0
+msg_https_nocert:    db "https: WARNING -- no certificate validation. The connection is", 10, "  encrypted but the server's identity is NOT verified (like curl -k).", 10, 0
 msg_http_unresolved: db "http: cannot resolve host.", 10, 0
 msg_http_cancelled: db 10, "http: cancelled.", 10, 0
 icmp_data_pad:     db "ShellyForever ping payload 0123456789abcdef", 0
@@ -17953,7 +18022,10 @@ help_text:
     db "  cpy <src> <dest>   copy a file or folder (both can be paths)", 10
     db "  mov <src> <dest>   move/rename a file or folder (both can be paths)", 10
     db "  rr <script.rsh>    run a rush script file ($ = comment line)", 10
+    db "  run <file.run>     execute a compiled ShellyForever RUN 0.1 binary", 10
+    db "  party <file.pa>    run an interpreted Party-language script", 10
     db "  prs [kill <id>]    list processes, or kill by PID/rushrun", 10
+    db "  peek <pid|name> <N> [lower|upper]  view a background process's output", 10
     db "  vars               list all variables", 10
     db "  vars rmv all       clear all variables (requires auth)", 10
     db "  ali <name> <cmds>  create an alias, e.g. ali gs list ~ show", 10
@@ -17974,7 +18046,9 @@ help_text:
     db "  shelly             splash banner - ShellyForever OS credits", 10
     db "  write <path>       write text to a file, e.g. show hi ~ write file.txt", 10
     db "  wipe               clear the screen", 10
+    db "  color <name>       set the shell text color ('color list', 'color reset')", 10
     db "  sync               save the filesystem (and mounted drives) to disk", 10
+    db "  autosync on|off     toggle auto-save of the filesystem after writes", 10
     db "  fmt <label>        format a drive with the SFFS format (-force reuses one)", 10
     db "  fmt <target> <lbl> format a SPECIFIC drive (see dscan's 'fmt target:')", 10
     db "  dscan              scan for SFFS drives attached to the ATA bus", 10
@@ -18000,6 +18074,8 @@ help_text:
     db "  tcp <host> <port>  open a TCP connection and exchange data", 10
     db "  take <url> <file>  HTTP GET, save body to a file", 10
     db "  give <url> <file>  HTTP POST, send a file to a server", 10
+    db "  stake <url> <file> HTTPS (TLS 1.3) GET, save body to a file", 10
+    db "  sgive <url> <file> HTTPS (TLS 1.3) POST, send a file to a server", 10
     db "  browse <url>       text-based web browser", 10
     db "  mouse              toggle the PS/2 mouse cursor on/off", 10
     db "  pack <folder>      zip a folder into <folder>.zip (stored, uncompressed)", 10
@@ -18185,6 +18261,22 @@ help_give:
     db "  to the given URL. The request includes Content-Type", 10
     db "  and Content-Length headers. The server's reply is", 10
     db "  printed. Esc cancels during the transfer.", 10, 0
+
+help_stake:
+    db "stake <url> <file>", 10
+    db "  Like take, but over TLS 1.3. The URL must use the", 10
+    db "  https:// scheme (default port 443). WARNING: the", 10
+    db "  server's certificate is NOT validated -- the link is", 10
+    db "  encrypted but the peer's identity is unverified, the", 10
+    db "  same trust model as curl -k. Esc cancels during the", 10
+    db "  transfer.", 10, 0
+
+help_sgive:
+    db "sgive <url> <file>", 10
+    db "  Like give, but over TLS 1.3. The URL must use the", 10
+    db "  https:// scheme (default port 443). Same no-cert-", 10
+    db "  validation caveat as stake. Esc cancels during the", 10
+    db "  transfer.", 10, 0
 
 help_browse:
     db "browse <url>", 10
@@ -18626,9 +18718,14 @@ tcp_stream_sink:  dq 0       ; per-segment callback (http.asm take_stream_sink)
 http_host_buf:   times 64 db 0
 http_path_buf:   times 128 db 0
 http_port:       dw 0
+http_url_scheme: db 0        ; set by http_parse_url: 0 = http://, 1 = https://
 http_body_len:   dd 0
 http_tx_big:     times HTTP_TX_MAX db 0
 http_rx_buf:     times HTTP_RX_BUF_SIZE db 0
+
+; --- HTTPS stake / sgive state (Phase 5) ---
+https_warn_shown: db 0        ; 1 once the no-cert-validation warning has
+                               ; been printed this session (https.asm)
 
 ; --- take-stream state (write-through download via tcp_stream_sink) ---
 ts_file:        dd 0                 ; target file node index
@@ -18717,9 +18814,15 @@ dev_name_num_buf: times 24 db 0
 ident_buf:  times 40 db 0
 
 ; --- process table for rush scripts ---
-MAX_PROCESSES equ 2   ; was 4; trimmed to fit the kernel's BSS under 0xA0000 -
-                       ; the kernel image must end before the VGA adapter window
-                       ; at physical 0xA0000 (base RAM tops out at 0x9FFFF).
+MAX_PROCESSES equ 2   ; was 4, trimmed to fit the kernel's BSS under the old
+                       ; 0xA0000 flat-load ceiling (the kernel image had to
+                       ; end before the VGA adapter window at physical
+                       ; 0xA0000, since base RAM topped out at 0x9FFFF). That
+                       ; ceiling is gone now that the kernel is relocated
+                       ; above 1MB (see this file's header comment) - 2 is no
+                       ; longer a hard requirement, just left as-is here
+                       ; since raising it back to 4 is a scheduler/memory
+                       ; sizing decision on its own, not part of this fix.
 proc_id:       times MAX_PROCESSES dw 0
 proc_name:     times MAX_PROCESSES*32 db 0
 proc_state:    times MAX_PROCESSES db 0    ; 0=free, 1=running, 2=killed
