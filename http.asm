@@ -137,6 +137,7 @@ http_parse_url:
 
 .ppath:
     lea rdi, [http_path_buf]
+    xor ecx, ecx
 .plp:
     mov al, [rsi]
     test al, al
@@ -145,9 +146,12 @@ http_parse_url:
     je .pdn
     cmp al, '?'
     je .pdn
+    cmp ecx, 127
+    jae .pdn
     mov [rdi], al
     inc rsi
     inc rdi
+    inc ecx
     jmp .plp
 .pdn:
     mov byte [rdi], 0
@@ -209,6 +213,21 @@ http_build_get:
     mov byte [rdi], 13
     mov byte [rdi+1], 10
     add rdi, 2
+    ; extra headers many CDN/WAF edges expect from a real client -- a
+    ; request with no User-Agent at all is a common trigger for those
+    ; edges to just close the TLS session (clean close_notify, zero
+    ; HTTP bytes back) instead of answering with an actual response,
+    ; which is what "no body in response" was actually seeing.
+    lea rsi, [http_extra_headers]
+.bg_x:
+    mov al, [rsi]
+    test al, al
+    jz .bg_xd
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    jmp .bg_x
+.bg_xd:
     mov byte [rdi], 13
     mov byte [rdi+1], 10
     add rdi, 2
@@ -275,6 +294,17 @@ http_build_post:
     mov byte [rdi], 13
     mov byte [rdi+1], 10
     add rdi, 2
+    ; extra headers -- see the matching comment in http_build_get
+    lea rbx, [http_extra_headers]
+.p2x:
+    mov al, [rbx]
+    test al, al
+    jz .p2xd
+    mov [rdi], al
+    inc rbx
+    inc rdi
+    jmp .p2x
+.p2xd:
     ; Content-Type: text/plain
     mov dword [rdi], 'Cont'
     mov dword [rdi+4], 'ent-'

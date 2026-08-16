@@ -1,24 +1,43 @@
 ; ============================================================
-;  tcp.asm  --  minimal polled TCP engine (Milestone C)
+; tcp.asm -- minimal polled TCP engine (Milestone C)
 ;
-;  A deliberately tiny TCP client: 3-way handshake (SYN -> SYN-ACK ->
-;  ACK), seq/ack tracking, one retransmit per wait phase, a single
-;  send + receive of up to TCP_PAYLOAD_MAX bytes, and Esc-cancellable
-;  waits. This is the foundation for Milestone D's HTTP take/give.
+; A deliberately tiny TCP client: 3-way handshake (SYN -> SYN-ACK ->
+; ACK), seq/ack tracking, one retransmit per wait phase, a single
+; send + receive of up to TCP_PAYLOAD_MAX bytes, and Esc-cancellable
+; waits. This is the foundation for Milestone D's HTTP take/give.
 ;
-;  Entry points:
-;    tcp_send_segment     build + transmit one segment (seq/ack from
-;                         tcp_cur_seq / tcp_cur_ack)
-;    tcp_handle_segment   called from handle_ipv4 for IP_PROTO_TCP;
-;                         rsi = TCP header ptr inside nic_rx_frame
-;    cmd_tcp              "tcp <host> <port> [payload]" shell command
+; Entry points:
+; tcp_send_segment build + transmit one segment (seq/ack from
+; tcp_cur_seq / tcp_cur_ack)
+; tcp_handle_segment called from handle_ipv4 for IP_PROTO_TCP;
+; rsi = TCP header ptr inside nic_rx_frame
+; cmd_tcp "tcp <host> <port> [payload]" shell command
 ;
-;  All state lives in the data area at the end of kernel.asm (tcp_*),
-;  declared separately so the module here stays pure code.
+; All state lives in the data area at the end of kernel.asm (tcp_*),
+; declared separately so the module here stays pure code.
 ; ============================================================
-
-TCP_PAYLOAD_MAX equ 1536     ; fits inside net_build_buf (4096 build area) and
-                              ; nic_tx_buf (2KB): frame = 34 + 20 + 1536 = 1590 < 2048
+TCP_PAYLOAD_MAX equ 1536 ; fits inside net_build_buf (4096 build area) and
+                              ; nic_tx_buf (2KB): frame = 34 + 20 + 1536 = 1590 < 2048.
+                              ; This is a SEND-side limit only (one segment has to
+                              ; fit in one Ethernet frame) - see TCP_RX_BUF_SIZE
+                              ; below for why the receive side can't reuse it.
+; TCP_RX_BUF_SIZE -- capacity of tcp_rx_buf, the landing buffer tcp_handle_segment
+; appends incoming payload into before tls_pump drains it into tls_rx_buf (16KB).
+; This used to just be TCP_PAYLOAD_MAX (1536), which is fine for cmd_tcp's small
+; test replies but not for a real TLS handshake: netpoll() drains every frame
+; currently queued from the NIC in one call, invoking tcp_handle_segment for
+; each, and tls_pump only runs once *after* netpoll returns. A server's
+; encrypted flight (EncryptedExtensions + Certificate + CertificateVerify +
+; Finished - routinely several KB for a real cert chain) commonly arrives as a
+; burst of several back-to-back segments before we ever get a chance to pump.
+; Once more than TCP_PAYLOAD_MAX-1 bytes piled up, tcp_handle_segment's
+; "buffer full" path silently dropped the remainder while STILL acknowledging
+; it as received (see the ack-anyway comment below) - the server believed we
+; got everything and never resent it, so the truncated TLS record could never
+; complete and tls_wait_for_record spun until the final timeout. Give the
+; landing buffer the same headroom as tls_rx_buf so a whole flight fits
+; between polls.
+TCP_RX_BUF_SIZE equ 16384
 ; Wait budget for SYN-ACK / reply waits. A SYN (or a data segment) has to
 ; make a real round trip to a host out past the gateway - unlike ARP/DHCP,
 ; which only ever talk to something on the local segment. The old code gave
@@ -27,14 +46,13 @@ TCP_PAYLOAD_MAX equ 1536     ; fits inside net_build_buf (4096 build area) and
 ; perfectly healthy connections report "timed out" before a reply had any
 ; chance to arrive. Mirror nic_arp_resolve's fix: a multi-second budget per
 ; round, several resend rounds before finally giving up.
-TCP_ROUND_SECS  equ 5         ; ~5-6s of continuous polling per round
-TCP_MAX_RETRIES equ 3         ; up to 3 retransmits (4 sends total) per phase
-TCP_FLAG_FIN    equ 0x01
-TCP_FLAG_SYN    equ 0x02
-TCP_FLAG_RST    equ 0x04
-TCP_FLAG_PSH    equ 0x08
-TCP_FLAG_ACK    equ 0x10
-
+TCP_ROUND_SECS equ 5 ; ~5-6s of continuous polling per round
+TCP_MAX_RETRIES equ 3 ; up to 3 retransmits (4 sends total) per phase
+TCP_FLAG_FIN equ 0x01
+TCP_FLAG_SYN equ 0x02
+TCP_FLAG_RST equ 0x04
+TCP_FLAG_PSH equ 0x08
+TCP_FLAG_ACK equ 0x10
 ; ---- 32-bit big-endian (wire order) helpers ----
 ; tcp_load_be32: rsi = ptr -> eax = big-endian dword as a host value.
 tcp_load_be32:
@@ -49,7 +67,6 @@ tcp_load_be32:
     movzx edx, byte [rsi+3]
     or eax, edx
     ret
-
 ; tcp_store_be32: rdi = ptr, eax = host value -> stores big-endian dword.
 tcp_store_be32:
     push rdx
@@ -65,7 +82,6 @@ tcp_store_be32:
     mov [rdi+3], al
     pop rdx
     ret
-
 ; net_tcp_checksum: rsi = TCP segment ptr, ecx = segment len, r8d = src IP,
 ; r9d = dst IP -> ax = one's-complement checksum. Same pseudo-header trick
 ; as net_udp_checksum (12-byte pseudo header + segment with the checksum
@@ -82,7 +98,16 @@ net_tcp_checksum:
     push r11
     mov r10, rsi
     mov r11d, ecx
-    lea rdi, [net_build_buf + 1536]
+    ; Pseudo-header scratch lives at +2048, not +1536: at TCP_PAYLOAD_MAX the
+    ; segment is 1556 bytes (1536 payload + 20 header), and the old +1536
+    ; destination (effectively +1548 after the 12-byte pseudo header) started
+    ; INSIDE that still-unread 0..1556 source range - rep movsb was reading
+    ; bytes it had already overwritten a few iterations earlier, silently
+    ; corrupting the checksum input for any large record (a full-size TLS
+    ; Certificate/ClientHello segment, for instance). +2048 puts the
+    ; destination safely past any segment this buffer can hold
+    ; (net_build_buf is 4096 bytes; 2048+12+1556 = 3616 still fits).
+    lea rdi, [net_build_buf + 2048]
     mov eax, r8d
     mov [rdi], eax
     mov eax, r9d
@@ -92,12 +117,12 @@ net_tcp_checksum:
     mov ax, r11w
     rol ax, 8
     mov [rdi+10], ax
-    lea rdi, [net_build_buf + 1536 + 12]
+    lea rdi, [net_build_buf + 2048 + 12]
     mov rsi, r10
     mov ecx, r11d
     rep movsb
-    mov word [net_build_buf + 1536 + 12 + 16], 0   ; zero the checksum field
-    lea rsi, [net_build_buf + 1536]
+    mov word [net_build_buf + 2048 + 12 + 16], 0 ; zero the checksum field
+    lea rsi, [net_build_buf + 2048]
     mov ecx, r11d
     add ecx, 12
     call net_checksum16
@@ -115,17 +140,16 @@ net_tcp_checksum:
     pop rcx
     pop rbx
     ret
-
 ; ---- segment transmit ----
 ; tcp_send_segment: builds the TCP segment in net_build_buf and ships it.
-;   in:  rsi  = payload ptr (xor rsi,rsi / 0 for none)
-;        ecx  = payload len (<= TCP_PAYLOAD_MAX)
-;        r8d  = dst IP
-;        r9w  = dst port
-;        r10w = src port
-;        r11w = TCP flags (low byte)
-;        seq/ack for the header come from tcp_cur_seq / tcp_cur_ack
-;   out: CF = 0 sent, CF = 1 TX failed
+; in: rsi = payload ptr (xor rsi,rsi / 0 for none)
+; ecx = payload len (<= TCP_PAYLOAD_MAX)
+; r8d = dst IP
+; r9w = dst port
+; r10w = src port
+; r11w = TCP flags (low byte)
+; seq/ack for the header come from tcp_cur_seq / tcp_cur_ack
+; out: CF = 0 sent, CF = 1 TX failed
 tcp_send_segment:
     push rbx
     push rcx
@@ -137,9 +161,9 @@ tcp_send_segment:
     push r11
     push r12
     push r13
-    mov rbx, r8             ; dst IP (r8 is clobbered by the checksum/send calls)
-    mov r12, rsi            ; payload ptr
-    mov r13d, ecx           ; payload len
+    mov rbx, r8 ; dst IP (r8 is clobbered by the checksum/send calls)
+    mov r12, rsi ; payload ptr
+    mov r13d, ecx ; payload len
     lea rdi, [net_build_buf]
     mov ax, r10w
     mov byte [rdi], ah
@@ -157,11 +181,23 @@ tcp_send_segment:
     mov eax, [tcp_cur_ack]
 .tss_noack:
     call tcp_store_be32
-    mov byte [net_build_buf+12], 0x50    ; data offset 5 (20 bytes), reserved 0
-    mov byte [net_build_buf+13], r11b    ; flags
-    mov word [net_build_buf+14], 0x2000  ; window
-    mov word [net_build_buf+16], 0       ; checksum (computed below)
-    mov word [net_build_buf+18], 0       ; urgent pointer
+    mov byte [net_build_buf+12], 0x50 ; data offset 5 (20 bytes), reserved 0
+    mov byte [net_build_buf+13], r11b ; flags
+    mov word [net_build_buf+14], 0x0020 ; window = 8192, wire-order big-endian
+                                          ; (bytes 0x20,0x00 -- x86 `mov word`
+                                          ; stores the immediate little-endian
+                                          ; in memory, so the byte-swapped
+                                          ; literal is what actually lands as
+                                          ; big-endian on the wire. seq/ack use
+                                          ; tcp_store_be32 and the ports are
+                                          ; swapped by hand above; this field
+                                          ; was the one spot still storing a
+                                          ; raw little-endian word, so every
+                                          ; segment advertised a receive
+                                          ; window of 0x0020 = 32 bytes
+                                          ; instead of 0x2000 = 8192.
+    mov word [net_build_buf+16], 0 ; checksum (computed below)
+    mov word [net_build_buf+18], 0 ; urgent pointer
     test r12, r12
     jz .tss_nopayload
     test r13d, r13d
@@ -172,7 +208,7 @@ tcp_send_segment:
     rep movsb
 .tss_nopayload:
     lea eax, [r13d + 20]
-    mov r12d, eax                        ; total TCP segment length
+    mov r12d, eax ; total TCP segment length
     lea rsi, [net_build_buf]
     mov ecx, r12d
     mov r8d, [nic_ip]
@@ -202,7 +238,6 @@ tcp_send_segment:
     pop rcx
     pop rbx
     ret
-
 ; ---- receive path ----
 ; tcp_handle_segment: rsi = TCP header ptr inside nic_rx_frame. Only
 ; segments addressed to our (peer,my) port pair are considered. Updates
@@ -222,7 +257,7 @@ tcp_handle_segment:
     push r13
     push r14
     push r15
-    mov r13, rsi            ; TCP header base
+    mov r13, rsi ; TCP header base
     ; src port must match the peer's
     movzx eax, byte [r13]
     shl eax, 8
@@ -238,7 +273,7 @@ tcp_handle_segment:
     cmp ax, [tcp_my_port]
     jne .th_out
     mov al, [r13+13]
-    mov r14b, al            ; flags byte
+    mov r14b, al ; flags byte
     test al, TCP_FLAG_RST
     jz .th_norst
     mov byte [tcp_rst_got], 1
@@ -260,10 +295,10 @@ tcp_handle_segment:
     call tcp_load_be32
     mov [tcp_peer_seq], eax
     inc eax
-    mov [tcp_cur_ack], eax   ; our ACK number = peer ISN + 1
+    mov [tcp_cur_ack], eax ; our ACK number = peer ISN + 1
     mov eax, [tcp_isn]
     inc eax
-    mov [tcp_cur_seq], eax   ; next outgoing seq = our ISN + 1
+    mov [tcp_cur_seq], eax ; next outgoing seq = our ISN + 1
     lea rsi, [r13+8]
     call tcp_load_be32
     mov [tcp_last_ack], eax
@@ -285,7 +320,7 @@ tcp_handle_segment:
     mov [tcp_last_ack], eax
 .th_est_data:
     ; payload length = IP total length - ihl - TCP header length
-    xor ebx, ebx                ; payload length, 0 unless a payload branch sets it
+    xor ebx, ebx ; payload length, 0 unless a payload branch sets it
     movzx eax, byte [nic_rx_frame + 14 + 2]
     shl eax, 8
     movzx edx, byte [nic_rx_frame + 14 + 3]
@@ -295,18 +330,23 @@ tcp_handle_segment:
     jbe .th_est_fin
     movzx ecx, byte [r13+12]
     shr ecx, 4
-    shl ecx, 2              ; TCP header length
+    shl ecx, 2 ; TCP header length
     cmp ecx, eax
     jae .th_est_fin
-    sub eax, ecx            ; payload length
+    sub eax, ecx ; payload length
     jz .th_est_fin
-    mov r15d, eax           ; full payload length (for the ACK advance)
+    mov r15d, eax ; full payload length (for the ACK advance)
     mov ebx, r15d
-    ; append capped at TCP_PAYLOAD_MAX (accumulate across segments)
+    ; append capped at TCP_RX_BUF_SIZE (accumulate across segments)
     mov eax, [tcp_rx_len]
-    mov edx, TCP_PAYLOAD_MAX
-    sub edx, eax            ; free space left
-    jbe .th_est_fin         ; buffer full - ack anyway
+    mov edx, TCP_RX_BUF_SIZE - 1 ; reserve 1 byte for the NUL terminator
+                                    ; written below (tcp_rx_buf is exactly
+                                    ; TCP_RX_BUF_SIZE bytes, immediately
+                                    ; followed by tcp_tx_buf - without this
+                                    ; reservation a full-size response makes
+                                    ; the terminator overwrite tcp_tx_buf[0])
+    sub edx, eax ; free space left
+    jbe .th_est_fin ; buffer full - ack anyway
     cmp r15d, edx
     jbe .th_append_all
     mov r15d, edx
@@ -319,7 +359,7 @@ tcp_handle_segment:
     rep movsb
     add [tcp_rx_len], r15d
     mov edx, [tcp_rx_len]
-    mov byte [tcp_rx_buf + rdx], 0      ; 0-terminate for print_string
+    mov byte [tcp_rx_buf + rdx], 0 ; 0-terminate for print_string
 .th_est_fin:
     ; a FIN ends the data phase
     test r14b, TCP_FLAG_FIN
@@ -344,7 +384,7 @@ tcp_handle_segment:
     inc eax
 .th_est_ack1:
     cmp eax, [tcp_cur_ack]
-    jbe .th_est_acknoupd        ; never let the ACK go backwards
+    jbe .th_est_acknoupd ; never let the ACK go backwards
     mov [tcp_cur_ack], eax
 .th_est_acknoupd:
     xor rsi, rsi
@@ -370,7 +410,6 @@ tcp_handle_segment:
     pop rcx
     pop rbx
     ret
-
 ; ---- helpers for the shell command ----
 ; tcp_parse_port: rsi = decimal string -> CF=0 and eax = port (1..65535),
 ; else CF=1.
@@ -388,8 +427,12 @@ tcp_parse_port:
     cmp bl, '9'
     ja .tpp_bad
     sub bl, '0'
+    movzx edx, bl ; zero-extend the digit - ebx's upper bits are stale garbage
+                    ; from whatever the caller last left in rbx, and using the
+                    ; full ebx here corrupted the parsed port (e.g. "80" could
+                    ; come out as some unrelated 5-digit value)
     imul eax, eax, 10
-    add eax, ebx
+    add eax, edx
     cmp eax, 65535
     ja .tpp_bad
     inc rsi
@@ -406,7 +449,6 @@ tcp_parse_port:
     pop rdx
     pop rbx
     ret
-
 ; tcp_print_dec: eax = value -> prints it in decimal via putchar.
 tcp_print_dec:
     push rax
@@ -434,12 +476,10 @@ tcp_print_dec:
     pop rcx
     pop rax
     ret
-
 ; ---- the shell command ----
 tcp_default_payload:
     db "GET / HTTP/1.0", 13, 10, 13, 10
 TCP_DEFAULT_PAYLOAD_LEN equ ($ - tcp_default_payload)
-
 ; cmd_tcp: "tcp <host> <port> [payload]" - resolve, handshake, send a
 ; payload, wait for a reply, print it, close. Esc cancels any wait.
 cmd_tcp:
@@ -511,7 +551,7 @@ cmd_tcp:
 .tc_tick:
     mov r13, rax
     dec byte [tcp_wait_ticks]
-    jns .tc_wait               ; still budget left this round - keep polling
+    jns .tc_wait ; still budget left this round - keep polling
     cmp byte [tcp_retry], TCP_MAX_RETRIES
     jae .tc_timeout
     inc byte [tcp_retry]
@@ -610,7 +650,7 @@ cmd_tcp:
     jmp .tc_wait2
 .tc_tick2_nodata:
     dec byte [tcp_wait_ticks]
-    jns .tc_wait2               ; still budget left this round - keep polling
+    jns .tc_wait2 ; still budget left this round - keep polling
     cmp byte [tcp_retry], TCP_MAX_RETRIES
     jae .tc_timeout
     inc byte [tcp_retry]

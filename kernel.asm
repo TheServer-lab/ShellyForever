@@ -12559,6 +12559,7 @@ nic_send_raw_e1000:
 ; wait for the chip to clear OWN on the slot we just queued.
 nic_send_raw_rtl8168:
     push rax
+    push rbx
     push rcx
     push rdx
     push rdi
@@ -12707,6 +12708,7 @@ nic_send_raw_rtl8168:
     pop rdi
     pop rdx
     pop rcx
+    pop rbx
     pop rax
     clc
     ret
@@ -12725,6 +12727,7 @@ nic_send_raw_rtl8168:
     pop rdi
     pop rdx
     pop rcx
+    pop rbx
     pop rax
     stc
     ret
@@ -12975,7 +12978,7 @@ netpoll:
     inc dword [nic_rx_seen]
     cmp byte [nic_diag_verbose], 0
     je .np_nodiag
-    cmp byte [nic_diag_rx_count], 12
+    cmp byte [nic_diag_rx_count], 60
     jae .np_nodiag
     inc byte [nic_diag_rx_count]
     call netdiag_dump_frame
@@ -13390,7 +13393,14 @@ net_udp_checksum:
     push r11
     mov r10, rsi
     mov r11d, ecx
-    lea rdi, [net_build_buf + 1536]
+    ; Pseudo-header scratch lives at +2048, not +1536: the datagram gets
+    ; rep-movsb'd in right after it, and with a max-size segment the old
+    ; +1536 destination (effectively +1548) overlapped the still-unread
+    ; source range (0..1556 for a full TCP_PAYLOAD_MAX-sized TCP segment),
+    ; corrupting the checksum input mid-copy. +2048 puts the destination
+    ; safely past any segment this buffer can hold (net_build_buf is 4096
+    ; bytes; 2048+12+1556 = 3616 still fits with room to spare).
+    lea rdi, [net_build_buf + 2048]
     mov eax, r8d
     mov [rdi], eax
     mov eax, r9d
@@ -13400,12 +13410,12 @@ net_udp_checksum:
     mov ax, r11w
     rol ax, 8
     mov [rdi+10], ax
-    lea rdi, [net_build_buf + 1536 + 12]
+    lea rdi, [net_build_buf + 2048 + 12]
     mov rsi, r10
     mov ecx, r11d
     rep movsb
-    mov word [net_build_buf + 1536 + 12 + 6], 0
-    lea rsi, [net_build_buf + 1536]
+    mov word [net_build_buf + 2048 + 12 + 6], 0
+    lea rsi, [net_build_buf + 2048]
     mov ecx, r11d
     add ecx, 12
     call net_checksum16
@@ -13952,6 +13962,7 @@ dns_skip_name:
 ; dns_handle_reply: parse the DNS response whose UDP payload is in
 ; nic_rx_frame (ip header at +14). On an A record for our query id, store
 ; nic_dns_result and set nic_dns_done.
+NIC_DNS_MAX_IPS equ 8
 dns_handle_reply:
     push rbx
     push rcx
@@ -13986,9 +13997,10 @@ dns_handle_reply:
     call dns_skip_name
     add rsi, 4
     xor r11d, r11d
+    xor r15d, r15d                   ; r15b = A records stored so far
 .dh_answer:
     cmp r11d, r9d
-    jae .dh_notfound
+    jae .dh_scandone
     call dns_skip_name
     movzx r8d, byte [rsi]
     shl r8d, 8
@@ -14006,14 +14018,25 @@ dns_handle_reply:
     jne .dh_skip
     cmp r10d, 4
     jne .dh_skip
+    ; an A record -- stash it (if there's still room in the array)
+    cmp r15b, NIC_DNS_MAX_IPS
+    jae .dh_skip
     mov eax, [rsi]
-    mov [nic_dns_result], eax
-    mov byte [nic_dns_done], 1
-    jmp .dh_done
+    movzx rbx, r15b
+    mov [nic_dns_ips + rbx*4], eax
+    inc r15b
 .dh_skip:
     add rsi, r10
     inc r11d
     jmp .dh_answer
+.dh_scandone:
+    mov [nic_dns_ip_count], r15b
+    test r15b, r15b
+    jz .dh_notfound
+    mov eax, [nic_dns_ips]
+    mov [nic_dns_result], eax
+    mov byte [nic_dns_done], 1
+    jmp .dh_done
 .dh_notfound:
     mov byte [nic_dns_done], 1
     mov dword [nic_dns_result], 0xFFFFFFFF
@@ -14035,8 +14058,21 @@ dns_handle_reply:
 
 ; dns_query: rsi = hostname (null-terminated). If it's already a dotted
 ; quad, returns eax = IP. Otherwise sends a DNS A query to nic_dns:53,
-; waits for the reply (with one retry), and returns eax = IP, or
-; 0xFFFFFFFF on failure.
+; waits for the reply, and returns eax = IP, or 0xFFFFFFFF on failure.
+;
+; DNS_ROUND_SECS / DNS_MAX_RETRIES: the wait budget used to be a single
+; ~1-second tick plus one immediate resend, then an outright fail on the
+; very next tick -- worst case barely over a second, best case under two.
+; That's nowhere near enough for a real round trip through QEMU's
+; user-mode DNS proxy (which itself has to go ask a real resolver), so
+; a perfectly healthy query could -- and did -- report "could not
+; resolve host" moments after its reply had actually left the wire (see
+; the trace: the "rx ... sport=0x0035" DNS reply prints, immediately
+; followed by "could not resolve host"). Mirror the same fix already
+; applied to tcp_send_segment's wait loop and nic_arp_resolve: a
+; multi-second budget per round, several resend rounds before giving up.
+DNS_ROUND_SECS equ 5
+DNS_MAX_RETRIES equ 3
 dns_query:
     push rbx
     push rcx
@@ -14059,6 +14095,7 @@ dns_query:
     mov byte [nic_diag_verbose], 1
     mov r12, rsi
     mov byte [nic_dns_retry], 0
+    mov byte [nic_dns_wait_ticks], DNS_ROUND_SECS
     mov ax, [nic_dns_id]
     inc word [nic_dns_id]
     mov r13w, ax
@@ -14132,9 +14169,13 @@ dns_query:
     jne .dq_tick
     jmp .dq_wait
 .dq_tick:
-    cmp byte [nic_dns_retry], 0
-    jne .dq_fail
-    mov byte [nic_dns_retry], 1
+    mov r15, rax
+    dec byte [nic_dns_wait_ticks]
+    jns .dq_wait              ; still budget left this round - keep polling
+    cmp byte [nic_dns_retry], DNS_MAX_RETRIES
+    jae .dq_fail
+    inc byte [nic_dns_retry]
+    mov byte [nic_dns_wait_ticks], DNS_ROUND_SECS
     lea rsi, [net_build_buf]
     mov ecx, r14d
     mov r8d, [nic_dns]
@@ -17450,9 +17491,9 @@ wig_str_buf:   times 16 db 0    ; scratch for the wig clock widget
 wig_last_sec:  db 0             ; last second the widget drew (redraw gate)
 
 banner:
-    db "ShellyForever v0.1.15 -- 'help' for commands", 10, 0
+    db "ShellyForever v0.1.16 -- 'help' for commands", 10, 0
 build_stamp:
-    db "build 20260814 -- Streaming HTTP take + kernel memory hotfix (zip/view/edit/install buffers back under the hard ceiling)", 10, 0
+    db "build 20260816 -- HTTPS stake/sgive (TLS 1.3 GET/POST)", 10, 0
 
 prompt_head: db "rush>", 0
 prompt_tail: db ": ", 0
@@ -17602,7 +17643,7 @@ SHELLY_PAL_LEN equ 6
 shelly_palette: db 0x0E, 0x0B, 0x0A, 0x0D, 0x09, 0x0F   ; yel, cyan, grn, mag, lblu, wht
 shelly_rule:  db "  ============================================================", 10, 0
 shelly_title: db "         ShellyForever OS", 0
-shelly_version: db "         v0.1.15", 10, 0
+shelly_version: db "         v0.1.16", 10, 0
 shelly_by:    db "         Developed by Sourasish Das", 10, 0
 shelly_cr:    db "         Copyright 2026. All rights reserved.", 10, 0
 str_col_black:    db "black", 0
@@ -17876,7 +17917,8 @@ msg_stake_saved:     db "stake: saved to ", 0
 msg_stake_getting:   db "stake: getting ", 0
 msg_stake_from:      db " from ", 0
 msg_stake_badpath:   db "stake: bad file path.", 10, 0
-msg_stake_nobody:    db "stake: no body in response.", 10, 0
+msg_stake_nobody:    db "stake: no body in response. (", 0
+msg_stake_nobody2:   db " bytes received)", 10, 0
 msg_sgive_usage:     db "sgive: usage sgive <url> <file>", 10, 0
 msg_sgive_posting:   db "sgive: posting ", 0
 msg_sgive_to:        db " to ", 0
@@ -18588,7 +18630,18 @@ nic_dns_id:      dw 1
 nic_dns_query_id: dw 0
 nic_dns_done:    db 0
 nic_dns_retry:   db 0
+nic_dns_wait_ticks: db 0   ; whole-seconds left in the current DNS round -- same
+                            ; multi-second-round idea as tcp_wait_ticks, see the
+                            ; fix in dns_query (the old code gave up after ~1-2
+                            ; real seconds total, nowhere near enough for a real
+                            ; DNS round trip through QEMU's user-mode DNS proxy)
 nic_dns_result:  dd 0
+; every A record from the most recent reply, so a caller whose TCP connect
+; to the first one times out (e.g. one anycast edge of a multi-IP host is
+; unreachable from this network while the others are fine) can fall back
+; to the next one instead of just giving up.
+nic_dns_ips:     times NIC_DNS_MAX_IPS dd 0
+nic_dns_ip_count: db 0
 dhcp_xid:        dd 0
 dhcp_offered_ip: dd 0
 dhcp_done:       db 0
@@ -18709,7 +18762,7 @@ tcp_tx_len:    dd 0
 tcp_rx_prev:   dd 0          ; rx length at the previous idle-check tick
 tcp_err_msg:   dq 0          ; ptr to the last tcp/http error message (0 = none)
 tcp_dec_buf:   times 10 db 0
-tcp_rx_buf:    times TCP_PAYLOAD_MAX db 0
+tcp_rx_buf:    times TCP_RX_BUF_SIZE db 0
 tcp_tx_buf:    times TCP_PAYLOAD_MAX db 0
 tcp_stream_active: db 0      ; 1 while cmd_take streams a reply to disk
 tcp_stream_sink:  dq 0       ; per-segment callback (http.asm take_stream_sink)
@@ -18722,6 +18775,16 @@ http_url_scheme: db 0        ; set by http_parse_url: 0 = http://, 1 = https://
 http_body_len:   dd 0
 http_tx_big:     times HTTP_TX_MAX db 0
 http_rx_buf:     times HTTP_RX_BUF_SIZE db 0
+
+; extra headers appended by both http_build_get and http_build_post, right
+; after Host: and before the blank line that ends the header block. A
+; request with no User-Agent/Accept at all is unusual enough that some
+; CDN/WAF edges (Fastly, the infra fronting GitHub Pages included) just
+; drop it -- closing the TLS session cleanly (handshake OK, close_notify,
+; zero HTTP bytes back) instead of returning any actual HTTP response.
+; That looked exactly like "stake: no body in response." even though
+; nothing in the TLS/record layer was at fault.
+http_extra_headers: db "User-Agent: rush/1.0", 13, 10, "Accept: */*", 13, 10, "Connection: close", 13, 10, 0
 
 ; --- HTTPS stake / sgive state (Phase 5) ---
 https_warn_shown: db 0        ; 1 once the no-cert-validation warning has

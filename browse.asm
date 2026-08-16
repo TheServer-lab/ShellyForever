@@ -1040,17 +1040,28 @@ browse_resolve_url:
 
     cmp byte [r13], 0
     je .bad
-    ; absolute http:// ?
+    ; absolute http:// or https:// ?
     mov eax, [r13]
     or eax, 0x20202020
     cmp eax, 'http'
     jne .not_abs
     cmp byte [r13+4], ':'
+    je .abs_chk4
+    cmp byte [r13+4], 's'
     jne .not_abs
+    cmp byte [r13+5], ':'
+    jne .not_abs
+    cmp byte [r13+6], '/'
+    jne .not_abs
+    cmp byte [r13+7], '/'
+    jne .not_abs
+    jmp .abs_copy
+.abs_chk4:
     cmp byte [r13+5], '/'
     jne .not_abs
     cmp byte [r13+6], '/'
     jne .not_abs
+.abs_copy:
     ; copy as-is
     mov rsi, r13
     mov rdi, r14
@@ -1083,7 +1094,15 @@ browse_resolve_url:
     cmp byte [browse_base_url], 0
     je .bad
     ; relative: build scheme://host + basedir + href, then normalize.
-    lea rbx, [browse_base_url + 7]
+    ; scheme prefix is 7 bytes for "http://", 8 for "https://" -- tell
+    ; them apart by whether byte 4 is ':' (http) or 's' (https).
+    lea rbx, [browse_base_url]
+    mov ecx, 7
+    cmp byte [rbx+4], ':'
+    je .rv_scheme_len_ok
+    mov ecx, 8
+.rv_scheme_len_ok:
+    add rbx, rcx
     mov r12, rbx
 .rv_host_scan:
     cmp byte [r12], 0
@@ -1244,12 +1263,28 @@ browse_fetch_url:
     call http_build_get
     mov [tcp_tx_len], eax
 
+    cmp byte [http_url_scheme], 1
+    je .fetch_https
+
+    ; ---- plain http:// ----
     call tcp_do_exchange
     jc .fetch_fail
-
     call http_find_body
     jc .no_body
+    jmp .have_body
 
+.fetch_https:
+    ; ---- https:// -- same request, sent/received over TLS ----
+    call https_warn_once
+    call https_bridge_tx
+    lea rsi, [http_host_buf]
+    mov dx, [http_port]
+    call tls_do_exchange
+    jc .fetch_fail
+    call https_find_body
+    jc .no_body
+
+.have_body:
     ; rax = body ptr, ecx = body len -> stage in http_rx_buf
     mov r13d, ecx
     cmp ecx, HTTP_RX_BUF_SIZE-1
@@ -2125,18 +2160,30 @@ cmd_browse:
     je .no_nic
     cmp byte [arg1_buf], 0
     je .usage
-    ; build an absolute URL from arg1
+    ; build an absolute URL from arg1 (accepts http:// or https:// as-is;
+    ; anything else gets "http://" prepended, same as before)
     lea rsi, [arg1_buf]
     mov eax, [rsi]
     or eax, 0x20202020
     cmp eax, 'http'
     jne .prepend
     cmp byte [rsi+4], ':'
+    je .chk4_slashes
+    cmp byte [rsi+4], 's'
     jne .prepend
+    cmp byte [rsi+5], ':'
+    jne .prepend
+    cmp byte [rsi+6], '/'
+    jne .prepend
+    cmp byte [rsi+7], '/'
+    jne .prepend
+    jmp .copy_as_is
+.chk4_slashes:
     cmp byte [rsi+5], '/'
     jne .prepend
     cmp byte [rsi+6], '/'
     jne .prepend
+.copy_as_is:
     lea rdi, [browse_url_tmp]
     call browse_cp_str
     jmp .have_url
@@ -2239,7 +2286,7 @@ msg_browse_hints:       db "[b]ack [f]wd [a]dd-bm [l]ist-bm [t]save [q]uit", 0
 msg_browse_taken:       db "saved raw page to ", 0
 msg_browse_take_fail:   db "browse: failed to save file.", 0
 msg_browse_take_badpath: db "browse: bad file path.", 0
-browse_err_msg_badurl:  db "browse: bad URL format. Use http://host[:port]/path", 0
+browse_err_msg_badurl:  db "browse: bad URL format. Use http(s)://host[:port]/path", 0
 browse_err_msg_fetch:   db "browse: failed to load page.", 0
 browse_err_msg_nobody:  db "browse: server returned no content.", 0
 browse_empty_page:      db "( empty page )", 0

@@ -35,7 +35,10 @@
 ;    - https_find_body is http_find_body's logic re-pointed at
 ;      tls_app_rx_buf/tls_app_rx_len instead of tcp_rx_buf/
 ;      tcp_rx_len, for the same reason in the other direction
-;      (TLS_APP_RX_MAX=4096 doesn't fit inside tcp_rx_buf's 1536).
+;      (TLS_APP_RX_MAX=4096 is a different buffer with a different
+;      purpose than tcp_rx_buf, which only ever holds raw handshake-
+;      phase record bytes before tls_pump drains it -- see
+;      TCP_RX_BUF_SIZE in tcp.asm).
 ;      tcp_rx_buf/tcp_rx_len themselves are untouched by this phase.
 ;
 ;  Included from kernel.asm; inherits BITS 64.
@@ -275,6 +278,11 @@ cmd_stake:
 
 .no_body:
     mov rsi, msg_stake_nobody
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    mov eax, [tls_app_rx_len]
+    call tcp_print_dec
+    mov rsi, msg_stake_nobody2
     mov al, [cur_normal_attr]
     call print_string_attr
     jmp .done

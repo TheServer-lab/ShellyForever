@@ -2276,10 +2276,39 @@ RNG_MAX_RETRIES equ 10
 ; "succeeds" from the caller's point of view (CF=0) -- if RDRAND is
 ; exhausted after retry, falls back to rng_fallback64 rather than
 ; propagating a hardware-level failure.
+;
+; IMPORTANT: RDRAND support is NOT universal -- unlike a CPUID-visible
+; feature that merely changes behavior, executing `rdrand` on a CPU
+; that doesn't implement it raises #UD (invalid opcode) the instant
+; the CPU tries to decode it. That happens before the instruction can
+; even set CF, so the `jc .have_random` / retry loop below cannot catch
+; it -- it only handles the CPU supporting RDRAND but the DRNG not
+; having a value ready yet, a different (retryable) situation. Several
+; common QEMU CPU models don't expose RDRAND, so without a feature
+; check this faults deterministically on the very first call, every
+; boot, regardless of any network/TLS data (this crashed the kernel
+; via cmd_stake/cmd_sgive's very first tls_handshake_after_connect
+; call -- see the client_random rng_get64 calls there).
+; rng_rdrand_checked/rng_rdrand_ok cache the CPUID.1:ECX.bit30 result
+; so we only ever probe once, not on every rng_get64 call.
 rng_get64:
     push rax
+    push rbx
     push rcx
+    push rdx
     push rdi
+
+    cmp byte [rng_rdrand_checked], 0
+    jne .checked
+    mov eax, 1
+    cpuid                      ; clobbers eax,ebx,ecx,edx -- all reloaded below
+    test ecx, (1 << 30)        ; RDRAND support bit
+    setnz byte [rng_rdrand_ok]
+    mov byte [rng_rdrand_checked], 1
+.checked:
+    cmp byte [rng_rdrand_ok], 0
+    je .no_rdrand
+
     mov ecx, RNG_MAX_RETRIES
 .retry:
     rdrand rax
@@ -2287,18 +2316,26 @@ rng_get64:
     dec ecx
     jnz .retry
     ; exhausted retries -- hardware not yielding entropy, fall back
+.no_rdrand:
     pop rdi
+    pop rdx
     pop rcx
+    pop rbx
     pop rax
     call rng_fallback64
     ret
 .have_random:
     mov [rdi], rax
     pop rdi
+    pop rdx
     pop rcx
+    pop rbx
     pop rax
     clc
     ret
+
+rng_rdrand_checked: db 0   ; 0 = not probed yet, 1 = probed (see rng_rdrand_ok)
+rng_rdrand_ok:       db 0   ; valid only once rng_rdrand_checked=1
 
 ; Test-only entry point: skips RDRAND entirely and goes straight to
 ; the "retries exhausted" path, so that path is exercised even on

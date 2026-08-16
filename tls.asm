@@ -274,6 +274,22 @@ tls_record_decrypt:
                                ; below, so it can't be read back after
     ; rdx = seq
 
+    ; ---- reject a record shorter than the AEAD tag ----
+    ; A peer (malicious, or just buggy/lossy) can send an application_data
+    ; or handshake-phase record whose declared length is < AEAD_TAG_LEN
+    ; (even 0 -- tls_poll_single_frame only requires the 5-byte header
+    ; plus that many payload bytes, it never enforces a minimum). Without
+    ; this check, "lea rdx, [r8 - AEAD_TAG_LEN]" below wraps r8=0..15
+    ; around to a huge 64-bit value (e.g. r8=0 -> rdx=0xFFFFFFFFFFFFFFF0),
+    ; which is then handed to chacha20_poly1305_decrypt as ct_len -- an
+    ; effectively unbounded read past tls_frame_buf/tls_plain that
+    ; corrupts memory well beyond this module. That's consistent with
+    ; the illegal-instruction/triple-fault crash seen in practice: this
+    ; kernel installs no IDT (see kernel.asm header), so any resulting
+    ; fault is unrecoverable.
+    cmp rbx, AEAD_TAG_LEN
+    jb .tls_rd_fail
+
     ; ---- nonce = iv XOR (00000000 || u64be(seq)) ----
     lea rdi, [tls_nonce_buf]
     mov rsi, r13
@@ -504,6 +520,25 @@ tls_build_client_hello:
     mov ecx, 32
     rep movsb
 
+    ; 6. application_layer_protocol_negotiation (ALPN): id 0x0010
+    ;   u16(0x0010) + u16(ext_data_len=11) + u16(list_len=9) + u8(8) + "http/1.1"
+    ; A real client (browser, curl, wget) sends this on essentially every
+    ; TLS connection; going without it is an unusual fingerprint some
+    ; edges use to silently drop scripted-looking clients rather than
+    ; sending back an alert. We only ever speak HTTP/1.1, so offer just
+    ; that one protocol.
+    mov ax, 0x0010
+    call tls_store_be16
+    mov ax, 11
+    call tls_store_be16              ; ext data len = u16(list_len)+list
+    mov ax, 9
+    call tls_store_be16              ; protocol_name_list len = 1+8
+    mov byte [rdi], 8
+    inc rdi
+    lea rsi, [tls_alpn_http11]
+    mov ecx, 8
+    rep movsb
+
     ; ---- patch server_name ext length ----
     ; server_name ext starts at r13 (its id), data begins r13+4.
     ; ext data len = rdi - (r13+4) - (data len fields...) = rdi - r13 - 4
@@ -548,7 +583,7 @@ tls_build_client_hello:
     mov byte [tls_ch_buf+3], dl
     ; total message length
     add rax, 4
-    mov [tls_ch_len], rax
+    mov [tls_ch_len], eax
 
     pop r15
     pop r14
@@ -617,6 +652,10 @@ tls_parse_server_hello:
 .tls_psh_ext:
     cmp rsi, r8
     jae .tls_psh_nokeyshare
+    ; need at least 4 bytes left in the ext block for the header itself
+    lea r9, [rsi + 4]
+    cmp r9, r8
+    ja .tls_psh_bad
     movzx eax, byte [rsi]
     shl eax, 8
     movzx edx, byte [rsi+1]
@@ -625,9 +664,19 @@ tls_parse_server_hello:
     shl ecx, 8
     movzx edx, byte [rsi+3]
     or ecx, edx                      ; ext data len
+    ; the extension's declared data must not run past the ext block --
+    ; without this, a truncated/malformed ServerHello could send rsi (and
+    ; the key_share reads below) past the extensions block's real end.
+    lea r9, [rsi + 4]
+    add r9, rcx
+    cmp r9, r8
+    ja .tls_psh_bad
     cmp ax, 0x0033
     jne .tls_psh_next
-    ; key_share ext: group(2) + keylen(2) + key(32)
+    ; key_share ext: group(2) + keylen(2) + key(32) -- confirm the
+    ; extension actually declared that much data before reading it
+    cmp ecx, 36
+    jb .tls_psh_bad
     movzx eax, byte [rsi+4]
     shl eax, 8
     movzx edx, byte [rsi+5]
@@ -1058,6 +1107,7 @@ tls_handshake_after_connect:
     ; ---- reset TLS stream state ----
     mov dword [tls_rx_used], 0
     mov dword [tls_transcript_len], 0
+    mov qword [tls_wfr_resend_hook], 0
 
     ; ---- generate client random / session id / private key ----
     ; (rng_get64: rdi = 8-byte out; kernel uses RDRAND, harness stub)
@@ -1104,6 +1154,8 @@ tls_handshake_after_connect:
     call tls_transcript_append
 
     ; send CH as plaintext handshake record
+    mov eax, [tcp_cur_seq]
+    mov [tls_ch_seq], eax            ; remember for tls_resend_ch
     lea rsi, [tls_ch_buf]
     mov ecx, [tls_ch_len]
     mov rdx, CT_HANDSHAKE
@@ -1111,17 +1163,27 @@ tls_handshake_after_connect:
     jc .tls_ha_sendfail
 
     ; ---- read ServerHello record ----
+    ; arm the retransmit hook: if this segment was dropped in transit, the
+    ; server will never answer no matter how long we passively wait, so
+    ; tls_wait_for_record needs to actually resend it once per round.
+    mov qword [tls_wfr_resend_hook], tls_resend_ch
 .tls_ha_sh_loop:
     call tls_wait_for_record
-    jc .tls_ha_fail
+    jc .tls_ha_fail_wait
+    cmp dl, CT_ALERT
+    je .tls_ha_alert                 ; server told us exactly why -- show it
     cmp dl, CT_HANDSHAKE
-    jne .tls_ha_sh_loop              ; skip CCS / alerts
+    jne .tls_ha_sh_loop              ; skip CCS
     ; rsi = SH handshake msg (record payload), ecx = payload len
     mov r12, rsi                     ; save payload ptr
+    ; got a real record -- disarm the hook regardless of what's in it, so
+    ; a later timeout (e.g. in the encrypted-flight loop) doesn't keep
+    ; resending a ClientHello the server has clearly already seen
+    mov qword [tls_wfr_resend_hook], 0
     ; parse SH body (skip the 4-byte handshake header)
     lea rsi, [r12 + 4]
     call tls_parse_server_hello
-    jc .tls_ha_fail
+    jc .tls_ha_fail_sh
 
     ; transcript += SH handshake message (the whole record payload)
     mov rsi, r12
@@ -1168,9 +1230,14 @@ tls_handshake_after_connect:
     mov qword [tls_got_sfin], 0
 .tls_ha_flight:
     call tls_wait_for_record
-    jc .tls_ha_fail
+    jc .tls_ha_fail_wait
+    cmp dl, CT_ALERT
+    je .tls_ha_alert                 ; still-plaintext alert (rare here, but
+                                      ; some servers bail before switching to
+                                      ; encrypted records) -- show it instead
+                                      ; of spinning until timeout
     cmp dl, CT_APPLICATION_DATA
-    jne .tls_ha_flight               ; skip CCS etc
+    jne .tls_ha_flight                ; skip CCS etc
     ; rsi = ciphertext payload ptr, tls_last_frame_len = ct len (incl tag)
     mov r14, rsi                     ; save ct ptr
     ; decrypt: rdi=key, rsi=iv, rdx=seq, rcx=payload, r8=len, r9=out
@@ -1190,7 +1257,7 @@ tls_handshake_after_connect:
     mov eax, [tls_hsmsg_len]
     add eax, edx
     cmp eax, TLS_RX_BUF_SIZE
-    ja .tls_ha_fail                  ; server flight too large to reassemble
+    ja .tls_ha_fail_overflow         ; server flight too large to reassemble
     lea rdi, [tls_hsmsg_buf]
     add edi, [tls_hsmsg_len]         ; 32-bit add/zero-extend -- see tls_pump's
                                       ; identical note: `add rdi,[mem32]` would
@@ -1250,7 +1317,7 @@ tls_handshake_after_connect:
     movzx edx, byte [r13+3]
     or eax, edx
     cmp eax, 32
-    jne .tls_ha_fail
+    jne .tls_ha_fail_finlen
     lea rsi, [r13+4]
     lea rdi, [tls_expected_fin]
     mov rcx, 32
@@ -1287,6 +1354,11 @@ tls_handshake_after_connect:
     mov byte [rdi+1], 0x00
     mov byte [rdi+2], 0x00
     mov byte [rdi+3], 0x20
+    add rdi, 4                ; advance past the 4-byte header -- the
+                              ; header writes above use [rdi+n] addressing
+                              ; and do NOT advance rdi, so without this the
+                              ; rep movsb would overwrite the header with
+                              ; the first 4 bytes of verify_data
     lea rsi, [tls_c_fin]
     mov ecx, 32
     rep movsb
@@ -1329,6 +1401,29 @@ tls_handshake_after_connect:
 
     clc
     jmp .tls_ha_done
+.tls_ha_alert:
+    ; rsi/ecx from tls_wait_for_record still point at the 2-byte alert
+    ; body: byte0 = level (1=warning, 2=fatal), byte1 = description
+    ; (RFC 8446 6.2 -- e.g. 40=handshake_failure, 42=bad_certificate,
+    ; 46=unsupported_certificate, 70=protocol_version, 112=unrecognized_name,
+    ; 116=certificate_required). Printing these turns a completely opaque
+    ; "handshake failed" into the actual reason the server gave us.
+    cmp ecx, 2
+    jb .tls_ha_fail                  ; malformed alert -- fall back to generic
+    movzx r12d, byte [rsi]
+    movzx r13d, byte [rsi+1]
+    mov rsi, msg_tls_alert_level
+    call tls_error_print
+    mov eax, r12d
+    call tcp_print_dec
+    mov rsi, msg_tls_alert_desc
+    call tls_error_print
+    mov eax, r13d
+    call tcp_print_dec
+    mov rsi, msg_nl
+    call print_string
+    stc
+    jmp .tls_ha_done
 .tls_ha_badfin:
     mov rsi, msg_tls_badfin
     call tls_error_print
@@ -1341,6 +1436,47 @@ tls_handshake_after_connect:
     jmp .tls_ha_done
 .tls_ha_sendfail:
     mov rsi, msg_tls_sendfail
+    call tls_error_print
+    stc
+    jmp .tls_ha_done
+.tls_ha_fail_wait:
+    ; al comes straight from tls_wait_for_record: 1=timeout, 2=RST,
+    ; 3=cancelled -- surface which one instead of a blanket "failed".
+    cmp al, 1
+    je .tls_ha_fw_timeout
+    cmp al, 2
+    je .tls_ha_fw_rst
+    cmp al, 3
+    je .tls_ha_fw_cancel
+    jmp .tls_ha_fail                 ; unrecognized reason -- generic message
+.tls_ha_fw_timeout:
+    mov rsi, msg_tls_hs_timeout
+    call tls_error_print
+    stc
+    jmp .tls_ha_done
+.tls_ha_fw_rst:
+    mov rsi, msg_tls_hs_reset
+    call tls_error_print
+    stc
+    jmp .tls_ha_done
+.tls_ha_fw_cancel:
+    mov byte [kill_flag], 0
+    mov rsi, msg_tls_cancelled
+    call print_string
+    stc
+    jmp .tls_ha_done
+.tls_ha_fail_sh:
+    mov rsi, msg_tls_sh_reject
+    call tls_error_print
+    stc
+    jmp .tls_ha_done
+.tls_ha_fail_overflow:
+    mov rsi, msg_tls_overflow
+    call tls_error_print
+    stc
+    jmp .tls_ha_done
+.tls_ha_fail_finlen:
+    mov rsi, msg_tls_finlen
     call tls_error_print
     stc
     jmp .tls_ha_done
@@ -1443,6 +1579,9 @@ tls_wait_for_record:
     jae .tls_wfr_timeout
     inc byte [tls_retry]
     mov byte [tls_wait_ticks], TCP_ROUND_SECS
+    cmp qword [tls_wfr_resend_hook], 0
+    je .tls_wfr_loop
+    call qword [tls_wfr_resend_hook]
     jmp .tls_wfr_loop
 .tls_wfr_got:
     ; rsi = payload ptr in stream, ecx = payload len, dl = content type
@@ -1571,6 +1710,71 @@ tls_send_record_raw:
     ret
 
 ; ============================================================
+;  tls_resend_ch -- retransmit the already-built ClientHello (tls_ch_buf/
+;  tls_ch_len) at its ORIGINAL sequence number (tls_ch_seq), not the
+;  current tcp_cur_seq (which has already moved past it). This is a true
+;  retransmission, not a new send: tcp_cur_seq is restored to its pre-call
+;  value afterward so the "next new data" pointer is unaffected. Used as
+;  tls_wait_for_record's resend hook while waiting for the ServerHello --
+;  see the note by tls_wfr_resend_hook for why this exists.
+; ============================================================
+tls_resend_ch:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    mov rsi, msg_tls_resend_ch
+    call print_string                ; visible proof this actually fired --
+                                      ; if the wire were the problem, this
+                                      ; should print up to 3 times before
+                                      ; the final timeout
+    mov eax, [tcp_cur_seq]           ; save the current "next new data" seq
+    push rax
+    mov eax, [tls_ch_seq]
+    mov [tcp_cur_seq], eax           ; rewind to the ClientHello's own seq
+    lea rdi, [tls_tx_buf]
+    mov byte [rdi], CT_HANDSHAKE
+    mov byte [rdi+1], 0x03
+    mov byte [rdi+2], 0x03
+    mov eax, [tls_ch_len]
+    mov byte [rdi+3], ah
+    mov byte [rdi+4], al
+    lea rdi, [tls_tx_buf + 5]
+    lea rsi, [tls_ch_buf]
+    mov ecx, [tls_ch_len]
+    rep movsb
+    mov eax, [tls_ch_len]
+    add eax, 5
+    mov ecx, eax
+    lea rsi, [tls_tx_buf]
+    mov r8d, [tcp_peer_ip]
+    mov r9w, [tcp_peer_port]
+    mov r10w, [tcp_my_port]
+    mov r11w, TCP_FLAG_PSH | TCP_FLAG_ACK
+    call tcp_send_segment            ; ignore CF -- this is best-effort; a
+                                      ; real failure here surfaces the usual
+                                      ; way once the round budget still
+                                      ; expires and tls_wait_for_record times
+                                      ; out normally
+    pop rax
+    mov [tcp_cur_seq], eax           ; restore -- unaffected by a retransmit
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; ============================================================
 ;  tls_error_print -- rsi = error string. Prints in red.
 ; ============================================================
 tls_error_print:
@@ -1606,15 +1810,24 @@ tls_connect_and_handshake:
     mov rcx, 128
     rep stosb
     ; ---- copy hostname into tls_dns_buf (keep r14 = hostname) ----
+    ; Bounded copy: tls_dns_buf is 128 bytes and was just zeroed above, so
+    ; stopping at 127 chars always leaves the terminating NUL in place.
+    ; (Every other buffer copy in this file is bounds-checked -- this one
+    ; wasn't, and an over-length host would silently overrun tls_dns_buf
+    ; into whatever data follows it.)
     lea rdi, [tls_dns_buf]
     mov rsi, r14
+    xor ecx, ecx
 .tls_ch_copy:
+    cmp ecx, 127
+    jae .tls_ch_copy_done
     mov al, [rsi]
     test al, al
     jz .tls_ch_copy_done
     mov [rdi], al
     inc rsi
     inc rdi
+    inc ecx
     jmp .tls_ch_copy
 .tls_ch_copy_done:
     lea rsi, [tls_dns_buf]
@@ -1623,8 +1836,39 @@ tls_connect_and_handshake:
     je .tls_conn_dnsfail
     mov [tcp_peer_ip], eax
     mov [tcp_peer_port], r15w
-    mov ax, [nic_ip_id]
-    add ax, 0x4000
+    mov dword [tls_dns_ip_idx], 0     ; eax == nic_dns_ips[0] already
+
+    ; ---- trace every frame for the rest of this call ----
+    ; dns_query already turned nic_diag_verbose back off internally by
+    ; the time it returns (it only traces its own DNS wait), so the SYN,
+    ; SYN-ACK, our ACK, the ClientHello send, and anything (or nothing)
+    ; coming back from the peer were all completely invisible on the
+    ; console -- the trace stopped right after the DNS reply. Turn it on
+    ; for the rest of the TCP+TLS connect so a stalled handshake can
+    ; actually be diagnosed. .tls_conn_done turns it back off on every
+    ; exit path (success or failure).
+    mov byte [nic_diag_verbose], 1
+    mov byte [nic_diag_tx_dumped], 0
+    mov byte [nic_diag_rx_count], 0
+
+    ; ---- pick an ephemeral source port ----
+    ; NOTE: this used to be just [nic_ip_id] + 0x4000. nic_ip_id resets to
+    ; a fixed value at every boot and only a handful of packets (DNS) go
+    ; out before this point, so tcp_my_port came out IDENTICAL on every
+    ; run. If a previous attempt to this same host crashed/rebooted
+    ; without a clean FIN/RST, the remote server is still retransmitting
+    ; on that old connection -- and those stale segments land on our
+    ; brand-new SYN_SENT connection (same src port, same peer) and
+    ; confuse the TCP state machine. That's what the stray
+    ; "rx: ... proto=0x06 src=<peer>" frames arriving before we've even
+    ; sent a SYN are. Mix in rtc_sec_now so the port actually varies
+    ; from run to run.
+    call rtc_sec_now
+    mov ecx, eax
+    movzx eax, word [nic_ip_id]
+    xor eax, ecx
+    and eax, 0x3FFF
+    add eax, 0x4000
     mov [tcp_my_port], ax
     mov byte [kill_flag], 0
     mov dword [tcp_isn], 0x00010000
@@ -1651,6 +1895,7 @@ tls_connect_and_handshake:
     call print_string
 
     ; ---- SYN ----
+.tls_conn_send_syn:
     xor rsi, rsi
     xor ecx, ecx
     mov r8d, [tcp_peer_ip]
@@ -1726,6 +1971,46 @@ tls_connect_and_handshake:
     stc
     jmp .tls_conn_done
 .tls_conn_timeout:
+    ; a lot of hostnames (raw.githubusercontent.com among them) resolve to
+    ; several anycast IPs, and it's common for only some of them to be
+    ; reachable from a given network -- one edge times out while another
+    ; answers instantly. Before giving up outright, work through any other
+    ; A records the DNS reply gave us.
+    movzx eax, byte [nic_dns_ip_count]
+    mov ecx, [tls_dns_ip_idx]
+    inc ecx
+    cmp ecx, eax
+    jae .tls_conn_timeout_final        ; no more candidates left
+    mov [tls_dns_ip_idx], ecx
+    mov eax, [nic_dns_ips + rcx*4]
+    mov [tcp_peer_ip], eax
+    mov rsi, msg_tls_retry_ip
+    call print_string
+    lea rsi, [tcp_peer_ip]
+    call print_ip4
+    mov rsi, msg_tls_nl
+    call print_string
+    ; fresh connection state for the new peer
+    call rtc_sec_now
+    mov ecx, eax
+    movzx eax, word [nic_ip_id]
+    xor eax, ecx
+    and eax, 0x3FFF
+    add eax, 0x4000
+    mov [tcp_my_port], ax
+    mov dword [tcp_isn], 0x00010000
+    mov eax, [tcp_isn]
+    mov [tcp_cur_seq], eax
+    mov dword [tcp_cur_ack], 0
+    mov dword [tcp_last_ack], 0
+    mov byte [tcp_rst_got], 0
+    mov byte [tcp_fin_got], 0
+    mov byte [tcp_rx_got], 0
+    mov byte [tcp_retry], 0
+    mov byte [tcp_wait_ticks], TCP_ROUND_SECS
+    mov byte [tcp_state], 1
+    jmp .tls_conn_send_syn
+.tls_conn_timeout_final:
     mov rsi, msg_tcp_timeout
     call tls_error_print
     stc
@@ -1733,6 +2018,7 @@ tls_connect_and_handshake:
 .tls_conn_tlsfail:
     stc
 .tls_conn_done:
+    mov byte [nic_diag_verbose], 0
     pop r15
     pop r14
     pop r13
@@ -2105,6 +2391,8 @@ tls_sig_algs:
     db 0x08, 0x05, 0x05, 0x03
     db 0x08, 0x06, 0x06, 0x03
 
+tls_alpn_http11: db "http/1.1"
+
 ; key schedule scratch
 tls_early_secret:   times 32 db 0
 tls_derived1:       times 32 db 0
@@ -2205,7 +2493,18 @@ tls_suite:          dw 0
 tls_wait_ticks:     db 0
 tls_retry:          db 0
 tls_last_sec:       dd 0
+; optional retransmit hook for tls_wait_for_record: if nonzero, called once
+; per elapsed retry round (mirrors the SYN retransmit tls_connect_and_
+; handshake already does). Needed because unlike the SYN phase, nothing
+; else re-sends the ClientHello -- if that one TCP segment is dropped in
+; transit, the server never even sees the request, so no amount of passive
+; waiting will ever produce a reply. Caller sets/clears it around the call.
+tls_wfr_resend_hook: dq 0
+tls_ch_seq:          dd 0        ; tcp_cur_seq the ClientHello was sent at,
+                                  ; so a retransmit can reuse the same seq
+                                  ; instead of the (already advanced) next one
 tls_dns_buf:        times 128 db 0
+tls_dns_ip_idx:     dd 0        ; which entry of nic_dns_ips we're on
 
 ; labels (no "tls13 " prefix -- hkdf_expand_label adds it)
 tls_label_derived:  db "derived"
@@ -2225,7 +2524,9 @@ tls_empty_hash:
     db 0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55
 
 ; messages
+msg_tls_retry_ip:     db "tls: no reply from that address, trying ", 0
 msg_tls_connecting:   db "tls: connecting to ", 0
+msg_tls_resend_ch:    db "tls: no ServerHello yet -- resending ClientHello", 10, 0
 msg_tls_colon:        db ":", 0
 msg_tls_nl:           db 10, 0
 msg_tls_connected:    db 10, "tls: connected.", 10, 0
@@ -2235,4 +2536,11 @@ msg_tls_badfin:       db "tls: server Finished mismatch", 10, 0
 msg_tls_badmac:       db "tls: record auth failure", 10, 0
 msg_tls_sendfail:     db "tls: send failed", 10, 0
 msg_tls_handshake_fail: db "tls: handshake failed", 10, 0
+msg_tls_hs_timeout:   db "tls: handshake failed -- no reply from server (timeout waiting for a record)", 10, 0
+msg_tls_hs_reset:     db "tls: handshake failed -- connection reset by peer", 10, 0
+msg_tls_sh_reject:    db "tls: handshake failed -- ServerHello rejected (bad version/cipher/compression, or no usable key_share)", 10, 0
+msg_tls_overflow:     db "tls: handshake failed -- server's encrypted flight was too large to reassemble", 10, 0
+msg_tls_finlen:       db "tls: handshake failed -- server Finished message had the wrong length", 10, 0
+msg_tls_alert_level:  db "tls: server sent alert, level=", 0
+msg_tls_alert_desc:   db " description=", 0
 msg_tls_alert:        db "tls: fatal alert from server", 10, 0
