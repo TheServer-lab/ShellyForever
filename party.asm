@@ -22,7 +22,16 @@
 ;     against the keyword list) via the existing str_eq helper.
 ; ============================================================
 
-PARTY_MAX_TOKENS equ 512     ; token array capacity
+PARTY_MAX_TOKENS equ 2048    ; token array capacity - was 512, too small for
+                              ; even moderate scripts (e.g. matrix_rain.pa
+                              ; needs ~775 tokens); party_emit's overflow
+                              ; path looks identical to a bad-char lex
+                              ; failure to the caller (same party_lex_ok=0
+                              ; + party_error_line), so hitting the old cap
+                              ; showed up as a misleading "lex error near
+                              ; line N" at whatever line happened to be
+                              ; mid-scan when the array filled, not at any
+                              ; actually-invalid text
 PARTY_IDENT_MAX  equ 40      ; longest ident/keyword this lexer buffers
 
 ; ---- token types ----
@@ -60,7 +69,9 @@ TOK_COMMA   equ 30
 TOK_PERCENT equ 31
 TOK_READ    equ 32
 TOK_RUSH    equ 33          ; `rush <expr>` - run a Rush/ShellyForever shell command line
-TOK_COUNT_KNOWN equ 34       ; number of entries in party_tok_names
+TOK_AND     equ 34          ; &&
+TOK_OR      equ 35          ; ||
+TOK_COUNT_KNOWN equ 36       ; number of entries in party_tok_names
 TOK_ERROR   equ 255
 
 ; ------------------------------------------------------------
@@ -960,6 +971,10 @@ party_lex:
     je .pl_gt
     cmp al, ','
     je .pl_comma
+    cmp al, '&'
+    je .pl_amp
+    cmp al, '|'
+    je .pl_pipe
 
     jmp .pl_bad_char
 
@@ -1349,6 +1364,36 @@ party_lex:
     inc r13
     jmp .pl_loop
 
+.pl_amp:
+    mov al, [r13+1]
+    cmp al, '&'
+    jne .pl_bad_char           ; bare '&' isn't a valid Party token
+    mov r14, r13
+    sub r14, r12
+    mov r8, TOK_AND
+    mov r9, r14
+    mov r10, 2
+    call party_emit
+    cmp al, 0
+    je .pl_overflow
+    add r13, 2
+    jmp .pl_loop
+
+.pl_pipe:
+    mov al, [r13+1]
+    cmp al, '|'
+    jne .pl_bad_char           ; bare '|' isn't a valid Party token
+    mov r14, r13
+    sub r14, r12
+    mov r8, TOK_OR
+    mov r9, r14
+    mov r10, 2
+    call party_emit
+    cmp al, 0
+    je .pl_overflow
+    add r13, 2
+    jmp .pl_loop
+
 .pl_bad_char:
     mov byte [party_lex_ok], 0
     jmp .pl_out
@@ -1526,18 +1571,23 @@ party_boot_compiled:
 ; (party_scratch3, folded into the existing party_scratch region
 ; below) + 2084 bytes (the new party_arr_used/count/data regions:
 ; PARTY_ARR_MAX + PARTY_ARR_MAX*8 + PARTY_ARR_MAX*PARTY_ARR_CAP*32 =
-; 4 + 32 + 2048), so 20226 + 32 + 2084 = 22342. This constant is NOT
-; auto-derived from party_ctx_table below - if that table's per-entry
-; sizes change again, update this by hand to match, the same way this
-; session had to.
-PARTY_CTX_REGS_OFFS equ 22342 - 24
-PARTY_CTX_SIZE      equ 22342
+; 4 + 32 + 2048), so 20226 + 32 + 2084 = 22342. Bumping
+; PARTY_MAX_TOKENS from 512 to 2048 grows the token-array entry below
+; from 4098 (2 + 512*8) to 16386 (2 + 2048*8), a delta of 12288, so
+; 22342 + 12288 = 34630. Bumping PARTY_ARR_CAP from 16 to 80 grows
+; party_arr_data from 2048 to 10240 (4*80*32), a delta of 8192, so
+; 34630 + 8192 = 42822. This constant is NOT auto-derived from
+; party_ctx_table below - if that table's per-entry sizes change
+; again, update this by hand to match, the same way this session had
+; to (three times now).
+PARTY_CTX_REGS_OFFS equ 42822 - 24
+PARTY_CTX_SIZE      equ 42822
 
 party_ctx_table:
     dq party_lex_ok, 7             ; lex_ok, exec_ok, killed, error_line
     dq party_src_base, 8
     dq party_ident_buf, 184        ; ident_buf + call_name_buf + stmt_name_buf + text_buf
-    dq party_token_count, 4098     ; token_count + the token array
+    dq party_token_count, 16386    ; token_count + the token array (PARTY_MAX_TOKENS*8 + 2)
     dq party_returning, 1
     dq party_err_msg_ptr, 40       ; err_msg_ptr, vsp, call_depth, loc_count, func_count
     dq party_while_cond_tok, 8
@@ -1553,7 +1603,8 @@ party_ctx_table:
     dq party_frame_ret_r13, 1344   ; call frames incl. the retval block
     dq party_arr_used, 4           ; Phase 4: array-slot table (used flags)
     dq party_arr_count, 32         ; Phase 4: array-slot table (element counts)
-    dq party_arr_data, 2048        ; Phase 4: array-slot table (element storage)
+    dq party_arr_data, 10240       ; Phase 4: array-slot table (element storage)
+                                    ; PARTY_ARR_MAX*PARTY_ARR_CAP*32 = 4*80*32
     dq 0, 0
 
 party_ctx_save:                    ; rdi = dst ctx base
@@ -2204,10 +2255,26 @@ party_exec_stmts:
     jmp .pes_out
 .pes_while_nk:
     mov r13d, [party_while_body_tok]
+    ; Stash THIS loop's cond/body token indices on the real stack before
+    ; running the body. party_while_cond_tok/party_while_body_tok are
+    ; single globals - if the body contains its own nested `while`, that
+    ; inner loop reuses (and overwrites) the same globals for its own
+    ; bookkeeping. Without saving/restoring here, our re-check below would
+    ; read the *inner* loop's leftover token positions instead of our
+    ; own once the nested while finishes, sending r13 to a garbage
+    ; position - same reentrancy issue r14 already avoids via push/pop.
+    mov eax, [party_while_cond_tok]
+    push rax
+    mov eax, [party_while_body_tok]
+    push rax
     push r14
     mov r14, TOK_RBRACE
     call party_exec_stmts
     pop r14
+    pop rax
+    mov [party_while_body_tok], eax
+    pop rax
+    mov [party_while_cond_tok], eax
     cmp byte [party_exec_ok], 0
     je .pes_out
     cmp byte [party_killed], 0
@@ -3000,6 +3067,52 @@ party_parse_float_text:
 ; (each binary op pops two and pushes one).
 
 party_parse_expr:
+party_parse_or:
+    cmp byte [party_exec_ok], 0
+    je .out
+    call party_parse_and
+.po_loop:
+    cmp byte [party_exec_ok], 0
+    je .out
+    call party_tok_ptr
+    movzx eax, byte [rbx]
+    cmp eax, TOK_OR
+    jne .out
+    inc r13
+    call party_parse_and
+    cmp byte [party_exec_ok], 0
+    je .out
+    call party_op_or
+    jmp .po_loop
+.out:
+    ret
+
+; && binds tighter than ||, same as most C-family languages, but
+; both still sit above ==/!= (party_parse_eq) per the spec's
+; precedence table (section 4). No short-circuit: party_parse_and
+; always calls party_parse_eq for the rhs even when the lhs already
+; settled the result, consistent with && / || evaluating both sides
+; unconditionally everywhere else in the language.
+party_parse_and:
+    cmp byte [party_exec_ok], 0
+    je .out
+    call party_parse_eq
+.pn_loop:
+    cmp byte [party_exec_ok], 0
+    je .out
+    call party_tok_ptr
+    movzx eax, byte [rbx]
+    cmp eax, TOK_AND
+    jne .out
+    inc r13
+    call party_parse_eq
+    cmp byte [party_exec_ok], 0
+    je .out
+    call party_op_and
+    jmp .pn_loop
+.out:
+    ret
+
 party_parse_eq:
     cmp byte [party_exec_ok], 0
     je .out
@@ -3643,6 +3756,19 @@ party_parse_call:
     pop rcx
     pop rdi
     pop rsi
+    ; party_call_name_buf is a single global, but an argument can itself
+    ; be a call (e.g. randseed(time())) - parsing it below recurses into
+    ; party_parse_call, which overwrites party_call_name_buf with the
+    ; nested call's name before we get a chance to dispatch on ours.
+    ; Stash our own name in a private stack copy now, and restore it
+    ; from there right before dispatch (past .ppc_args_done) so a
+    ; clobber from any nested call in our argument list can't leak into
+    ; our own lookup.
+    sub rsp, PARTY_IDENT_MAX
+    lea rsi, [party_call_name_buf]
+    mov rdi, rsp
+    mov rcx, PARTY_IDENT_MAX
+    rep movsb
     inc r13                        ; past '('
     xor r14, r14                   ; arg count
 .ppc_arg_loop:
@@ -3667,6 +3793,14 @@ party_parse_call:
     jne .ppc_err_rparen
 .ppc_args_done:
     inc r13                        ; past ')'
+    ; Restore our own name from the private stack copy - argument
+    ; parsing above may have recursed into party_parse_call for a
+    ; nested call and left party_call_name_buf holding *its* name
+    ; instead of ours.
+    lea rdi, [party_call_name_buf]
+    mov rsi, rsp
+    mov rcx, PARTY_IDENT_MAX
+    rep movsb
     ; Builtins (fopen/fread/fwrite/fclose/fexists/fdelete - Phase 3)
     ; are checked before user-defined functions, so a script can't
     ; shadow them. party_call_builtin clobbers r8-r13 on a match (see
@@ -3699,6 +3833,7 @@ party_parse_call:
     lea rsi, [msg_party_arg_count]
     call party_set_err
 .ppc_out:
+    add rsp, PARTY_IDENT_MAX
     pop r15
     pop r14
     pop r12
@@ -3824,6 +3959,16 @@ party_call_builtin:
     call str_eq
     cmp al, 1
     je .pcb_timestr
+    lea rsi, [party_call_name_buf]
+    lea rdi, [str_fn_sleep]
+    call str_eq
+    cmp al, 1
+    je .pcb_sleep
+    lea rsi, [party_call_name_buf]
+    lea rdi, [str_fn_gotoxy]
+    call str_eq
+    cmp al, 1
+    je .pcb_gotoxy
     xor al, al
     ret
 .pcb_rand:
@@ -3848,6 +3993,14 @@ party_call_builtin:
     ret
 .pcb_timestr:
     call party_bi_timestr
+    mov al, 1
+    ret
+.pcb_sleep:
+    call party_bi_sleep
+    mov al, 1
+    ret
+.pcb_gotoxy:
+    call party_bi_gotoxy
     mov al, 1
     ret
 .pcb_arr_new:
@@ -4417,7 +4570,21 @@ PARTY_ARR_MAX equ 4     ; concurrently-alive arrays. Kept deliberately
                          ; ("nasm party.asm standalone" only checks
                          ; syntax, not final image size) - not done
                          ; this session, no boot/link environment here.
-PARTY_ARR_CAP equ 16    ; elements per array
+PARTY_ARR_CAP equ 80    ; elements per array - was 16, too small for
+                         ; scripts that size an array to the screen
+                         ; width (e.g. matrix_rain.pa's per-column
+                         ; state arrays need cols=79 elements); raised
+                         ; to 80 for a one-element margin. See the
+                         ; BSS-budget caution on PARTY_ARR_MAX above -
+                         ; this raises party_arr_data's footprint from
+                         ; 2048 to 10240 bytes (+8192), which also
+                         ; grows the party_ctx_table entry below and
+                         ; PARTY_CTX_SIZE by the same amount, and that
+                         ; growth is replicated per background-process
+                         ; slot in kernel.asm's proc_bg_ctx - not
+                         ; verified against real link-time BSS headroom
+                         ; this session, same as the MAX_PROCESSES
+                         ; trim already noted above.
 
 ; party_arr_alloc: finds a free array slot. Out: rax = slot index, or
 ; -1 if the table is full (msg_party_arr_full via party_set_err).
@@ -4947,6 +5114,109 @@ party_bi_timestr:
     call party_push_val
     ret
 
+; ============================================================
+;  SCREEN + TIMING BUILTINS  (Phase 6)
+; ============================================================
+; sleep/gotoxy are the two primitives §13's "true matrix rain needs
+; independent columns" note was waiting on: sleep(ms) throttles a
+; frame loop instead of busy-spinning it at full CPU speed, and
+; gotoxy(x,y) repositions the cursor so a script can address any
+; screen cell directly instead of only ever appending at the bottom.
+; Both route straight to kernel.asm primitives (sleep_ms,
+; kernel_gotoxy) - see the TIMING/SLEEP and CURSOR ADDRESSING
+; sections there for how the delay is actually measured (RDTSC,
+; calibrated once at boot - there's no PIT/IRQ0 timer) and why
+; gotoxy doesn't scroll or draw anything itself.
+
+; ---- sleep(ms) -> none; busy-waits ms milliseconds. Esc still
+; aborts a long sleep early (sleep_ms polls kill_flag itself), same
+; as any other statement - see party_exec_stmts's kill check. ----
+party_bi_sleep:
+    cmp r14, 1
+    je .bsl_argc_ok
+    lea rsi, [msg_party_arg_count]
+    call party_set_err
+    ret
+.bsl_argc_ok:
+    lea rdi, [party_scratch1]
+    call party_pop_val
+    cmp byte [party_exec_ok], 1
+    jne .bsl_out
+    cmp byte [party_scratch1], PV_INT
+    jne .bsl_err_type
+    mov rax, [party_scratch1+8]
+    cmp rax, 0
+    jl .bsl_err_neg
+    mov rdi, rax
+    call sleep_ms
+    lea rdi, [party_scratch]
+    call party_val_set_none
+    lea rsi, [party_scratch]
+    call party_push_val
+    jmp .bsl_out
+.bsl_err_type:
+    lea rsi, [msg_party_arg_int]
+    call party_set_err
+    jmp .bsl_out
+.bsl_err_neg:
+    lea rsi, [msg_party_sleep_neg]
+    call party_set_err
+.bsl_out:
+    ret
+
+; ---- gotoxy(x, y) -> none; moves the cursor to column x, row y
+; (both ints, 0-based, in screen bounds) - the next display/putchar
+; output starts from there, without drawing or scrolling anything
+; itself. Out-of-range x/y is a runtime error rather than a silent
+; clamp, matching randint's lo>hi handling. ----
+party_bi_gotoxy:
+    cmp r14, 2
+    je .bgx_argc_ok
+    lea rsi, [msg_party_arg_count]
+    call party_set_err
+    ret
+.bgx_argc_ok:
+    lea rdi, [party_scratch2]      ; y (pushed last = on top)
+    call party_pop_val
+    lea rdi, [party_scratch1]      ; x
+    call party_pop_val
+    cmp byte [party_exec_ok], 1
+    jne .bgx_out
+    cmp byte [party_scratch1], PV_INT
+    jne .bgx_err_type
+    cmp byte [party_scratch2], PV_INT
+    jne .bgx_err_type
+    mov rax, [party_scratch1+8]    ; x
+    mov rcx, [party_scratch2+8]    ; y
+    cmp rax, 0
+    jl .bgx_err_range
+    cmp rax, VGA_COLS-1
+    jg .bgx_err_range
+    cmp rcx, 0
+    jl .bgx_err_range
+    cmp rcx, VGA_ROWS-1
+    jg .bgx_err_range
+    mov rdi, rax                   ; x
+    mov rsi, rcx                   ; y
+    call kernel_gotoxy
+    lea rdi, [party_scratch]
+    call party_val_set_none
+    lea rsi, [party_scratch]
+    call party_push_val
+    jmp .bgx_out
+.bgx_err_type:
+    lea rsi, [msg_party_arg_int]
+    call party_set_err
+    jmp .bgx_out
+.bgx_err_range:
+    lea rsi, [msg_party_gotoxy_range]
+    call party_set_err
+.bgx_out:
+    ret
+
+msg_party_sleep_neg:     db 'sleep: ms must not be negative', 0
+msg_party_gotoxy_range:  db 'gotoxy: x/y out of screen bounds', 0
+
 ALIGN 8
 fp_2p32:              dq 4294967296.0
 party_time_str_buf1:  times 16 db 0     ; "YYYY-MM-DD", separate from buf2 so
@@ -5337,6 +5607,84 @@ party_op_rel:
     pop r14
     pop r13
     pop r12
+    pop rbx
+.out:
+    ret
+
+; ---- logical AND (&&): pop rhs, pop lhs (both already evaluated by
+; the parser - no short-circuit), truthy-coerce each the same way an
+; if/while condition would (party_truthy), push the bool result. ----
+party_op_and:
+    cmp byte [party_exec_ok], 0
+    je .out
+    push rbx
+    push rcx
+    push rsi
+    push rdi
+    lea rdi, [party_scratch2]
+    call party_pop_val
+    lea rdi, [party_scratch1]
+    call party_pop_val
+    cmp byte [party_exec_ok], 1
+    jne .out2
+    lea rbx, [party_scratch1]
+    call party_truthy
+    mov cl, al
+    lea rbx, [party_scratch2]
+    call party_truthy
+    and cl, al
+    lea rdi, [party_scratch1]
+    cmp cl, 0
+    je .and_false
+    call party_val_set_bool_true
+    jmp .and_push
+.and_false:
+    call party_val_set_bool_false
+.and_push:
+    lea rsi, [party_scratch1]
+    call party_push_val
+.out2:
+    pop rdi
+    pop rsi
+    pop rcx
+    pop rbx
+.out:
+    ret
+
+; ---- logical OR (||): same shape as party_op_and, OR instead of AND ----
+party_op_or:
+    cmp byte [party_exec_ok], 0
+    je .out
+    push rbx
+    push rcx
+    push rsi
+    push rdi
+    lea rdi, [party_scratch2]
+    call party_pop_val
+    lea rdi, [party_scratch1]
+    call party_pop_val
+    cmp byte [party_exec_ok], 1
+    jne .out2
+    lea rbx, [party_scratch1]
+    call party_truthy
+    mov cl, al
+    lea rbx, [party_scratch2]
+    call party_truthy
+    or cl, al
+    lea rdi, [party_scratch1]
+    cmp cl, 0
+    je .or_false
+    call party_val_set_bool_true
+    jmp .or_push
+.or_false:
+    call party_val_set_bool_false
+.or_push:
+    lea rsi, [party_scratch1]
+    call party_push_val
+.out2:
+    pop rdi
+    pop rsi
+    pop rcx
     pop rbx
 .out:
     ret
@@ -5984,6 +6332,8 @@ str_tok_comma:   db 'COMMA', 0
 str_tok_percent: db 'PERCENT', 0
 str_tok_read:    db 'READ', 0
 str_tok_rush:    db 'RUSH', 0
+str_tok_and:     db 'AND', 0
+str_tok_or:      db 'OR', 0
 str_tok_error:   db 'ERROR', 0
 str_tok_dbgpre:  db 'VGL tok=', 0
 str_rel_dbgpre:  db 'REL op=', 0
@@ -6000,6 +6350,7 @@ party_tok_names:
     dq str_tok_slash, str_tok_eq, str_tok_eqeq, str_tok_neq, str_tok_lt
     dq str_tok_lte, str_tok_gt, str_tok_gte, str_tok_comma
     dq str_tok_percent, str_tok_read, str_tok_rush
+    dq str_tok_and, str_tok_or
 
 party_lex_ok:      db 0
 party_exec_ok:     db 0
@@ -6038,6 +6389,11 @@ str_fn_randseed: db 'randseed', 0
 str_fn_time:     db 'time', 0
 str_fn_datestr:  db 'datestr', 0
 str_fn_timestr:  db 'timestr', 0
+
+; Phase 6 builtin function names (screen + timing), same
+; not-a-keyword / can't-be-shadowed mechanism as above.
+str_fn_sleep:    db 'sleep', 0
+str_fn_gotoxy:   db 'gotoxy', 0
 
 ; Phase 3 open-file-handle table, parallel arrays indexed by handle
 ; slot (party_fh_alloc/party_fh_check). party_fh_pending_mode is

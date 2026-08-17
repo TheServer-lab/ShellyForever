@@ -478,7 +478,41 @@ vars c = timestr()          // "HH:MM:SS"
 - `timestr() -> string` — takes no arguments. The current time as
   `"HH:MM:SS"`.
 
-## 14. Example programs
+## 14. Screen and timing builtins
+
+Like the file, array, and random/time builtins (sections 9, 10, 13), these
+are ordinary function-shaped builtins, not statements or keywords — a
+script cannot declare its own `func sleep` or `func gotoxy`; the builtin
+is always what runs.
+
+```
+sleep(250)         // busy-waits ~250ms before the next statement runs
+gotoxy(10, 5)       // moves the cursor to column 10, row 5
+display "hi"        // now prints starting at that cell
+```
+
+- `sleep(ms)` — busy-waits for `ms` milliseconds before continuing.
+  `ms` must be a non-negative int; a non-int argument or a negative
+  `ms` are runtime errors. Statement only, like `fwrite`/`arr_set` —
+  returns no value. **Esc** still aborts a long `sleep` early, the
+  same as it aborts any other running statement.
+- `gotoxy(x, y)` — moves the cursor to column `x`, row `y` (both
+  0-based ints) without drawing or scrolling anything itself — the
+  next `display` output starts from that cell instead of wherever
+  the cursor last was left. The screen is 80x25, so `x` must be in
+  `[0, 79]` and `y` in `[0, 24]`; an out-of-range `x`/`y` is a
+  runtime error rather than a silent clamp, the same way `randint`'s
+  `lo > hi` is. Returns no value.
+
+`display` always follows its output with a newline, so writing to the
+true last screen cell (column 79, row 24) forces a scroll that shifts
+every glyph already drawn by one row — which would desync a script's
+own column/row bookkeeping if it's addressing cells directly via
+`gotoxy`. A script drawing across the whole screen this way typically
+sidesteps that by only ever drawing into columns 0-78 and rows 0-23,
+one short of each true edge.
+
+## 15. Example programs
 
 `helloworld.pa`
 ```
@@ -580,6 +614,15 @@ display "you rolled a {roll}"
 
 vars today = datestr()
 display "today is {today}"
+```
+
+`screen.pa`
+```
+gotoxy(0, 0)
+display "top-left"
+gotoxy(20, 10)
+display "middle of the screen"
+sleep(500)
 ```
 
 `main.pa` + `utils.pa` (modules)

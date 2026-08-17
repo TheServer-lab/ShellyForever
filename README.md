@@ -1,6 +1,6 @@
 # ShellyForever
 
-**Version:** 0.1.17
+**Version:** 0.1.18
 
 A 64-bit shell-based OS written entirely in x86-64 NASM assembly, from scratch —
 no C, no BIOS libraries beyond boot-time disk/keyboard calls, no existing kernel.
@@ -41,6 +41,13 @@ no C, no BIOS libraries beyond boot-time disk/keyboard calls, no existing kernel
     small headered binary, hands it a kernel API table (print, input,
     kill-check), and tracks it in the process table like a script. See
     "Compiled programs: `run`" below.
+  - A package manager — `mksin <folder>` builds a `.sin` installer
+    package, `install <file.sin>` installs one by running its
+    `whattodo.inst` script (creating folders, copying files, registering
+    the program so typing its id launches it), `uninstall <id>` removes a
+    registered program, and `sin get <name>` fetches and installs a
+    package by name over HTTPS in one step. See "Package manager:
+    `mksin`, `install`, and `sin get`" below.
   - **Party**, a small built-in scripting language (`.pa` files) with
     its own variables, expressions, control flow, and functions — the
     interpreter now implements the full v0.1 spec end-to-end.
@@ -86,6 +93,10 @@ no C, no BIOS libraries beyond boot-time disk/keyboard calls, no existing kernel
 | `party` | `party hello.pa` | run a program in **Party** (`.pa`), a small built-in scripting language — own variables, expressions, `if`/`else`, `while`, `func`/`return`, and `display` output. See "Party" below and `PARTY_SPEC.md` |
 | `party compile` | `party compile hello.pa` | compile a Party script straight to a `hello.run` executable instead of interpreting it |
 | `party get` | `party get math` | fetch `<modulename>.pa` from the module server over HTTPS and save it locally, ready for a `module "..."` line |
+| `mksin` | `mksin calculator` | build a `<folder>.sin` installer package from a folder laid out as `whattodo.inst` + `files/` |
+| `install` | `install calculator.sin` | install a `.sin` package: run its `whattodo.inst` instructions, copy its files into place, and register the program so typing its id launches it |
+| `uninstall` | `uninstall calculator` | remove a program previously installed with `install`, by the id it was registered under |
+| `sin get` | `sin get calculator` | download a `.sin` package by name over HTTPS and install it in one step (`-keep` to keep the downloaded file) |
 | `prs` | `prs`, `prs kill 1`, `prs kill rushrun` | list processes, or kill by PID or name |
 | `auth` | `auth sdown`, `auth vars rmv all` | elevate privileges for one dangerous command |
 | `sys reset` | `auth sys reset` | factory-reset the OS volume: wipe every file and variable, recreate default system files (requires auth) |
@@ -564,6 +575,69 @@ follows. Before jumping in, it:
 An unrecognized or missing header prints `run: error: invalid or missing
 RUN 0.1 header` rather than jumping into arbitrary bytes; a missing file
 or missing argument fail the same way `rr`/`party` do.
+
+### Package manager: `mksin`, `install`, and `sin get`
+
+A `.sin` file ("Shelly Installer") is how programs are packaged and
+distributed. It's a stored-mode `.zip` (exactly the format `pack`
+produces) containing two things:
+
+- **`whattodo.inst`** — a tiny instruction script that says what
+  installing should do: declare the package's `name`/`version`, `mkdir`
+  folders, `copy` files from the package's `files/` folder onto the
+  filesystem, and `program <id>` to register a launchable program id.
+  The `.inst` parser accepts LF, CR, and CRLF line endings, so a
+  package edited with Windows-style line endings installs the same as
+  one written on a Unix box.
+- **`files/`** — the actual files `whattodo.inst` copies out.
+
+Four commands cover the lifecycle:
+
+- **`mksin <folder>`** — build `<folder>.sin` from a folder you've
+  already laid out as a package (`whattodo.inst` + `files/`). It
+  validates the folder shape and the `whattodo.inst` script first —
+  unknown instructions, missing arguments, non-absolute destination
+  paths, and `copy` sources missing from `files/` are all reported
+  (with a line number) before anything is written:
+  ```
+  rush>/home: mksin matrix
+  pack: packed 2 file(s) into matrix.zip
+  mksin: built matrix.sin
+  ```
+- **`install <file.sin>`** — validate the package and run its
+  instructions: create the folders it asks for, copy its `files/`
+  entries out, and register the `program <id>` in
+  `/home/sys/programs.sly` so the program can be launched later just by
+  typing that id. Unknown instructions, a missing/invalid package, or a
+  truncated archive are rejected with an error and the install stops
+  (steps already applied aren't rolled back). Esc cancels an install in
+  progress:
+  ```
+  rush>/home: install matrix.sin
+  install: installing matrix.sin
+  install: package: Matrix Rain
+  install: installed matrix.sin
+  rush>/home: matrix
+  run /home/programs/matrix/matrix.run (pid 1)
+  ```
+- **`uninstall <id>`** — remove a program by the id it was registered
+  under: deletes its registered executable and its
+  `/home/sys/programs.sly` entry. Other files the package may have
+  copied are left in place.
+- **`sin get <programname> [-keep]`** — fetch and install in one step:
+  downloads `<programname>.sin` over HTTPS (TLS 1.3, the same
+  no-certificate-validation trust model as `stake`/`sgive`) from the
+  shellybin package repo and hands it straight to `install`. On success
+  the downloaded package is deleted once install finishes; pass `-keep`
+  to leave it in the current folder. The name may only contain letters,
+  digits, `-`, and `_` (no `/`, `..`, or whitespace), and a non-200
+  response (e.g. a typo'd name) is reported without saving or installing
+  anything:
+  ```
+  rush>/home: sin get calculator
+  sin: fetching calculator
+  sin: removed downloaded package
+  ```
 
 ### The RTC clock: `date`, `time`, and `wig time`
 
@@ -1044,9 +1118,10 @@ message and then nothing, which is your cue to power off manually.
   Worth knowing: `mkfl`/`rname`/`cpy`/`mov` don't currently check that a
   destination name is short enough to fit in that 32-byte slot before
   copying it in.
-- `cpy`/`mov` only operate within the current folder (no path arguments like
-  `../docs`), matching how `cf`/`mkf`/etc. already work one directory at a
-  time.
+- `cf`/`mkf`/`rname` operate one directory at a time (no path arguments
+  like `../docs`), while `cpy`/`mov` accept full paths on both sides —
+  `cpy docs/notes.txt backup/` copies into an existing destination folder,
+  and `../x` works for either argument.
 - `~` piping captures a command's printed output into a fixed-size buffer
   (192 bytes) and, for the generic (non-`= name`) case, rebuilds the right
   side's command line by wrapping that captured text in double quotes before
@@ -1072,8 +1147,10 @@ message and then nothing, which is your cue to power off manually.
    follows links; session-only bookmarks could become persistent files,
    and a larger page buffer (currently ~1.5 KB, capped by `tcp_rx_buf`)
    would render longer pages.
-2. **Path arguments** for `cf`/`cpy`/`mov`/`rname` (e.g. `cpy docs/notes.txt ..`)
-   instead of current-folder-only operations.
+2. **Path arguments** for `cf`/`rname` (e.g. `cf docs/sub`,
+   `rname notes.txt docs/notes.txt`) — `cpy`/`mov` already accept full
+   paths on both sides; the remaining directory-local commands are the
+   gap.
 3. **Autosave on mutation** instead of requiring explicit `sync`/`rboot`/`sdown`,
    if you'd rather not think about it (tradeoff: more disk writes).
 4. **A real memory allocator** once you want dynamic-sized files/folders
@@ -1087,6 +1164,20 @@ message and then nothing, which is your cue to power off manually.
 
 ## What's new
 
+- **Package manager & `sin get` (v0.1.18)** — programs can now be
+  packaged, shipped, and installed as `.sin` files. `mksin <folder>`
+  builds an installer package from a folder laid out as `whattodo.inst`
+  + `files/` (validating the script before writing anything);
+  `install <file.sin>` runs the package's instructions — creating
+  folders, copying files, and registering the program so typing its id
+  at the prompt launches it; `uninstall <id>` removes a registered
+  program. `sin get <programname> [-keep]` ties it together: it
+  downloads a package by name over HTTPS and installs it in one step,
+  deleting the downloaded file unless `-keep` is given. This release
+  also fixed the `.inst` parser rejecting CR/CRLF line endings, and two
+  filesystem/runtime bugs that silently corrupted copied binary `.run`
+  files (`cpy`) and let `run` execute stale memory on a truncated one.
+  See "Package manager: `mksin`, `install`, and `sin get`" above.
 - **Party modules & `party get` (v0.1.17)** — multi-file Party
   scripts. A `module "path.pa"` line textually splices that file's
   source in before lexing (function definitions meant to be shared

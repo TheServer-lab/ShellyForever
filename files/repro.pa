@@ -1,0 +1,16 @@
+vars c = 0
+vars w = 0
+
+while (true) {
+    c = 0
+    while (c < 5) {
+        w = c
+        if (w > 0) {
+            display w
+        } else {
+            display 0 - 1
+        }
+        c = c + 1
+    }
+    display "done"
+}

@@ -1,0 +1,25 @@
+vars cols = 5
+vars c = 0
+vars w = 0
+vars wait = arr_new(cols)
+
+vars i = 0
+while (i < cols) {
+    arr_set(wait, i, i)
+    i = i + 1
+}
+
+while (true) {
+    c = 0
+    while (c < cols) {
+        w = arr_get(wait, c)
+        if (w > 0) {
+            arr_set(wait, c, w - 1)
+        } else {
+            display "zero branch"
+        }
+        display w
+        c = c + 1
+    }
+    display "done"
+}

@@ -162,6 +162,8 @@ cmd_install:
     je .line_end
     cmp al, 0x0A
     je .line_end
+    cmp al, 0x0D
+    je .line_end
     cmp r14, LINE_MAX-1
     jae .line_end
     mov [rdi], al
@@ -171,8 +173,17 @@ cmd_install:
     jmp .copy_loop
 .line_end:
     mov [inst_content_ptr], r12
-    cmp byte [r12], 0x0A
+    mov al, [r12]
+    cmp al, 0x0A
+    je .skip_one_nl
+    cmp al, 0x0D
     jne .no_nl
+    inc r12
+    cmp byte [r12], 0x0A
+    je .skip_one_nl
+    mov [inst_content_ptr], r12
+    jmp .no_nl
+.skip_one_nl:
     inc r12
     mov [inst_content_ptr], r12
 .no_nl:
@@ -261,6 +272,7 @@ inst_exec_line:
 
     mov rsi, r13
     mov rdi, inst_cmd_buf
+    mov edx, 31
     call next_token
     mov r13, rsi                     ; cursor now past the keyword
 
@@ -325,6 +337,7 @@ inst_exec_line:
 .k_name:
     mov rsi, r13
     mov rdi, inst_arg1_buf
+    mov edx, 127
     call next_token
     mov r13, rsi
     mov rsi, msg_install_pkg_name
@@ -340,6 +353,7 @@ inst_exec_line:
 .k_version:
     mov rsi, r13
     mov rdi, inst_arg1_buf
+    mov edx, 127
     call next_token
     mov r13, rsi
     xor al, al
@@ -348,6 +362,7 @@ inst_exec_line:
 .k_mkdir:
     mov rsi, r13
     mov rdi, inst_arg1_buf
+    mov edx, 127
     call next_token
     mov r13, rsi
     cmp byte [inst_arg1_buf], 0
@@ -358,10 +373,12 @@ inst_exec_line:
 .k_copy:
     mov rsi, r13
     mov rdi, inst_arg1_buf
+    mov edx, 127
     call next_token
     mov r13, rsi
     mov rsi, r13
     mov rdi, inst_arg2_buf
+    mov edx, 159
     call next_token
     mov r13, rsi
     cmp byte [inst_arg1_buf], 0
@@ -374,6 +391,7 @@ inst_exec_line:
 .k_delete:
     mov rsi, r13
     mov rdi, inst_arg1_buf
+    mov edx, 127
     call next_token
     mov r13, rsi
     cmp byte [inst_arg1_buf], 0
@@ -384,10 +402,12 @@ inst_exec_line:
 .k_program:
     mov rsi, r13
     mov rdi, inst_arg1_buf
+    mov edx, 127
     call next_token
     mov r13, rsi
     mov rsi, r13
     mov rdi, inst_arg2_buf
+    mov edx, 159
     call next_token
     mov r13, rsi
     cmp byte [inst_arg1_buf], 0
@@ -1465,6 +1485,8 @@ cmd_mksin:
     je .val_line_end
     cmp al, 0x0A
     je .val_line_end
+    cmp al, 0x0D
+    je .val_line_end
     cmp r8, LINE_MAX-1
     jae .val_line_end
     mov [rdi], al
@@ -1474,8 +1496,17 @@ cmd_mksin:
     jmp .val_copy
 .val_line_end:
     mov [inst_content_ptr], r9
-    cmp byte [r9], 0x0A
+    mov al, [r9]
+    cmp al, 0x0A
+    je .val_skip_one_nl
+    cmp al, 0x0D
     jne .val_no_nl
+    inc r9
+    cmp byte [r9], 0x0A
+    je .val_skip_one_nl
+    mov [inst_content_ptr], r9
+    jmp .val_no_nl
+.val_skip_one_nl:
     inc r9
     mov [inst_content_ptr], r9
 .val_no_nl:
@@ -1620,6 +1651,7 @@ inst_validate_line:
 
     mov rsi, r13
     mov rdi, inst_cmd_buf
+    mov edx, 31
     call next_token
     mov r13, rsi
 
@@ -1682,6 +1714,7 @@ inst_validate_line:
 .k_take1:
     mov rsi, r13
     mov rdi, inst_arg1_buf
+    mov edx, 127
     call next_token
     mov r13, rsi
     xor al, al
@@ -1690,6 +1723,7 @@ inst_validate_line:
 .k_mkdir:
     mov rsi, r13
     mov rdi, inst_arg1_buf
+    mov edx, 127
     call next_token
     mov r13, rsi
     cmp byte [inst_arg1_buf], 0
@@ -1702,10 +1736,12 @@ inst_validate_line:
 .k_copy:
     mov rsi, r13
     mov rdi, inst_arg1_buf
+    mov edx, 127
     call next_token
     mov r13, rsi
     mov rsi, r13
     mov rdi, inst_arg2_buf
+    mov edx, 159
     call next_token
     mov r13, rsi
     cmp byte [inst_arg1_buf], 0
@@ -1725,6 +1761,7 @@ inst_validate_line:
 .k_delete:
     mov rsi, r13
     mov rdi, inst_arg1_buf
+    mov edx, 127
     call next_token
     mov r13, rsi
     cmp byte [inst_arg1_buf], 0
@@ -1737,10 +1774,12 @@ inst_validate_line:
 .k_program:
     mov rsi, r13
     mov rdi, inst_arg1_buf
+    mov edx, 127
     call next_token
     mov r13, rsi
     mov rsi, r13
     mov rdi, inst_arg2_buf
+    mov edx, 159
     call next_token
     mov r13, rsi
     cmp byte [inst_arg1_buf], 0

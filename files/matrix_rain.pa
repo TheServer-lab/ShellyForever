@@ -1,0 +1,132 @@
+// matrix_rain.pa - digital rain for the ShellyForever terminal.
+//
+// Built on the Phase 6 primitives sleep(ms) and gotoxy(x, y): gotoxy
+// places the cursor anywhere on screen, display draws one glyph there,
+// sleep throttles the frame loop instead of busy-spinning it.
+//
+// Screen is 80x25 (cols 0-79, rows 0-24), but we only ever draw into
+// cols 0-78 and rows 0-23. Reason: display always follows its text
+// with a newline, and writing the very last cell on a row/column pair
+// (col 79, row 23) makes that automatic newline push the cursor past
+// row 24 and trigger a screen scroll - which would shift every glyph
+// already drawn and desync it from our column bookkeeping. Staying one
+// row and one column short of the true edge means that can never fire.
+//
+// Also: Party's variable scope is flat (global table at top level, one
+// flat local table per function call) - there's no separate scope per
+// while/if block. So `vars` for anything touched inside the frame loop
+// is declared exactly once, up front; the loop body only ever
+// reassigns (`x = ...`), never redeclares (`vars x = ...`).
+
+vars cols = 79
+vars rows = 24
+vars trail = 8
+
+// glyph set: digits, A-Z, a few symbols - 40 entries
+vars nchars = 40
+vars charset = arr_new(nchars)
+arr_set(charset, 0, "0")
+arr_set(charset, 1, "1")
+arr_set(charset, 2, "2")
+arr_set(charset, 3, "3")
+arr_set(charset, 4, "4")
+arr_set(charset, 5, "5")
+arr_set(charset, 6, "6")
+arr_set(charset, 7, "7")
+arr_set(charset, 8, "8")
+arr_set(charset, 9, "9")
+arr_set(charset, 10, "A")
+arr_set(charset, 11, "B")
+arr_set(charset, 12, "C")
+arr_set(charset, 13, "D")
+arr_set(charset, 14, "E")
+arr_set(charset, 15, "F")
+arr_set(charset, 16, "G")
+arr_set(charset, 17, "H")
+arr_set(charset, 18, "I")
+arr_set(charset, 19, "J")
+arr_set(charset, 20, "K")
+arr_set(charset, 21, "L")
+arr_set(charset, 22, "M")
+arr_set(charset, 23, "N")
+arr_set(charset, 24, "O")
+arr_set(charset, 25, "P")
+arr_set(charset, 26, "Q")
+arr_set(charset, 27, "R")
+arr_set(charset, 28, "S")
+arr_set(charset, 29, "T")
+arr_set(charset, 30, "U")
+arr_set(charset, 31, "V")
+arr_set(charset, 32, "W")
+arr_set(charset, 33, "X")
+arr_set(charset, 34, "Y")
+arr_set(charset, 35, "Z")
+arr_set(charset, 36, "#")
+arr_set(charset, 37, "$")
+arr_set(charset, 38, "%")
+arr_set(charset, 39, "@")
+
+// per-column state
+vars heads = arr_new(cols)   // current head row (negative = still above screen)
+vars speed = arr_new(cols)   // frames between steps for this column
+vars wait = arr_new(cols)    // frames left until this column's next step
+
+randseed(time())
+
+vars i = 0
+vars starty = 0
+vars sp = 0
+while (i < cols) {
+    starty = randint(1, rows * 2)
+    arr_set(heads, i, 0 - starty)
+    sp = randint(1, 3)
+    arr_set(speed, i, sp)
+    arr_set(wait, i, randint(0, sp))
+    i = i + 1
+}
+
+rush "wipe"
+
+// working vars for the frame loop - declared once, reused every frame
+vars c = 0
+vars w = 0
+vars h = 0
+vars erase_y = 0
+vars idx = 0
+vars ch = "0"
+
+while (true) {
+    c = 0
+    while (c < cols) {
+        w = arr_get(wait, c)
+        if (w > 0) {
+            arr_set(wait, c, w - 1)
+        } else {
+            h = arr_get(heads, c)
+
+            // erase the glyph now trailing off the bottom of this drop
+            erase_y = h - trail
+            if (erase_y >= 0 && erase_y < rows) {
+                gotoxy(c, erase_y)
+                display " "
+            }
+
+            // draw the new head glyph, if it's on screen
+            if (h >= 0 && h < rows) {
+                idx = randint(0, nchars - 1)
+                ch = arr_get(charset, idx)
+                gotoxy(c, h)
+                display ch
+            }
+
+            h = h + 1
+            if (h - trail >= rows) {
+                h = 0 - randint(1, rows)
+            }
+            arr_set(heads, c, h)
+            arr_set(wait, c, arr_get(speed, c))
+        }
+        c = c + 1
+    }
+    sleep(40)
+}

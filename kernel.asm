@@ -255,6 +255,13 @@ kernel_entry:
     mov byte [rdi+1], 0x0F
 
     call clear_screen
+
+    ; calibrate the RDTSC-based sleep_ms delay (Party's sleep() builtin)
+    ; against the RTC's real 1-second tick - see the TIMING/SLEEP section
+    ; below for why this exists instead of a PIT/IRQ0 timer. Takes up to
+    ; ~1 real second; done once, here, before anything could call sleep().
+    call tsc_calibrate
+
     call fs_load                ; loads persisted fs from disk, or fs_init's a fresh one
 
     ; --- auto-create the system folders every boot, not just on a fresh
@@ -1193,6 +1200,12 @@ dispatch:
     call str_eq
     cmp al, 1
     je cmd_mksin
+
+    mov rsi, cmd_buf
+    mov rdi, str_sin
+    call str_eq
+    cmp al, 1
+    je cmd_sin
 
     ; --- typed a bare "<name>.run" filename directly? treat it the
     ; same as "run <name>.run" so scripts double as executables ---
@@ -2880,6 +2893,12 @@ help_lookup:
     cmp al, 1
     je .h_mksin
 
+    mov rsi, arg1_buf
+    mov rdi, str_sin
+    call str_eq
+    cmp al, 1
+    je .h_sin
+
     ; unknown command name
     mov rsi, msg_help_unknown1
     mov al, ATTR_ERROR
@@ -3064,6 +3083,10 @@ help_lookup:
     mov rsi, help_mksin
     jmp .h_print
 
+.h_sin:
+    mov rsi, help_sin
+    jmp .h_print
+
 .h_print:
     mov al, [cur_normal_attr]
     call print_string_attr
@@ -3158,6 +3181,7 @@ cmd_run:
 
     lea rdi, [fs_io_buf]
     call fs_read_binary_file
+    mov r13, rax                ; file byte length (0 on IO failure)
 
     lea rsi, [fs_io_buf]
     mov rdi, str_run_magic1
@@ -3200,6 +3224,15 @@ cmd_run:
     jnz .cr_stub_scan
     jmp .cr_bad_header
 .cr_stub_found:
+
+    ; Guard against a truncated .run: the embedded source must actually
+    ; start inside the file. If the boot pointer lands past EOF (e.g. a
+    ; text-safe copy that stopped at a NUL inside the stub), party_boot_compiled
+    ; would lex whatever stale bytes the staging buffer still holds.
+    lea rsi, [r12 + 14]
+    lea rdi, [fs_io_buf + r13]
+    cmp rsi, rdi
+    jae .cr_bad_header
 
     ; "run <file> -back" starts the script in the background: it shares the
     ; process slot but is stepped cooperatively by the shell when idle, its
@@ -9600,13 +9633,20 @@ fs_copy_node:
 
     cmp r11, 2
     jne .isfolder
-    ; copy the whole file through staging
+    ; copy the whole file through staging. fs_write_file would stop at the
+    ; first embedded NUL (str_len), silently truncating binary files like
+    ; compiled .run programs; use the source's exact byte count instead.
     mov rax, r8
     lea rdi, [fs_io_buf]
     call fs_read_file
+    mov ecx, [node_bin_len + r8*4]
+    cmp rcx, EDIT_MAX - 1
+    jbe .cp_len_ok
+    mov rcx, EDIT_MAX - 1
+.cp_len_ok:
     mov rax, r12
     lea rsi, [fs_io_buf]
-    call fs_write_file
+    call fs_write_binary_file
     jmp .done
 .isfolder:
     xor r13, r13
@@ -15414,6 +15454,126 @@ rtc_update:
     pop rax
     ret
 
+; ============================================================
+;  TIMING / SLEEP  (Phase 6)
+; ============================================================
+; There's no PIT/IRQ0 timer wired up (no IDT is set up - keyboard is
+; polled, see this file's header comment), so millisecond delays are
+; built from the CPU's own cycle counter (RDTSC) instead of a
+; hardware timer tick. cpu_tsc_hz is calibrated once at boot
+; (tsc_calibrate, called from kernel_entry) by busy-waiting across
+; exactly one real RTC second and counting how many TSC cycles
+; elapsed - rtc_sec_now's raw (possibly BCD) byte is only ever
+; compared for inequality here, so whether it's BCD or binary doesn't
+; matter, only that it changes once per real second. sleep_ms then
+; busy-waits that many cycles*ms/1000, polling kbd_poll/kill_flag on
+; every spin so Esc still aborts a long sleep promptly instead of
+; only being noticed after it returns (see party_exec_stmts's
+; between-statement kill check in party.asm).
+ALIGN 8
+cpu_tsc_hz:      dq 0
+sleep_ms_cycles: dq 0
+sleep_ms_target: dq 0
+tsc_calibrated:  db 0
+
+; tsc_calibrate: measures cpu_tsc_hz. Call once at boot, before
+; anything relies on sleep_ms - takes up to ~1 real second to run.
+; Clobbers rax, rbx, rcx, rdx.
+tsc_calibrate:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    call rtc_sec_now
+    mov bl, al
+.tc_wait_edge1:
+    call rtc_sec_now
+    cmp al, bl
+    je .tc_wait_edge1        ; spin until the second changes (align to an edge)
+    mov bl, al
+    rdtsc
+    shl rdx, 32
+    or rax, rdx
+    mov rcx, rax              ; rcx = tsc reading at the edge
+.tc_wait_edge2:
+    call rtc_sec_now
+    cmp al, bl
+    je .tc_wait_edge2        ; spin for one full real second
+    rdtsc
+    shl rdx, 32
+    or rax, rdx               ; rax = tsc reading one second later
+    sub rax, rcx               ; rax = cycles elapsed in ~1 second
+    mov [cpu_tsc_hz], rax
+    mov byte [tsc_calibrated], 1
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; sleep_ms: rdi = milliseconds to busy-wait. Returns early (without
+; completing the full delay) if Esc sets kill_flag mid-sleep - the
+; caller doesn't need to do anything extra for that, party_exec_stmts's
+; own kill check (which runs right after a builtin call returns) takes
+; it from there. If cpu_tsc_hz is still 0 (tsc_calibrate never ran, or
+; an absent/bugged TSC), this is a no-op instead of a divide fault or
+; an infinite spin. Clobbers rax, rbx, rcx, rdx.
+sleep_ms:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    cmp qword [cpu_tsc_hz], 0
+    je .sm_out
+    mov rax, [cpu_tsc_hz]
+    imul rax, rdi                 ; rax = tsc_hz * ms
+    xor rdx, rdx
+    mov rbx, 1000
+    div rbx                       ; rax = cycles to wait
+    mov [sleep_ms_cycles], rax
+    rdtsc
+    shl rdx, 32
+    or rax, rdx
+    add rax, [sleep_ms_cycles]
+    mov [sleep_ms_target], rax    ; target tsc reading
+.sm_loop:
+    call kbd_poll
+    cmp byte [kill_flag], 0
+    jne .sm_out                   ; Esc pressed - stop waiting early
+    rdtsc
+    shl rdx, 32
+    or rax, rdx
+    cmp rax, [sleep_ms_target]
+    jae .sm_out
+    pause
+    jmp .sm_loop
+.sm_out:
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; ============================================================
+;  CURSOR ADDRESSING  (Phase 6)
+; ============================================================
+; kernel_gotoxy: dil = x (column, 0..VGA_COLS-1), sil = y (row,
+; 0..VGA_ROWS-1). Moves cursor_row/cursor_col directly (no scrolling,
+; no drawing) and updates the hardware cursor, so the next
+; display/putchar output starts from there. Range-checking the x/y
+; args against screen bounds is the caller's job (party_bi_gotoxy) -
+; this just writes them through, same division of labor as putchar
+; trusting cursor_row/cursor_col are already in range. Clobbers rax.
+kernel_gotoxy:
+    push rax
+    mov al, dil
+    mov [cursor_col], al
+    mov al, sil
+    mov [cursor_row], al
+    call update_cursor
+    pop rax
+    ret
+
 ; format_num2: rax = 0..99 -> two zero-padded digits written to [rdi], rdi
 ; advances by 2. Preserves rax/rbx/rcx/rdx.
 format_num2:
@@ -15786,6 +15946,7 @@ cmd_shelly_rainbow:
 %include "mouse.asm"
 %include "zip.asm"
 %include "install.asm"
+%include "sin.asm"
 
 ; print_prompt: prints "rush>" + current path + ": "
 print_prompt:
@@ -17523,9 +17684,9 @@ wig_str_buf:   times 16 db 0    ; scratch for the wig clock widget
 wig_last_sec:  db 0             ; last second the widget drew (redraw gate)
 
 banner:
-    db "ShellyForever v0.1.17 -- 'help' for commands", 10, 0
+    db "ShellyForever v0.1.18 -- 'help' for commands", 10, 0
 build_stamp:
-    db "build 20260817 -- party modules / party get", 10, 0
+    db "build 20260818 -- package manager / sin get", 10, 0
 
 prompt_head: db "rush>", 0
 prompt_tail: db ": ", 0
@@ -17675,7 +17836,7 @@ SHELLY_PAL_LEN equ 6
 shelly_palette: db 0x0E, 0x0B, 0x0A, 0x0D, 0x09, 0x0F   ; yel, cyan, grn, mag, lblu, wht
 shelly_rule:  db "  ============================================================", 10, 0
 shelly_title: db "         ShellyForever OS", 0
-shelly_version: db "         v0.1.17", 10, 0
+shelly_version: db "         v0.1.18", 10, 0
 shelly_by:    db "         Developed by Sourasish Das", 10, 0
 shelly_cr:    db "         Copyright 2026. All rights reserved.", 10, 0
 str_col_black:    db "black", 0
@@ -17790,6 +17951,7 @@ completion_cmds:
     dq str_install
     dq str_uninstall
     dq str_mksin
+    dq str_sin
     dq 0
 comp_matches: times 96 dw 0
 
@@ -18161,6 +18323,7 @@ help_text:
     db "  install <file.sin> install a Shelly Installer package", 10
     db "  uninstall <id>     remove an installed program by its registered id", 10
     db "  mksin <folder>     build <folder>.sin from a folder holding whattodo.inst + files/", 10
+    db "  sin get <name>     download <name>.sin from the shellybin repo and install it", 10
     db "  <program-id>       launch an installed program by its registered id", 10
     db "  help <command>     show detailed help for one command", 10, 10, 0
 
@@ -18431,6 +18594,20 @@ help_mksin:
     db "  result <folder>.sin. Refuses if <folder>.sin (or a colliding", 10
     db "  <folder>.zip) already exists here - remove it first.", 10
     db "  e.g. mksin calculator      (then: install calculator.sin)", 10, 0
+
+help_sin:
+    db "sin get <programname> [-keep]", 10
+    db "  Download a Shelly Installer package by name over HTTPS from", 10
+    db "  the shellybin repo and install it in one step - equivalent", 10
+    db "  to 'stake' followed by 'install', minus the URL and .sin", 10
+    db "  suffix you'd otherwise have to type yourself. <programname>", 10
+    db "  may only contain letters, digits, '-' and '_' (no '/', '..',", 10
+    db "  or whitespace). On success the downloaded <programname>.sin", 10
+    db "  is deleted once install finishes; pass -keep to leave it in", 10
+    db "  the current folder instead. A non-200 response (e.g. a typo'd", 10
+    db "  name) is reported and nothing is saved or installed.", 10
+    db "  e.g. sin get calculator", 10
+    db "       sin get calculator -keep", 10, 0
 
 help_help:
     db "help | help <command>", 10

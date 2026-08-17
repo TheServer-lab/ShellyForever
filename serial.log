@@ -1,37 +1,5 @@
-ShellyForever v0.2.0 -- 'help' for commands
-build 20260811 -- Party v0.2: % && || read, multi-var vars
-No saved filesystem found - starting fresh.
+|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\ShellyForever v0.1.18 -- 'help' for commands
+build 20260818 -- package manager / sin get
+Loaded filesystem from disk.
 
-rush>/home: take http://10.0.2.2:8000/modulo.pa modulo.pa
-take: getting /modulo.pa from 10.0.2.2
-|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\take: saved to modulo.pa
-rush>/home: party modulo.pa
-2
-1
--1
-rush>/home: take http://10.0.2.2:8000/logic.pa logic.pa
-take: getting /logic.pa from 10.0.2.2
-|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\take: saved to logic.pa
-rush>/home: party logic.pa
-and-ok
-or-ok
-and-false
-or-true
-truthy-yes
-rush>/home: take http://10.0.2.2:8000/multideclare.pa multideclare.pa
-take: getting /multideclare.pa from 10.0.2.2
-|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\take: saved to multideclare.pa
-rush>/home: party multideclare.pa
-0
-7
-0
-3
-8
-rush>/home: take http://10.0.2.2:8000/read.pa read.pa
-take: getting /read.pa from 10.0.2.2
-|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\take: saved to read.pa
-rush>/home: party read.pa
-helly
-hello 
-helly
 rush>/home: 

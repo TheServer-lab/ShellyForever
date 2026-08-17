@@ -1,5 +1,6 @@
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import os
+import socket
 
 HOST = "0.0.0.0"
 PORT = 8080
@@ -54,4 +55,4 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
 print(f"Server running on port {PORT}")
-HTTPServer((HOST, PORT), Handler).serve_forever()
+ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()

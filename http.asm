@@ -13,7 +13,11 @@
 ; ============================================================
 
 HTTP_DEFAULT_PORT equ 80
-HTTP_RX_BUF_SIZE equ 3072
+HTTP_RX_BUF_SIZE equ 16384   ; match TCP_RX_BUF_SIZE: take/stake stage the whole
+                             ; reply (headers + body) in tcp_rx_buf before the
+                             ; body is copied here, so anything bigger than this
+                             ; would just be truncated away - 3072 previously cut
+                             ; ~3.8KB Party scripts mid-line (matrix_rain.pa)
 HTTP_TX_MAX      equ 1200
 
 ; ---- URL parser ----

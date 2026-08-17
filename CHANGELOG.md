@@ -4,6 +4,86 @@ All notable changes to ShellyForever are documented here. The format is
 loosely based on [Keep a Changelog](https://keepachangelog.com/); the
 project does not yet follow strict SemVer.
 
+## [0.1.18] - 2026-08-18
+
+### Added
+
+- **Package manager** (`install.asm`) — `.sin` ("Shelly Installer")
+  packages are now a first-class way to build, ship, and install
+  programs, on top of the existing `pack`/`unpack` zip machinery:
+  - **`mksin <folder>`** builds `<folder>.sin` from a folder already
+    laid out as a package: `<folder>/whattodo.inst` plus a
+    `<folder>/files/` folder holding whatever the script copies onto the
+    target. It validates the folder shape and the `whattodo.inst` script
+    *before* writing anything — unknown instructions, missing arguments,
+    non-absolute destination paths, and `copy` sources missing from
+    `files/` are all reported with a line number. The result is a
+    stored-mode `.zip`, exactly the format `pack` produces.
+  - **`install <file.sin>`** validates a package and runs its
+    `whattodo.inst` instructions: `name`/`version` (reported while
+    installing), `mkdir <folder>`, `copy "files/x" <absolute-path>`,
+    `delete <path>`, `program <id>` (registers the id in
+    `/home/sys/programs.sly` so typing it at the prompt launches the
+    program), and `finish`. Esc cancels an install; steps already
+    applied before an error are not rolled back.
+  - **`uninstall <id>`** removes a program previously installed with
+    `install` — its registered executable and its `programs.sly` entry —
+    leaving other files the package copied in place.
+- **`sin get <programname> [-keep]`** (`sin.asm`) — the package manager's
+  fetch-and-install command: downloads `<programname>.sin` over HTTPS
+  (TLS 1.3, reusing `stake`'s URL/DNS/TLS machinery and its
+  no-certificate-validation trust model) from the shellybin package repo
+  and hands it straight to `install`, exactly as if you'd typed
+  `install <programname>.sin` yourself. The downloaded package is deleted
+  once install finishes unless `-keep` is given. The name is validated to
+  a bare identifier (letters/digits/`-`/`_` only) before it's ever used in
+  a URL or filesystem path, and a non-200 response (e.g. a typo'd name)
+  is reported without saving or installing anything.
+
+### Fixed
+
+- **`mksin`/`install` rejected `whattodo.inst` files with CR or CRLF
+  line endings** — the parser split the script on LF only, so a lone
+  `\r` became a phantom line that failed with `unknown instruction:
+  (line N)`. Both `cmd_install` and `cmd_mksin` now treat CR, CRLF, and
+  LF all as line terminators (skipping a following LF after a CR), so a
+  package edited on Windows installs the same as one written on a Unix
+  box.
+- **Inst-parser `next_token` overflow** — all 17 `next_token` calls in
+  `inst_exec_line`/`inst_validate_line` never set the output-buffer size
+  (`rdx`); each now passes the real capacity of its destination buffer.
+- **`cpy` silently truncated binary files at the first NUL** —
+  `fs_copy_node` copied file content with `fs_write_file`, whose `str_len`
+  length scan stops at an embedded NUL. Copying a compiled `.run` program
+  (whose 14-byte entry stub contains NUL bytes) produced a 43-byte stub
+  instead of the real binary. The copy path now uses
+  `fs_write_binary_file` with the source's exact byte count, so binary
+  files survive `cpy` intact.
+- **`run` executed stale memory on a truncated `.run` file** — when a
+  `.run`'s embedded-source pointer fell past end-of-file (exactly what the
+  `cpy` bug above produced), `cmd_run` booted whatever bytes the staging
+  buffer happened to hold from a previous read instead of failing. The
+  boot pointer is now bounds-checked against the file's real length, and a
+  truncated program is rejected cleanly.
+
+### Changed
+
+- Banner and build stamp bumped to `v0.1.18` (`kernel.asm`); the build
+  stamp now reads "package manager / sin get".
+- README gains a package-manager section, command-table rows for
+  `mksin`/`install`/`uninstall`/`sin get`, and a "What's new" entry.
+
+### Verified
+
+- End-to-end in QEMU on the real kernel: `mksin matrix` built a `.sin`
+  package from a folder whose `whattodo.inst` mixed CR and LF line
+  endings (the exact case that failed before the fix); `install
+  matrix.sin` installed it; and the registered `matrix` program launched
+  and ran. A `party compile` → `cpy` → `mksin` → `install` round trip
+  confirmed the compiled `.run` binary survives the package pipeline
+  intact (checked by downloading the installed file and by running the
+  installed program).
+
 ## [0.1.17] - 2026-08-17
 
 ### Added
