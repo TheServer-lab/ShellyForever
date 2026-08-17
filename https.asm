@@ -180,6 +180,14 @@ cmd_stake:
     call tls_do_exchange
     jc .done
 
+    ; reject non-200 responses (e.g. a 404 page) before saving anything
+    lea rsi, [tls_app_rx_buf]
+    mov ecx, [tls_app_rx_len]
+    call http_status_code
+    jc .bad_status
+    cmp eax, 200
+    jne .bad_status
+
     ; find body in response
     call https_find_body
     jc .no_body
@@ -284,6 +292,18 @@ cmd_stake:
     call tcp_print_dec
     mov rsi, msg_stake_nobody2
     mov al, [cur_normal_attr]
+    call print_string_attr
+    jmp .done
+
+.bad_status:
+    push rax                    ; save status code across print_string calls
+    mov rsi, msg_stake_badstatus
+    mov al, ATTR_ERROR
+    call print_string_attr
+    pop rax
+    call tcp_print_dec
+    mov rsi, msg_stake_badstatus2
+    mov al, ATTR_ERROR
     call print_string_attr
     jmp .done
 

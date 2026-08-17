@@ -2,8 +2,8 @@
 ;  http.asm  --  HTTP take / give (Milestone D)
 ;
 ;  Two shell commands:
-;    take <url> <file>   HTTP/1.0 GET, save body to a file
-;    give <url> <file>   HTTP/1.0 POST, send file content to server
+;    take <url> <file>   HTTP/1.1 GET, save body to a file
+;    give <url> <file>   HTTP/1.1 POST, send file content to server
 ;
 ;  URL format: http://host[:port]/path
 ;  e.g.:  take http://10.0.2.2:80/notes.txt notes.txt
@@ -191,7 +191,7 @@ http_build_get:
     mov byte [rdi+4], '/'
     mov byte [rdi+5], '1'
     mov byte [rdi+6], '.'
-    mov byte [rdi+7], '0'
+    mov byte [rdi+7], '1'
     add rdi, 8
     mov byte [rdi], 13
     mov byte [rdi+1], 10
@@ -271,7 +271,7 @@ http_build_post:
     mov byte [rdi+4], '/'
     mov byte [rdi+5], '1'
     mov byte [rdi+6], '.'
-    mov byte [rdi+7], '0'
+    mov byte [rdi+7], '1'
     add rdi, 8
     mov byte [rdi], 13
     mov byte [rdi+1], 10
@@ -677,9 +677,50 @@ http_find_body:
     pop rbx
     ret
 
+; http_status_code: rsi = raw HTTP response buffer, ecx = its length.
+; Both "HTTP/1.1" and "HTTP/1.0" are 8 bytes, so the status line's
+; 3-digit code always starts at offset 9 regardless of minor version
+; (see party_check_http_200 in party.asm, which this generalizes --
+; that one only cares about 200/not-200; take/stake want the actual
+; code to report to the user).
+; Out: CF=0 and eax = numeric status code (0-999) on success.
+;      CF=1 if the buffer is too short or bytes 9-11 aren't digits
+;      (e.g. a malformed/non-HTTP reply).
+; Clobbers eax only.
+http_status_code:
+    cmp ecx, 12
+    jb .hsc_bad
+    movzx eax, byte [rsi+9]
+    sub eax, '0'
+    cmp eax, 9
+    ja .hsc_bad
+    imul eax, eax, 100
+    push rax
+    movzx eax, byte [rsi+10]
+    sub eax, '0'
+    cmp eax, 9
+    ja .hsc_bad_pop
+    imul eax, eax, 10
+    pop rcx
+    add eax, ecx
+    push rax
+    movzx eax, byte [rsi+11]
+    sub eax, '0'
+    cmp eax, 9
+    ja .hsc_bad_pop
+    pop rcx
+    add eax, ecx
+    clc
+    ret
+.hsc_bad_pop:
+    pop rcx
+.hsc_bad:
+    stc
+    ret
+
 ; ============================================================
 ; cmd_take: "take <url> <file>"
-;     HTTP/1.0 GET from URL, save response body to a file.
+;     HTTP/1.1 GET from URL, save response body to a file.
 ; ============================================================
 cmd_take:
     cmp byte [nic_present], 0
@@ -711,6 +752,14 @@ cmd_take:
 
     call tcp_do_exchange
     jc .done
+
+    ; reject non-200 responses (e.g. a 404 page) before saving anything
+    lea rsi, [tcp_rx_buf]
+    mov ecx, [tcp_rx_len]
+    call http_status_code
+    jc .bad_status
+    cmp eax, 200
+    jne .bad_status
 
     ; find body in response
     call http_find_body
@@ -812,6 +861,18 @@ cmd_take:
 .no_body:
     mov rsi, msg_take_nobody
     mov al, [cur_normal_attr]
+    call print_string_attr
+    jmp .done
+
+.bad_status:
+    push rax                    ; save status code across print_string calls
+    mov rsi, msg_take_badstatus
+    mov al, ATTR_ERROR
+    call print_string_attr
+    pop rax
+    call tcp_print_dec
+    mov rsi, msg_take_badstatus2
+    mov al, ATTR_ERROR
     call print_string_attr
     jmp .done
 

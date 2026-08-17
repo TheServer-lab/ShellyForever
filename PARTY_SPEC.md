@@ -21,6 +21,30 @@ at the prompt) then runs it. The full grammar below compiles, not just a
 subset — this section is a language spec, and everything in it applies
 whether a program is interpreted or compiled.
 
+A third shell form fetches a module instead of running one:
+
+```
+party get modulename
+```
+
+Downloads `modulename.pa` over HTTPS from the community module repo
+(`https://raw.githubusercontent.com/TheServer-lab/shellybin/.../party/modules/modulename.pa`)
+and saves it as `modulename.pa` in the current directory — nothing
+more; it doesn't lex, run, or otherwise validate the fetched text
+beyond confirming the server actually returned it (a 404 is reported
+as an error, not saved). `party get modulename outfile.pa` saves it
+under a different local name instead. A module name is a bare name,
+not a path — it may not contain `/`, and a redundant `.pa` typed on
+the end (`party get modulename.pa`) is accepted and treated the same
+as leaving it off. Once fetched, `module "modulename.pa"` in a script
+splices it in exactly as if it had been written by hand (see §12).
+This shares the same trust model as `stake`/`sgive` (§8's `rush`
+still doesn't reach any of this — `get`, like `compile`, is a form of
+the `party` shell command itself, not a script-callable builtin): the
+connection is encrypted but the server's identity isn't verified, and
+there's no signing or integrity check on what comes back, so only
+fetch modules from sources you trust.
+
 ---
 
 ## 1. Lexical rules
@@ -343,7 +367,118 @@ read name
 display name
 ```
 
-## 12. Example programs
+## 12. Modules
+
+A script can be split across files. A line of the form
+
+```
+module "utils.pa"
+```
+
+splices that file's whole text in at that point, *before* lexing —
+a textual include, the same idea as C's `#include`. This runs as a
+preprocessing pass over the raw source, not as part of the grammar
+itself: `module` is not a keyword the lexer or parser knows about,
+so it has no effect (and isn't recognized) anywhere except as this
+exact line shape.
+
+For a line to be treated as a module include:
+
+- After trimming leading spaces/tabs, the line must start with
+  `module`, then at least one space or tab, then a double-quoted
+  path, with nothing but optional trailing spaces/tabs after the
+  closing quote. Anything else on the line — including a trailing
+  `// comment` — makes it a malformed module statement (a runtime
+  error), not a silently-ignored line.
+- A line that doesn't start with `module` (leading whitespace
+  aside) is left untouched, so `// module "x"` in a comment is never
+  mistaken for a real include.
+- The path is resolved the same way the top-level script's own path
+  is — relative to the shell's current directory, **not** relative
+  to the file containing the `module` line. A module nested inside
+  another module still resolves its own `module "..."` lines against
+  that same current directory.
+
+A module is typically just `func` definitions meant to be called
+from the including script, but nothing stops it from having
+top-level statements too — those run in place, in file order, same
+as if they'd been pasted in by hand. A module doesn't have to be
+hand-written locally — `party get modulename` (see the intro above)
+downloads one from the community module repo and saves it as
+`modulename.pa` in the current directory, ready to `module` it in.
+
+- Modules may include modules, up to 3 levels deep; exceeding that
+  is a runtime error (`modules nested too deeply`), so a module that
+  (perhaps indirectly) includes itself fails cleanly instead of
+  recursing forever.
+- Up to 8 distinct module files may be included in one run; a 9th
+  is a runtime error (`too many modules included`).
+- Each distinct module is only spliced in once, even if multiple
+  files `module` it. "Distinct" is judged by the path text as
+  written, not the resolved file — `module "utils.pa"` and
+  `module "./utils.pa"` are treated as two different includes even
+  if they resolve to the same file.
+- A module path that doesn't resolve to a file is a runtime error
+  (`module file not found: <path>`), as is a path longer than 199
+  characters (`module path too long`) or an expansion that grows the
+  combined source past the interpreter's size limit
+  (`expanded script too large`).
+
+```
+// utils.pa
+func double(n) {
+    return n * 2
+}
+```
+
+```
+// main.pa
+module "utils.pa"
+
+display double(21)      // 42
+```
+
+## 13. Random and time builtins
+
+Like the file and array functions (sections 9–10), these are
+builtin functions, not statements or keywords — a script cannot
+declare its own `func` with any of these names.
+
+```
+vars f = rand()             // float in [0, 1)
+vars n = randint(1, 6)      // int, inclusive both ends - a d6 roll
+randseed(42)                // reseed for a repeatable sequence
+
+vars t = time()             // int seconds since a fixed reference point
+vars d = datestr()          // "YYYY-MM-DD"
+vars c = timestr()          // "HH:MM:SS"
+```
+
+- `rand() -> float` — takes no arguments. Returns a pseudo-random
+  float in `[0, 1)`.
+- `randint(lo, hi) -> int` — both `lo` and `hi` must be ints, and
+  `lo <= hi`; otherwise a runtime error (`randint requires two ints`
+  or `randint: lo must be <= hi`). Returns a pseudo-random int in
+  `[lo, hi]`, inclusive on both ends.
+- `randseed(n)` — reseeds the generator from the int `n`. Statement
+  only, like `fwrite`/`arr_set` — returns no value. Without ever
+  calling it, `rand`/`randint` still work: the generator lazily
+  seeds itself from the hardware clock the first time either is
+  called, so two runs started a second or more apart already get
+  different sequences. Call `randseed` explicitly when a run needs a
+  repeatable sequence instead (e.g. a test).
+- `time() -> int` — takes no arguments. Seconds since a fixed
+  reference point (2000-01-01 00:00:00), derived from the hardware
+  real-time clock. This is **not** a true Unix timestamp, but it's
+  monotonic across a run — good for measuring elapsed time or for
+  seeding, not for exchanging timestamps with anything that expects
+  a real epoch.
+- `datestr() -> string` — takes no arguments. The current date as
+  `"YYYY-MM-DD"`.
+- `timestr() -> string` — takes no arguments. The current time as
+  `"HH:MM:SS"`.
+
+## 14. Example programs
 
 `helloworld.pa`
 ```
@@ -435,6 +570,30 @@ arr_set(alias, 0, 99)
 display arr_get(nums, 0)  // 99 - alias and nums share storage
 
 arr_free(nums)
+```
+
+`dice.pa`
+```
+randseed(1)
+vars roll = randint(1, 6)
+display "you rolled a {roll}"
+
+vars today = datestr()
+display "today is {today}"
+```
+
+`main.pa` + `utils.pa` (modules)
+```
+// utils.pa
+func double(n) {
+    return n * 2
+}
+```
+```
+// main.pa
+module "utils.pa"
+
+display double(21)      // 42
 ```
 
 ---

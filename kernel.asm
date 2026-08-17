@@ -611,14 +611,19 @@ process_segment:
 
     mov rsi, line_buf
     mov rdi, cmd_buf
+    mov edx, 31
     call next_token
     mov rdi, arg1_buf
+    mov edx, 255
     call next_token
     mov rdi, arg2_buf
+    mov edx, 159
     call next_token
     mov rdi, arg3_buf
+    mov edx, 31
     call next_token
     mov rdi, arg4_buf
+    mov edx, 31
     call next_token
 
     cmp byte [cmd_buf], 0
@@ -640,8 +645,10 @@ process_segment:
     ; tokenize the right side to see if it's the "= name" shorthand
     mov rsi, pipe_right_buf
     mov rdi, cmd_buf
+    mov edx, 31
     call next_token
     mov rdi, arg1_buf
+    mov edx, 255
     call next_token
 
     cmp byte [cmd_buf], 0
@@ -690,14 +697,19 @@ process_segment:
 
     mov rsi, line_buf
     mov rdi, cmd_buf
+    mov edx, 31
     call next_token
     mov rdi, arg1_buf
+    mov edx, 255
     call next_token
     mov rdi, arg2_buf
+    mov edx, 159
     call next_token
     mov rdi, arg3_buf
+    mov edx, 31
     call next_token
     mov rdi, arg4_buf
+    mov edx, 31
     call next_token
 
     cmp byte [cmd_buf], 0
@@ -709,14 +721,19 @@ process_segment:
     ; no "~" pipe: original behaviour - tokenize line_buf as-is, dispatch
     mov rsi, line_buf
     mov rdi, cmd_buf
+    mov edx, 31
     call next_token
     mov rdi, arg1_buf
+    mov edx, 255
     call next_token
     mov rdi, arg2_buf
+    mov edx, 159
     call next_token
     mov rdi, arg3_buf
+    mov edx, 31
     call next_token
     mov rdi, arg4_buf
+    mov edx, 31
     call next_token
 
     cmp byte [cmd_buf], 0
@@ -15822,11 +15839,16 @@ print_path:
     pop rax
     ret
 
-; next_token: rsi = pointer into source line, rdi = dest buffer
-; advances rsi; writes null-terminated token (may be empty) to rdi
-; supports "quoted strings with spaces"
+; next_token: rsi = source (advanced past the consumed token), rdi =
+; destination buffer, rdx = max chars to write (destination buffer
+; size minus 1, for the NUL). Stops copying at rdx chars even if the
+; token is longer, so a long argument (e.g. a long URL) truncates
+; instead of overflowing into whatever buffer follows rdi in memory.
+; Still always NUL-terminates. Supports "quoted strings with spaces".
 next_token:
     push rax
+    push rbx
+    xor ebx, ebx                ; chars written so far
 .skip:
     mov al, [rsi]
     cmp al, 0
@@ -15845,8 +15867,12 @@ next_token:
     je .term
     cmp al, '"'
     je .qend
+    cmp ebx, edx
+    jae .qskip               ; buffer full - keep consuming input but stop writing
     mov [rdi], al
     inc rdi
+    inc ebx
+.qskip:
     inc rsi
     jmp .qloop
 .qend:
@@ -15859,16 +15885,22 @@ next_token:
     je .term
     cmp al, ' '
     je .term
+    cmp ebx, edx
+    jae .pskip                ; buffer full - keep consuming input but stop writing
     mov [rdi], al
     inc rdi
+    inc ebx
+.pskip:
     inc rsi
     jmp .ploop
 .term:
     mov byte [rdi], 0
+    pop rbx
     pop rax
     ret
 .empty:
     mov byte [rdi], 0
+    pop rbx
     pop rax
     ret
 
@@ -17491,9 +17523,9 @@ wig_str_buf:   times 16 db 0    ; scratch for the wig clock widget
 wig_last_sec:  db 0             ; last second the widget drew (redraw gate)
 
 banner:
-    db "ShellyForever v0.1.16 -- 'help' for commands", 10, 0
+    db "ShellyForever v0.1.17 -- 'help' for commands", 10, 0
 build_stamp:
-    db "build 20260816 -- HTTPS stake/sgive (TLS 1.3 GET/POST)", 10, 0
+    db "build 20260817 -- party modules / party get", 10, 0
 
 prompt_head: db "rush>", 0
 prompt_tail: db ": ", 0
@@ -17643,7 +17675,7 @@ SHELLY_PAL_LEN equ 6
 shelly_palette: db 0x0E, 0x0B, 0x0A, 0x0D, 0x09, 0x0F   ; yel, cyan, grn, mag, lblu, wht
 shelly_rule:  db "  ============================================================", 10, 0
 shelly_title: db "         ShellyForever OS", 0
-shelly_version: db "         v0.1.16", 10, 0
+shelly_version: db "         v0.1.17", 10, 0
 shelly_by:    db "         Developed by Sourasish Das", 10, 0
 shelly_cr:    db "         Copyright 2026. All rights reserved.", 10, 0
 str_col_black:    db "black", 0
@@ -17893,6 +17925,8 @@ msg_take_noclen:    db "take: no Content-Length in reply.", 10, 0
 msg_take_diskfull:  db "take: disk full while downloading.", 10, 0
 msg_take_hdrbig:    db "take: HTTP reply header too large or malformed.", 10, 0
 msg_take_wrerr:     db "take: disk write failed while downloading.", 10, 0
+msg_take_badstatus:  db "take: server returned status ", 0
+msg_take_badstatus2: db " -- not saved.", 10, 0
 msg_edit_toobig:    db "edit: '", 0
 msg_edit_toobig_sz: db "' is ", 0
 msg_edit_toobig_max: db " bytes - too large for the editor (max ", 0
@@ -17919,6 +17953,8 @@ msg_stake_from:      db " from ", 0
 msg_stake_badpath:   db "stake: bad file path.", 10, 0
 msg_stake_nobody:    db "stake: no body in response. (", 0
 msg_stake_nobody2:   db " bytes received)", 10, 0
+msg_stake_badstatus:  db "stake: server returned status ", 0
+msg_stake_badstatus2: db " -- not saved.", 10, 0
 msg_sgive_usage:     db "sgive: usage sgive <url> <file>", 10, 0
 msg_sgive_posting:   db "sgive: posting ", 0
 msg_sgive_to:        db " to ", 0
@@ -18829,7 +18865,7 @@ leaf2_buf:      times 64 db 0    ; resolved leaf name for arg2_buf paths
 line_buf: times LINE_MAX db 0
 chain_scan_buf: times LINE_MAX db 0  ; scratch copy for ; chaining
 cmd_buf:  times 32  db 0
-arg1_buf: times 96  db 0
+arg1_buf: times 256 db 0
 arg2_buf: times 160 db 0
 dbr_prog_path_buf: times 160 db 0  ; scratch for the bare-registered-id dispatch fallback
 arg3_buf: times 32  db 0             ; for flags (-force, -silent, -info)

@@ -4,6 +4,91 @@ All notable changes to ShellyForever are documented here. The format is
 loosely based on [Keep a Changelog](https://keepachangelog.com/); the
 project does not yet follow strict SemVer.
 
+## [0.1.17] - 2026-08-17
+
+### Added
+
+- **Party modules** (`party.asm`) — a `module "path.pa"` line in a Party
+  script textually splices that file's whole source in at that point,
+  before lexing, the same idea as C's `#include`. Handled by
+  `party_expand_modules`/`party_expand_scan`/`party_expand_include`,
+  which run before `party_lex`, so both `party <file.pa>` and
+  `party compile <file.pa>` get it for free — a module is flattened
+  into the same source buffer the lexer already tokenizes, and is
+  typically just function definitions meant to be called from the
+  including script (though top-level statements in it run in place
+  too). Included paths resolve relative to `cur_dir`, same as the
+  top-level script. Guards against runaway includes: each resolved
+  path is expanded only once per run (`party_module_names`, up to
+  `PARTY_MODULE_MAX` = 8 distinct files), and nesting is capped at
+  `PARTY_MODULE_DEPTH_MAX` = 3, so a module that includes itself
+  (directly or indirectly) fails cleanly instead of recursing forever.
+  A malformed `module` statement, a missing file, too many/too-deep
+  includes, or an expanded script too large to fit all fail with a
+  specific message and leave the original source untouched.
+- **`party get <modulename> [outfile.pa]`** (`party.asm`) — fetches
+  `<modulename>.pa` over TLS from a fixed GitHub-raw module repository
+  and stages it on disk, ready for a `module "modulename.pa"` line or
+  a direct `party modulename.pa` run. Reuses `https.asm`'s `stake`
+  machinery (URL parsing, DNS, `tls_do_exchange`) rather than
+  reimplementing the fetch path. `party get foo` and `party get
+  foo.pa` name the same module (a redundant `.pa` is stripped before
+  the request); a bare module name may not contain `/`. Checks that
+  the server actually returned `200` before trusting the body
+  (`party_check_http_200`), so a raw.githubusercontent.com 404 page
+  can't get saved as if it were the module's source. Saves as
+  `<modulename>.pa` in `cur_dir` by default, or as `outfile.pa` if a
+  third argument is given; doesn't run or lex the fetched text itself.
+  Same no-certificate-validation trust model as `stake`/`sgive`
+  (v0.1.16), and shares that feature's one-time `https_warn_once`
+  warning the first time `party get` runs in a session.
+
+### Changed
+
+- Banner and build stamp bumped to `v0.1.17` (`kernel.asm`); build
+  stamp now reads "party modules / party get".
+- README's Party section gains `module`/`party get` documentation, a
+  new "Party modules & `party get`" subsection with an example, and a
+  `party get` row in the command table.
+
+### Verified
+
+- `party.asm` syntax-checked standalone with `nasm -f elf64`; the only
+  error is the expected one (`EDIT_MAX`, a `kernel.asm` constant
+  `party.asm` is `%include`d into, used to size `party_mod_read_buf`) —
+  no new undefined-symbol errors from the modules/`party get` code
+  itself.
+- Not exercised in a real boot/QEMU environment this release (none
+  available); recommended smoke tests before relying on it: a
+  two-file `module "lib.pa"` include, a self-include and an
+  over-deep include chain (to confirm both fail cleanly), and a
+  `party get <name>` round trip against a real module on the server
+  (plus a `party get <name-that-doesn't-exist>` to check the 404
+  path).
+- A full real `nasm` build in the actual dev tree (with `https.asm`/
+  `tcp.asm`/`http.asm`/`crypto.asm`/`tls.asm`/`browse.asm`/
+  `mouse.asm`/`zip.asm`/`install.asm`/`layout.inc` present) is still
+  outstanding — this sandbox only had `party.asm` and `kernel.asm` to
+  check.
+
+## [0.1.16] - 2026-08-16
+
+### Added
+
+- **HTTPS `stake` / `sgive`** (`https.asm`) — TLS 1.3 counterparts to
+  `take`/`give`: `stake <url> <file>` GETs over an encrypted connection
+  and saves the body locally; `sgive <url> <file>` POSTs a local file's
+  content to an `https://` endpoint. Both require the `https://` scheme
+  (default port 443) and reuse the same URL-parsing, DNS resolution,
+  and Esc-cancelable transfer path as `take`/`give`.
+  - `http_url_scheme` (set by the shared URL parser) tells the
+    take/give and stake/sgive code paths whether to negotiate TLS.
+  - **No certificate validation**: the connection is encrypted but the
+    server's identity is not verified — the same trust model as
+    `curl -k`. A one-time warning (`https_warn_shown`) is printed the
+    first time `stake` or `sgive` runs in a session.
+  - `stake`/`sgive` help text and command-table entries.
+
 ## [0.1.13] - 2026-08-14
 
 ### Added

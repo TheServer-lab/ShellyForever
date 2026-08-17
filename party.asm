@@ -80,6 +80,12 @@ cmd_party:
     cmp al, 1
     je .do_compile
 
+    mov rsi, arg1_buf
+    mov rdi, str_get_flag
+    call str_eq
+    cmp al, 1
+    je .do_get
+
     ; Regular script execution: "party test.pa"
     mov rax, [cur_dir]
     mov rsi, arg1_buf
@@ -97,6 +103,10 @@ cmd_party:
 
     lea rdi, [fs_io_buf]
     call fs_read_file
+
+    call party_expand_modules
+    cmp byte [party_preproc_ok], 1
+    jne .preproc_failed
 
     lea rsi, [fs_io_buf]
     call party_lex
@@ -141,6 +151,10 @@ cmd_party:
     lea rdi, [fs_io_buf]
     call fs_read_file
 
+    call party_expand_modules
+    cmp byte [party_preproc_ok], 1
+    jne .preproc_failed
+
     lea rsi, [fs_io_buf]
     call party_lex
 
@@ -149,6 +163,242 @@ cmd_party:
 
     call derive_run_filename
     call party_compile_to_run
+    ret
+
+; ---- "party get modulename [outfile.pa]" ----
+; Fetches https://raw.githubusercontent.com/TheServer-lab/shellybin/
+; refs/heads/main/party/modules/<modulename>.pa over TLS (reusing
+; https.asm's cmd_stake machinery) and saves it locally as
+; <modulename>.pa in cur_dir, or as the given outfile.pa if a third
+; argument is given. Doesn't run or lex the fetched text - it's just
+; staged on disk, ready for a `module "modulename.pa"` line or a
+; `party modulename.pa` run, same as a hand-written file would be.
+.do_get:
+    cmp byte [arg2_buf], 0
+    jne .pg_have_name
+    mov rsi, msg_party_get_usage
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    ret
+.pg_have_name:
+    cmp byte [nic_present], 0
+    je .pg_no_nic
+
+    ; a module name is a bare name, not a path - reject '/' up front
+    ; rather than let it silently reshape the request URL or the
+    ; local destination path
+    lea rsi, [arg2_buf]
+.pg_scan_slash:
+    mov al, [rsi]
+    cmp al, 0
+    je .pg_slash_ok
+    cmp al, '/'
+    je .pg_bad_name
+    inc rsi
+    jmp .pg_scan_slash
+.pg_slash_ok:
+    lea rsi, [arg2_buf]
+    call str_len
+    cmp rax, PARTY_GET_NAME_MAX
+    ja .pg_too_long
+
+    ; normalize: "party get foo" and "party get foo.pa" name the same
+    ; module - strip a redundant trailing ".pa" up front so it isn't
+    ; doubled onto the URL/destination below (the server layout and
+    ; the local file both already end in ".pa" on their own).
+    lea rdi, [party_get_name_buf]
+    lea rsi, [arg2_buf]
+    call str_copy
+    lea rdi, [party_get_name_buf]
+    call party_strip_pa_suffix
+
+    ; build the request URL: fixed prefix + modulename + ".pa"
+    ; NOTE: str_append expects rdi = start of the destination buffer
+    ; (it walks to the end itself) - it must be reset before every
+    ; call, not just left wherever str_copy last put it.
+    lea rdi, [party_get_url_buf]
+    lea rsi, [party_get_url_prefix]
+    call str_copy
+    lea rdi, [party_get_url_buf]
+    lea rsi, [party_get_name_buf]
+    call str_append
+    lea rdi, [party_get_url_buf]
+    lea rsi, [party_get_pa_suffix]
+    call str_append
+
+    lea rsi, [party_get_url_buf]
+    call http_parse_url
+    jc .pg_bad_url
+    cmp byte [http_url_scheme], 1
+    jne .pg_bad_url          ; shouldn't happen - the prefix is hardcoded https://
+
+    call https_warn_once
+
+    call http_build_get
+    mov [tcp_tx_len], eax
+    call https_bridge_tx
+
+    mov rsi, msg_party_get_fetching
+    call print_string
+    lea rsi, [arg2_buf]
+    call print_string
+    mov rsi, msg_nl
+    call print_string
+
+    lea rsi, [http_host_buf]
+    mov dx, [http_port]
+    call tls_do_exchange
+    jc .pg_done               ; tls_do_exchange already printed the error
+
+    ; confirm the server actually said 200 before trusting the body -
+    ; otherwise a 404 page (raw.githubusercontent.com returns a small
+    ; error body with a non-200 status for a missing file) would get
+    ; saved as if it were the module's own source
+    lea rsi, [tls_app_rx_buf]
+    mov ecx, [tls_app_rx_len]
+    call party_check_http_200
+    cmp al, 1
+    jne .pg_not_found
+
+    call https_find_body
+    jc .pg_no_body
+
+    mov rsi, rax
+    mov dword [http_body_len], ecx
+    test ecx, ecx
+    jz .pg_write_file
+    cmp ecx, (HTTP_RX_BUF_SIZE - 1)
+    jbe .pg_body_fits
+    mov ecx, (HTTP_RX_BUF_SIZE - 1)
+.pg_body_fits:
+    mov dword [http_body_len], ecx
+    lea rdi, [http_rx_buf]
+    rep movsb
+    mov byte [rdi], 0
+
+.pg_write_file:
+    ; destination: arg3_buf if given, else "<modulename>.pa" in cur_dir
+    cmp byte [arg3_buf], 0
+    jne .pg_dest_given
+    lea rdi, [party_get_dest_buf]
+    lea rsi, [party_get_name_buf]
+    call str_copy
+    lea rdi, [party_get_dest_buf]
+    lea rsi, [party_get_pa_suffix]
+    call str_append
+    jmp .pg_dest_ready
+.pg_dest_given:
+    lea rdi, [party_get_dest_buf]
+    lea rsi, [arg3_buf]
+    call str_copy
+.pg_dest_ready:
+
+    mov rax, [cur_dir]
+    lea rsi, [party_get_dest_buf]
+    mov rdi, leaf1_buf
+    call fs_resolve_path
+    cmp rax, -1
+    je .pg_bad_path
+    mov r11, rax
+    call check_target_sys_auth
+    cmp rax, 1
+    je .pg_done
+
+    mov rax, r11
+    mov rsi, leaf1_buf
+    mov r10, -1
+    call fs_find_child
+    cmp rax, -1
+    jne .pg_overwrite
+
+    mov rax, r11
+    mov rsi, leaf1_buf
+    mov r10, 2
+    call fs_create_node
+    cmp rax, -1
+    je .pg_create_fail
+    mov r12, rax
+    jmp .pg_do_write
+
+.pg_create_fail:
+    mov rsi, msg_party_get_createfail
+    mov al, ATTR_ERROR
+    call print_string_attr
+    jmp .pg_done
+
+.pg_overwrite:
+    mov r12, rax
+
+.pg_do_write:
+    mov rax, r12
+    lea rsi, [http_rx_buf]
+    call fs_write_file
+    call maybe_auto_sync
+
+    mov rsi, msg_party_get_saved
+    call print_string
+    lea rsi, [party_get_dest_buf]
+    call print_string
+    mov rsi, msg_party_get_hint
+    call print_string
+    lea rsi, [party_get_dest_buf]
+    call print_string
+    mov rsi, msg_party_get_hint2
+    call print_string
+    jmp .pg_done
+
+.pg_not_found:
+    mov rsi, msg_party_get_notfound
+    mov al, ATTR_ERROR
+    call print_string_attr
+    lea rsi, [arg2_buf]
+    call print_string
+    mov rsi, newline_str
+    call print_string
+    jmp .pg_done
+
+.pg_no_body:
+    mov rsi, msg_stake_nobody
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    mov eax, [tls_app_rx_len]
+    call tcp_print_dec
+    mov rsi, msg_stake_nobody2
+    mov al, [cur_normal_attr]
+    call print_string_attr
+    jmp .pg_done
+
+.pg_bad_url:
+    mov rsi, msg_stake_badurl
+    mov al, ATTR_ERROR
+    call print_string_attr
+    jmp .pg_done
+
+.pg_bad_path:
+    mov rsi, msg_stake_badpath
+    mov al, ATTR_ERROR
+    call print_string_attr
+    jmp .pg_done
+
+.pg_bad_name:
+    mov rsi, msg_party_get_badname
+    mov al, ATTR_ERROR
+    call print_string_attr
+    jmp .pg_done
+
+.pg_too_long:
+    mov rsi, msg_party_get_toolong
+    mov al, ATTR_ERROR
+    call print_string_attr
+    jmp .pg_done
+
+.pg_no_nic:
+    mov rsi, msg_net_no_nic
+    mov al, ATTR_ERROR
+    call print_string_attr
+    jmp .pg_done
+
+.pg_done:
     ret
 
 .want_tokens:
@@ -197,6 +447,431 @@ cmd_party:
     mov rsi, newline_str
     call print_string
     ret
+
+.preproc_failed:
+    mov rsi, msg_party_mod_err
+    mov al, ATTR_ERROR
+    call print_string_attr
+    mov rsi, [party_preproc_err_ptr]
+    call print_string
+    mov rsi, [party_preproc_err_ptr]   ; re-read: print_string may not preserve rsi
+    cmp rsi, msg_party_mod_not_found
+    jne .preproc_failed_done
+    mov rsi, party_preproc_bad_path
+    call print_string
+.preproc_failed_done:
+    mov rsi, newline_str
+    call print_string
+    ret
+
+; party_check_http_200: rsi = raw HTTP response buffer, ecx = its
+; length. Both "HTTP/1.1" and "HTTP/1.0" are 8 bytes, so the status
+; line's 3-digit code always starts at offset 9 regardless of minor
+; version. Used by `party get` to make sure a fetched module is
+; actually the file, not a server's 404 page (https.asm's
+; take/stake now reject non-200 replies too (see http_status_code in
+; http.asm) - this local check just stays a plain boolean, since
+; `party get` only ever cares about 200-or-not, not the exact code).
+; Out: al = 1 if the status code is 200, else 0. Clobbers al only.
+party_check_http_200:
+    cmp ecx, 12
+    jb .pc2_no
+    cmp byte [rsi+9], '2'
+    jne .pc2_no
+    cmp byte [rsi+10], '0'
+    jne .pc2_no
+    cmp byte [rsi+11], '0'
+    jne .pc2_no
+    mov al, 1
+    ret
+.pc2_no:
+    xor al, al
+    ret
+
+; party_strip_pa_suffix: rdi = NUL-terminated buffer, modified in
+; place. If it ends with the literal ".pa", that suffix is dropped;
+; otherwise the buffer is left untouched. Used by `party get` (see
+; cmd_party's .do_get) so "party get foo" and "party get foo.pa" are
+; treated as the same module instead of the latter silently 404ing
+; against a "foo.pa.pa" URL. Clobbers rax, rcx, rsi.
+party_strip_pa_suffix:
+    mov rsi, rdi
+    call str_len              ; rax = length; str_len preserves rsi
+    cmp rax, 3
+    jb .pps_out
+    mov rcx, rax
+    sub rcx, 3                ; rcx = offset of a possible ".pa"
+    lea rsi, [rdi+rcx]
+    cmp byte [rsi], '.'
+    jne .pps_out
+    cmp byte [rsi+1], 'p'
+    jne .pps_out
+    cmp byte [rsi+2], 'a'
+    jne .pps_out
+    mov byte [rsi], 0
+.pps_out:
+    ret
+
+; ============================================================
+;  MODULES  (Phase 5)
+; ============================================================
+; A line of the form
+;     module "otherfile.pa"
+; splices that file's whole text in at that point, before lexing -
+; a textual include, same idea as C's #include or Python's exec of
+; another file's source. This is the simplest way to add
+; multi-file scripts without teaching the rest of the interpreter
+; (one token array over one source buffer - see party_lex's header
+; comment) about which file a token or a function body came from:
+; flatten everything into one buffer first, then lex/collect/run
+; exactly as before. A module is typically just function
+; definitions meant to be called from the including script, but
+; nothing stops it from having top-level statements too - those run
+; in place, in file order, same as if they'd been pasted in by hand.
+;
+; Include cycles and repeats are handled the boring way: each
+; resolved path is only ever expanded once per party_expand_modules
+; call (party_module_names), and nesting depth is capped
+; (PARTY_MODULE_DEPTH_MAX) so a module that (perhaps indirectly)
+; includes itself fails cleanly instead of recursing forever.
+; ------------------------------------------------------------
+
+PARTY_MODULE_MAX       equ 8    ; distinct module files one script may include
+PARTY_MODULE_DEPTH_MAX equ 3    ; how deeply modules may include modules
+PARTY_MOD_PATH_MAX     equ 200  ; NUL-terminated module-path staging size
+
+; party_expand_modules: expands `module "..."` lines in fs_io_buf in
+; place (fs_io_buf holds the just-read main script on entry).
+; Out: party_preproc_ok = 1 on success, fs_io_buf now holds the fully
+; expanded source. On failure, party_preproc_ok = 0,
+; party_preproc_err_ptr names the problem (and, for a not-found
+; module, party_preproc_bad_path holds the offending path) - fs_io_buf
+; is left untouched. Clobbers rax-rdx, rsi, rdi, r8-r15.
+party_expand_modules:
+    push rbx
+    mov byte [party_preproc_ok], 1
+    mov qword [party_module_name_count], 0
+    lea rax, [party_expand_buf]
+    mov qword [party_expand_cursor], rax
+
+    lea rsi, [fs_io_buf]
+    xor r15, r15                   ; depth 0 = the top-level script itself
+    call party_expand_scan
+    cmp byte [party_preproc_ok], 1
+    jne .pem_out
+
+    mov rdi, [party_expand_cursor]
+    mov byte [rdi], 0
+    lea rax, [party_expand_buf]
+    sub rdi, rax                   ; rdi = expanded length
+    cmp rdi, EDIT_MAX-1
+    jb .pem_fits
+    lea rsi, [msg_party_mod_too_big]
+    mov [party_preproc_err_ptr], rsi
+    mov byte [party_preproc_ok], 0
+    jmp .pem_out
+.pem_fits:
+    lea rsi, [party_expand_buf]
+    lea rdi, [fs_io_buf]
+    call str_copy
+.pem_out:
+    pop rbx
+    ret
+
+; party_expand_scan: rsi = null-terminated text to scan line-by-line,
+; r15 = nesting depth of this text (0 for the top-level script).
+; Copies ordinary lines straight to [party_expand_cursor]; for each
+; `module "path"` line, calls party_expand_include instead. Stops
+; (without erroring itself) as soon as party_preproc_ok drops to 0 -
+; the routine that set it has already recorded why.
+; Clobbers rax-rdx, rsi, rdi, r8-r15 (rbx/r12-r15 saved/restored so a
+; recursive call - via party_expand_include - can't disturb the
+; caller's line-scan position).
+party_expand_scan:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+.pes_line:
+    cmp byte [party_preproc_ok], 0
+    je .pes_ret
+    cmp byte [rsi], 0
+    je .pes_ret
+    mov r12, rsi                   ; find end of this line ('\n' or NUL)
+.pes_findeol:
+    mov al, [r12]
+    cmp al, 0
+    je .pes_haveeol
+    cmp al, 10
+    je .pes_haveeol
+    inc r12
+    jmp .pes_findeol
+.pes_haveeol:
+    mov r13, rsi                   ; trim leading whitespace, looking for "module"
+.pes_skip_ws1:
+    cmp r13, r12
+    jae .pes_not_module
+    mov al, [r13]
+    cmp al, ' '
+    je .pes_ws1_adv
+    cmp al, 9
+    je .pes_ws1_adv
+    jmp .pes_check_kw
+.pes_ws1_adv:
+    inc r13
+    jmp .pes_skip_ws1
+.pes_check_kw:
+    lea rbx, [r13+6]
+    cmp rbx, r12
+    ja .pes_not_module
+    cmp byte [r13], 'm'
+    jne .pes_not_module
+    cmp byte [r13+1], 'o'
+    jne .pes_not_module
+    cmp byte [r13+2], 'd'
+    jne .pes_not_module
+    cmp byte [r13+3], 'u'
+    jne .pes_not_module
+    cmp byte [r13+4], 'l'
+    jne .pes_not_module
+    cmp byte [r13+5], 'e'
+    jne .pes_not_module
+    mov al, [r13+6]
+    cmp al, ' '
+    je .pes_is_module
+    cmp al, 9
+    je .pes_is_module
+    jmp .pes_not_module
+
+.pes_is_module:
+    add r13, 6
+.pes_skip_ws2:
+    cmp r13, r12
+    jae .pes_bad_stmt
+    mov al, [r13]
+    cmp al, ' '
+    je .pes_ws2_adv
+    cmp al, 9
+    je .pes_ws2_adv
+    jmp .pes_check_quote
+.pes_ws2_adv:
+    inc r13
+    jmp .pes_skip_ws2
+.pes_check_quote:
+    cmp byte [r13], '"'
+    jne .pes_bad_stmt
+    inc r13
+    mov r14, r13                   ; r14 = path text start
+.pes_find_close:
+    cmp r13, r12
+    jae .pes_bad_stmt              ; unterminated string on this line
+    cmp byte [r13], '"'
+    je .pes_found_close
+    inc r13
+    jmp .pes_find_close
+.pes_found_close:
+    mov rbx, r13
+    sub rbx, r14                   ; rbx = path length
+    cmp rbx, PARTY_MOD_PATH_MAX-1
+    jb .pes_path_len_ok
+    lea rsi, [msg_party_mod_path_long]
+    mov [party_preproc_err_ptr], rsi
+    mov byte [party_preproc_ok], 0
+    jmp .pes_ret
+.pes_path_len_ok:
+    push rsi
+    mov rsi, r14
+    lea rdi, [party_mod_path_buf]
+    mov rcx, rbx
+    rep movsb
+    mov byte [rdi], 0
+    pop rsi
+    inc r13                        ; step past the closing quote
+.pes_trail_ws:
+    cmp r13, r12
+    jae .pes_trail_ok
+    mov al, [r13]
+    cmp al, ' '
+    je .pes_trail_adv
+    cmp al, 9
+    je .pes_trail_adv
+    cmp al, 13
+    je .pes_trail_adv
+    lea rsi, [msg_party_mod_bad_stmt]
+    mov [party_preproc_err_ptr], rsi
+    mov byte [party_preproc_ok], 0
+    jmp .pes_ret
+.pes_trail_adv:
+    inc r13
+    jmp .pes_trail_ws
+.pes_trail_ok:
+    call party_expand_include      ; party_mod_path_buf = path, r15 = our depth
+    cmp byte [party_preproc_ok], 1
+    jne .pes_ret
+    jmp .pes_next_line
+
+.pes_bad_stmt:
+    lea rsi, [msg_party_mod_bad_stmt]
+    mov [party_preproc_err_ptr], rsi
+    mov byte [party_preproc_ok], 0
+    jmp .pes_ret
+
+.pes_not_module:
+    mov rdi, [party_expand_cursor]
+    mov rbx, rsi
+.pes_copy_loop:
+    cmp rbx, r12
+    jae .pes_copy_done
+    mov al, [rbx]
+    mov [rdi], al
+    inc rdi
+    inc rbx
+    jmp .pes_copy_loop
+.pes_copy_done:
+    mov byte [rdi], 10
+    inc rdi
+    mov [party_expand_cursor], rdi
+
+.pes_next_line:
+    cmp byte [r12], 0
+    je .pes_ret
+    mov rsi, r12
+    inc rsi
+    jmp .pes_line
+.pes_ret:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; party_expand_include: party_mod_path_buf = NUL-terminated module
+; path (as written in the source, resolved relative to cur_dir same
+; as the top-level script), r15 = depth of the scan that found this
+; include. Resolves + reads the file, recurses into
+; party_expand_scan for its own text (at depth r15+1, into a
+; per-depth scratch buffer so an outer scan still in progress isn't
+; disturbed), and appends its expansion to [party_expand_cursor].
+; Silently does nothing if this exact path was already included
+; earlier in the same party_expand_modules run.
+; Clobbers rax-rdx, rsi, rdi, r8-r11 (rbx/r12-r15 saved/restored).
+party_expand_include:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov r12, r15
+    inc r12                        ; r12 = new depth
+    cmp r12, PARTY_MODULE_DEPTH_MAX
+    jbe .pei_depth_ok
+    lea rsi, [msg_party_mod_too_deep]
+    mov [party_preproc_err_ptr], rsi
+    mov byte [party_preproc_ok], 0
+    jmp .pei_out
+.pei_depth_ok:
+
+    xor r13, r13
+.pei_dedup_loop:
+    cmp r13, [party_module_name_count]
+    jae .pei_dedup_done
+    mov rax, r13
+    imul rax, PARTY_MOD_PATH_MAX
+    lea rsi, [party_mod_path_buf]
+    lea rdi, [party_module_names+rax]
+    call str_eq
+    cmp al, 1
+    je .pei_out                    ; already included this run - nothing to do
+    inc r13
+    jmp .pei_dedup_loop
+.pei_dedup_done:
+
+    mov rax, [party_module_name_count]
+    cmp rax, PARTY_MODULE_MAX
+    jb .pei_count_ok
+    lea rsi, [msg_party_mod_too_many]
+    mov [party_preproc_err_ptr], rsi
+    mov byte [party_preproc_ok], 0
+    jmp .pei_out
+.pei_count_ok:
+    mov rbx, rax
+    imul rbx, PARTY_MOD_PATH_MAX
+    lea rdi, [party_module_names+rbx]
+    lea rsi, [party_mod_path_buf]
+    call str_copy
+    inc qword [party_module_name_count]
+
+    mov rax, [cur_dir]
+    lea rsi, [party_mod_path_buf]
+    lea rdi, [party_mod_leaf_buf]
+    call fs_resolve_path
+    cmp rax, -1
+    je .pei_not_found
+    mov r14, rax
+    mov rax, r14
+    lea rsi, [party_mod_leaf_buf]
+    mov r10, 2
+    call fs_find_child
+    cmp rax, -1
+    je .pei_not_found
+
+    mov r13, r12
+    dec r13                        ; buffer index = new_depth - 1
+    imul r13, EDIT_MAX
+    lea rdi, [party_mod_read_buf+r13]
+    call fs_read_file
+
+    mov r15, r12                   ; depth parameter for the nested scan
+    lea rsi, [party_mod_read_buf+r13]
+    call party_expand_scan
+    cmp byte [party_preproc_ok], 1
+    jne .pei_out
+
+    mov rdi, [party_expand_cursor]
+    mov byte [rdi], 10             ; separating newline before whatever follows
+    inc rdi
+    mov [party_expand_cursor], rdi
+    jmp .pei_out
+
+.pei_not_found:
+    lea rsi, [msg_party_mod_not_found]
+    mov [party_preproc_err_ptr], rsi
+    lea rdi, [party_preproc_bad_path]
+    lea rsi, [party_mod_path_buf]
+    call str_copy
+    mov byte [party_preproc_ok], 0
+
+.pei_out:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+party_preproc_ok:      db 1
+ALIGN 8
+party_preproc_err_ptr: dq 0
+party_expand_cursor:   dq 0
+party_module_name_count: dq 0
+party_module_names:    times PARTY_MODULE_MAX*PARTY_MOD_PATH_MAX db 0
+party_mod_path_buf:    times PARTY_MOD_PATH_MAX db 0
+party_mod_leaf_buf:    times 64 db 0
+party_preproc_bad_path: times PARTY_MOD_PATH_MAX db 0
+party_mod_read_buf:    times PARTY_MODULE_DEPTH_MAX*EDIT_MAX db 0
+PARTY_EXPAND_MAX equ EDIT_MAX*2
+party_expand_buf:      times PARTY_EXPAND_MAX db 0
+
+msg_party_mod_err:        db 'module: ', 0
+msg_party_mod_too_deep:   db 'modules nested too deeply', 0
+msg_party_mod_too_many:   db 'too many modules included', 0
+msg_party_mod_bad_stmt:   db 'malformed module statement (expected: module "file.pa")', 0
+msg_party_mod_path_long:  db 'module path too long', 0
+msg_party_mod_not_found:  db 'module file not found: ', 0
+msg_party_mod_too_big:    db 'expanded script too large', 0
 
 ; ------------------------------------------------------------
 ; party_lex: rsi = null-terminated source text (in fs_io_buf).
@@ -3119,7 +3794,61 @@ party_call_builtin:
     call str_eq
     cmp al, 1
     je .pcb_arr_free
+    lea rsi, [party_call_name_buf]
+    lea rdi, [str_fn_rand]
+    call str_eq
+    cmp al, 1
+    je .pcb_rand
+    lea rsi, [party_call_name_buf]
+    lea rdi, [str_fn_randint]
+    call str_eq
+    cmp al, 1
+    je .pcb_randint
+    lea rsi, [party_call_name_buf]
+    lea rdi, [str_fn_randseed]
+    call str_eq
+    cmp al, 1
+    je .pcb_randseed
+    lea rsi, [party_call_name_buf]
+    lea rdi, [str_fn_time]
+    call str_eq
+    cmp al, 1
+    je .pcb_time
+    lea rsi, [party_call_name_buf]
+    lea rdi, [str_fn_datestr]
+    call str_eq
+    cmp al, 1
+    je .pcb_datestr
+    lea rsi, [party_call_name_buf]
+    lea rdi, [str_fn_timestr]
+    call str_eq
+    cmp al, 1
+    je .pcb_timestr
     xor al, al
+    ret
+.pcb_rand:
+    call party_bi_rand
+    mov al, 1
+    ret
+.pcb_randint:
+    call party_bi_randint
+    mov al, 1
+    ret
+.pcb_randseed:
+    call party_bi_randseed
+    mov al, 1
+    ret
+.pcb_time:
+    call party_bi_time
+    mov al, 1
+    ret
+.pcb_datestr:
+    call party_bi_datestr
+    mov al, 1
+    ret
+.pcb_timestr:
+    call party_bi_timestr
+    mov al, 1
     ret
 .pcb_arr_new:
     call party_bi_arr_new
@@ -3963,6 +4692,269 @@ party_bi_arr_free:
     call party_set_err
 .baf_out:
     ret
+
+; ============================================================
+;  RANDOM + TIME BUILTINS  (Phase 5)
+; ============================================================
+; random: a xorshift64* generator (state = party_rand_state) lazily
+; seeded on first use from RDTSC mixed with the RTC clock, so two
+; runs started a second or more apart get different sequences without
+; the script having to call randseed() itself. randseed() reseeds it
+; explicitly (e.g. for a repeatable test run).
+;
+; time: there's no real epoch on this hardware, only the CMOS RTC's
+; wall-clock fields (see rtc_update/rtc_sec..rtc_century, kernel.asm
+; ~15322+). time() converts those into a seconds count from a fixed
+; reference point (2000-01-01 00:00:00) using ordinary calendar math
+; - it's not a true Unix timestamp, but it's monotonic across a run
+; and good enough for elapsed-time measurements and for seeding
+; things. datestr()/timestr() just wrap the kernel's existing
+; format_date/format_time helpers (the same ones cmd_date/cmd_time
+; use) as Party-callable strings.
+
+party_rand_state:   dq 0
+party_rand_seeded:  db 0
+ALIGN 8
+party_rand_k1:      dq 0x2545F4914F6CDD1D   ; xorshift64* multiplier
+
+; party_rand_next: out = rax = next 64-bit pseudo-random value.
+; Lazily seeds party_rand_state on first call. Clobbers rax, rcx, rdx.
+party_rand_next:
+    cmp byte [party_rand_seeded], 0
+    jne .prn_seeded
+    rdtsc                          ; edx:eax = timestamp counter
+    shl rdx, 32
+    or rax, rdx                    ; rax = 64-bit tsc reading
+    push rax                       ; stash it - rtc_sec_now below clobbers rax
+    call rtc_sec_now                ; eax = current RTC seconds (0..59)
+    pop rdx                        ; rdx = the saved tsc reading
+    xor rax, rdx                   ; fold the RTC second into the tsc bits
+    or rax, 1                      ; xorshift64 can't recover from an all-zero state
+    mov [party_rand_state], rax
+    mov byte [party_rand_seeded], 1
+.prn_seeded:
+    mov rax, [party_rand_state]
+    mov rcx, rax
+    shr rcx, 12
+    xor rax, rcx
+    mov rcx, rax
+    shl rcx, 25
+    xor rax, rcx
+    mov rcx, rax
+    shr rcx, 7
+    xor rax, rcx
+    mov [party_rand_state], rax
+    imul rax, [party_rand_k1]      ; scramble the output (xorshift64*)
+    ret
+
+; ---- rand() -> float in [0, 1) ----
+party_bi_rand:
+    cmp r14, 0
+    je .brd_argc_ok
+    lea rsi, [msg_party_arg_count]
+    call party_set_err
+    ret
+.brd_argc_ok:
+    call party_rand_next
+    shr rax, 32                    ; keep the top 32 bits: a clean 0..2^32-1
+    mov [party_ftmp_i], rax
+    fild qword [party_ftmp_i]
+    fdiv qword [fp_2p32]
+    lea rdi, [party_scratch]
+    call party_val_set_float
+    lea rsi, [party_scratch]
+    call party_push_val
+    ret
+
+; ---- randint(lo, hi) -> int, inclusive on both ends ----
+party_bi_randint:
+    cmp r14, 2
+    je .bri_argc_ok
+    lea rsi, [msg_party_arg_count]
+    call party_set_err
+    ret
+.bri_argc_ok:
+    lea rdi, [party_scratch2]      ; hi (on top)
+    call party_pop_val
+    lea rdi, [party_scratch1]      ; lo
+    call party_pop_val
+    cmp byte [party_exec_ok], 1
+    jne .bri_out
+    cmp byte [party_scratch1], PV_INT
+    jne .bri_err_type
+    cmp byte [party_scratch2], PV_INT
+    jne .bri_err_type
+    mov rax, [party_scratch1+8]    ; lo
+    mov rcx, [party_scratch2+8]    ; hi
+    cmp rcx, rax
+    jl .bri_err_range
+    sub rcx, rax                   ; rcx = span = hi - lo
+    inc rcx                        ; rcx = count = span + 1
+    ; stash lo/count in party_scratch3 (plain scratch, not a tagged PV
+    ; value here) since party_rand_next clobbers rax/rcx/rdx
+    mov [party_scratch3], rax      ; [0]  = lo
+    mov [party_scratch3+8], rcx    ; [8]  = count
+    call party_rand_next           ; rax = 64-bit draw
+    xor rdx, rdx
+    div qword [party_scratch3+8]   ; rdx = draw mod count
+    add rdx, [party_scratch3]      ; + lo
+    mov rax, rdx
+    lea rdi, [party_scratch]
+    call party_val_set_int
+    lea rsi, [party_scratch]
+    call party_push_val
+    jmp .bri_out
+.bri_err_type:
+    lea rsi, [msg_party_randint_argtype]
+    call party_set_err
+    jmp .bri_out
+.bri_err_range:
+    lea rsi, [msg_party_randint_range]
+    call party_set_err
+.bri_out:
+    ret
+
+; ---- randseed(n) -> none; reseeds the generator with n ----
+party_bi_randseed:
+    cmp r14, 1
+    je .brs_argc_ok
+    lea rsi, [msg_party_arg_count]
+    call party_set_err
+    ret
+.brs_argc_ok:
+    lea rdi, [party_scratch1]
+    call party_pop_val
+    cmp byte [party_exec_ok], 1
+    jne .brs_out
+    cmp byte [party_scratch1], PV_INT
+    jne .brs_err_type
+    mov rax, [party_scratch1+8]
+    or rax, 1                      ; xorshift64 can't recover from an all-zero state
+    mov [party_rand_state], rax
+    mov byte [party_rand_seeded], 1
+    lea rdi, [party_scratch]
+    call party_val_set_none
+    lea rsi, [party_scratch]
+    call party_push_val
+    jmp .brs_out
+.brs_err_type:
+    lea rsi, [msg_party_arg_int]
+    call party_set_err
+.brs_out:
+    ret
+
+; ---- time() -> int, seconds since 2000-01-01 00:00:00 (RTC-derived,
+; not a real Unix epoch - see the section header comment above) ----
+party_days_before_month: dd 0,31,59,90,120,151,181,212,243,273,304,334
+party_bi_time:
+    cmp r14, 0
+    je .bti_argc_ok
+    lea rsi, [msg_party_arg_count]
+    call party_set_err
+    ret
+.bti_argc_ok:
+    call rtc_update
+    movzx rax, byte [rtc_century]
+    cmp al, 20
+    je .bti_cent_ok
+    cmp al, 21
+    je .bti_cent_ok
+    mov al, 20
+.bti_cent_ok:
+    imul rax, 100
+    movzx rcx, byte [rtc_year]
+    add rax, rcx
+    sub rax, 2000                  ; rax = years since 2000
+    mov r8, rax                    ; r8 = years
+    mov r9, rax
+    add r9, 3
+    shr r9, 2                      ; r9 = leap days before this year (see header comment's derivation)
+    xor r10, r10
+    mov rax, r8
+    and rax, 3
+    setz r10b                      ; r10 = 1 if this year is a leap year, else 0
+    movzx rax, byte [rtc_month]    ; 1..12
+    dec rax
+    mov ecx, [party_days_before_month+rax*4]
+    movzx rax, byte [rtc_day]      ; 1..31
+    dec rax
+    add rax, rcx                   ; + days_before_month[month-1]
+    add rax, r9                    ; + leap days before this year
+    imul r11, r8, 365
+    add rax, r11                   ; + years*365
+    ; days_before_month[] above is the non-leap table; a leap year's Feb 29
+    ; only affects months from March onward, so only add the extra day once
+    ; we're past February - Jan/Feb of a leap year need no adjustment.
+    cmp byte [rtc_month], 2
+    jbe .bti_no_leap_adj
+    test r10, r10
+    jz .bti_no_leap_adj
+    inc rax
+.bti_no_leap_adj:
+    ; rax = total whole days since 2000-01-01
+    imul rax, 86400
+    movzx rcx, byte [rtc_hour]
+    imul rcx, 3600
+    add rax, rcx
+    movzx rcx, byte [rtc_min]
+    imul rcx, 60
+    add rax, rcx
+    movzx rcx, byte [rtc_sec]
+    add rax, rcx
+    lea rdi, [party_scratch]
+    call party_val_set_int
+    lea rsi, [party_scratch]
+    call party_push_val
+    ret
+
+; ---- datestr() -> string "YYYY-MM-DD" ----
+party_bi_datestr:
+    cmp r14, 0
+    je .bds_argc_ok
+    lea rsi, [msg_party_arg_count]
+    call party_set_err
+    ret
+.bds_argc_ok:
+    lea rdi, [party_time_str_buf1]
+    call format_date
+    lea rsi, [party_time_str_buf1]
+    call str_len
+    mov rcx, rax
+    lea rdi, [party_scratch]
+    lea rsi, [party_time_str_buf1]
+    call party_val_set_str
+    lea rsi, [party_scratch]
+    call party_push_val
+    ret
+
+; ---- timestr() -> string "HH:MM:SS" ----
+party_bi_timestr:
+    cmp r14, 0
+    je .bts_argc_ok
+    lea rsi, [msg_party_arg_count]
+    call party_set_err
+    ret
+.bts_argc_ok:
+    lea rdi, [party_time_str_buf2]
+    call format_time
+    lea rsi, [party_time_str_buf2]
+    call str_len
+    mov rcx, rax
+    lea rdi, [party_scratch]
+    lea rsi, [party_time_str_buf2]
+    call party_val_set_str
+    lea rsi, [party_scratch]
+    call party_push_val
+    ret
+
+ALIGN 8
+fp_2p32:              dq 4294967296.0
+party_time_str_buf1:  times 16 db 0     ; "YYYY-MM-DD", separate from buf2 so
+party_time_str_buf2:  times 16 db 0     ; datestr()+timestr() in one expression don't alias
+
+msg_party_randint_argtype: db 'randint requires two ints', 0
+msg_party_randint_range:   db 'randint: lo must be <= hi', 0
+msg_party_arg_int:         db 'expected an int', 0
 
 ; ============================================================
 ;  BINARY OPERATORS
@@ -4907,14 +5899,39 @@ party_dump_tokens:
 ; ------------------------------------------------------------
 ; data
 ; ------------------------------------------------------------
-msg_party_usage:    db 'usage: party <file.pa>', 10, 0
+msg_party_usage:    db 'usage: party <file.pa> | party compile <file.pa> | party get <module>', 10, 0
 msg_party_lex_err:  db 'party: lex error near line ', 0
 msg_party_exec_err: db 'party: error near line ', 0
 msg_party_killed:   db 10, 'party: script killed (Esc)', 10, 0
 str_party:          db 'party', 0
 str_compile_flag:   db 'compile', 0
+str_get_flag:       db 'get', 0
 str_tokens_flag:    db '-tokens', 0
 str_minus_char:     db '-', 0
+
+; ---- "party get modulename" ----
+; Fetches a module from the shellybin community repo over HTTPS -
+; see cmd_party's .do_get for the fetch/save logic. No certificate
+; validation, same caveat as stake/sgive (https_warn_once).
+PARTY_GET_NAME_MAX equ 64             ; longest bare module name accepted
+PARTY_GET_URL_MAX  equ 256            ; fixed prefix (88) + name + ".pa" + NUL
+PARTY_GET_DEST_MAX equ 160            ; matches arg2_buf/arg3_buf sizing
+
+party_get_url_prefix: db 'https://raw.githubusercontent.com/TheServer-lab/shellybin/refs/heads/main/party/modules/', 0
+party_get_pa_suffix:  db '.pa', 0
+party_get_name_buf:   times PARTY_GET_NAME_MAX+1 db 0
+party_get_url_buf:    times PARTY_GET_URL_MAX db 0
+party_get_dest_buf:   times PARTY_GET_DEST_MAX db 0
+
+msg_party_get_usage:      db 'usage: party get <modulename> [outfile.pa]', 10, 0
+msg_party_get_fetching:   db 'party get: fetching ', 0
+msg_party_get_saved:      db 'party get: saved to ', 0
+msg_party_get_hint:       db 10, '  add: module "', 0
+msg_party_get_hint2:      db '" to a script to use it', 10, 0
+msg_party_get_notfound:   db 'party get: module not found on server: ', 0
+msg_party_get_badname:    db "party get: module name may not contain '/'", 10, 0
+msg_party_get_toolong:    db 'party get: module name too long', 10, 0
+msg_party_get_createfail: db 'party get: failed to create file.', 10, 0
 
 kw_vars:    db 'vars', 0
 kw_if:      db 'if', 0
@@ -5012,6 +6029,15 @@ str_fn_arr_len:  db 'arr_len', 0
 str_fn_arr_get:  db 'arr_get', 0
 str_fn_arr_set:  db 'arr_set', 0
 str_fn_arr_free: db 'arr_free', 0
+
+; Phase 5 builtin function names (random + time), same
+; not-a-keyword / can't-be-shadowed mechanism as above.
+str_fn_rand:     db 'rand', 0
+str_fn_randint:  db 'randint', 0
+str_fn_randseed: db 'randseed', 0
+str_fn_time:     db 'time', 0
+str_fn_datestr:  db 'datestr', 0
+str_fn_timestr:  db 'timestr', 0
 
 ; Phase 3 open-file-handle table, parallel arrays indexed by handle
 ; slot (party_fh_alloc/party_fh_check). party_fh_pending_mode is

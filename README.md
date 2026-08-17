@@ -1,6 +1,6 @@
 # ShellyForever
 
-**Version:** 0.1.13
+**Version:** 0.1.17
 
 A 64-bit shell-based OS written entirely in x86-64 NASM assembly, from scratch —
 no C, no BIOS libraries beyond boot-time disk/keyboard calls, no existing kernel.
@@ -85,6 +85,7 @@ no C, no BIOS libraries beyond boot-time disk/keyboard calls, no existing kernel
 | `run` | `run hello.run` | run a compiled ShellyForever `RUN 0.1` executable; typing a bare `name.run` does the same |
 | `party` | `party hello.pa` | run a program in **Party** (`.pa`), a small built-in scripting language — own variables, expressions, `if`/`else`, `while`, `func`/`return`, and `display` output. See "Party" below and `PARTY_SPEC.md` |
 | `party compile` | `party compile hello.pa` | compile a Party script straight to a `hello.run` executable instead of interpreting it |
+| `party get` | `party get math` | fetch `<modulename>.pa` from the module server over HTTPS and save it locally, ready for a `module "..."` line |
 | `prs` | `prs`, `prs kill 1`, `prs kill rushrun` | list processes, or kill by PID or name |
 | `auth` | `auth sdown`, `auth vars rmv all` | elevate privileges for one dangerous command |
 | `sys reset` | `auth sys reset` | factory-reset the OS volume: wipe every file and variable, recreate default system files (requires auth) |
@@ -112,6 +113,8 @@ no C, no BIOS libraries beyond boot-time disk/keyboard calls, no existing kernel
 | `tcp` | `tcp 10.0.2.2 8000` | open a TCP connection, send a payload, and print the reply |
 | `take` | `take http://10.0.2.2:8000/notes.txt notes.txt` | HTTP GET a file from a server, save to local file |
 | `give` | `give http://10.0.2.2:8000/upload notes.txt` | HTTP POST a local file to a server endpoint |
+| `stake` | `stake https://10.0.2.2:8443/notes.txt notes.txt` | HTTPS (TLS 1.3) GET a file from a server, save to local file (no cert validation) |
+| `sgive` | `sgive https://10.0.2.2:8443/upload notes.txt` | HTTPS (TLS 1.3) POST a local file to a server endpoint (no cert validation) |
 | `browse` | `browse http://10.0.2.2:8000/` | fetch a page over HTTP, strip HTML to text, follow `[N]` links, back/forward/bookmarks (see below) |
 
 ### Line editing: history, tab completion, cursor movement, and scrollback
@@ -346,7 +349,11 @@ expands it further with `rush` (shelling out to a Rush command line from
 inside a script), `"{identifier}"` string interpolation, an in-language
 file API (`fopen`/`fread`/`fwrite`/`fclose`/`fexists`/`fdelete`), and
 fixed-size arrays (`arr_new`/`arr_len`/`arr_get`/`arr_set`/`arr_free`).
-See "Party language expansion (0.1.13)" below for details.
+0.1.17 adds multi-file scripts: a `module "path.pa"` line splices
+another file's source in before lexing, and `party get <modulename>`
+fetches a module from a small module server over HTTPS and saves it
+locally. See "Party language expansion (0.1.13)" and "Party modules &
+`party get` (0.1.17)" below for details.
 
 ```
 vars a = "hi"
@@ -396,6 +403,12 @@ What's in there:
   arrays), `arr_get`/`arr_set` index it, `arr_len` reports its size,
   `arr_free` releases the slot. Elements are ordinary Party values,
   including nested arrays; `display` prints an array as `[e0, e1, ...]`.
+- **Modules:** a `module "path.pa"` line splices that file's whole
+  source in at that point, before lexing — a textual include, same
+  idea as C's `#include`. `party get <modulename> [outfile.pa]` fetches
+  a module from a small module server over HTTPS and stages it on
+  disk, ready to `module`-in. See "Party modules & `party get`
+  (0.1.17)" below.
 - **Not in v0.1.14:** no `[...]`/`a[i]` bracket syntax for arrays (use
   the `arr_*` builtins above), no growable arrays, no `{<expr>}` string
   interpolation, no string concatenation with `+`, no server-side
@@ -465,6 +478,58 @@ See `PARTY_SPEC.md` sections 8-11 for the full grammar, and the
 "Not in v0.1.14" list above for what's still deferred (bracket-syntax
 array indexing, growable arrays, `{<expr>}` interpolation, string
 concatenation, and server-side networking).
+
+#### Party modules & `party get` (0.1.17)
+
+Multi-file scripts, in two parts: a preprocessor directive for
+splicing files together locally, and a command for fetching a file
+worth splicing in the first place.
+
+- **`module "path.pa"`** — a line of exactly this form textually
+  splices that file's whole text in at that point, before lexing,
+  the same idea as C's `#include` or Python's `exec` of another
+  file's source. A module is typically just function definitions
+  meant to be called from the including script, but top-level
+  statements in it run too, in place, in file order. Runs before
+  `party_lex`, so it's invisible to the rest of the interpreter — one
+  token array over one flattened source buffer, exactly like a
+  single-file script — and both `party foo.pa` and
+  `party compile foo.pa` pick it up automatically.
+  ```
+  $ mathlib.pa
+  func square(x) {
+      return x * x
+  }
+
+  $ main.pa
+  module "mathlib.pa"
+  display square(6)     $ 36
+  ```
+  Included paths resolve relative to `cur_dir`, same as the
+  top-level script. Each resolved path is only ever expanded once per
+  run (repeating a `module` line, or two files that both include a
+  third, doesn't duplicate it), and modules may include modules up to
+  3 levels deep — a module that includes itself, directly or
+  indirectly, fails with a clean error instead of hanging.
+- **`party get <modulename> [outfile.pa]`** — fetches
+  `<modulename>.pa` over HTTPS from a small module server and saves
+  it as `<modulename>.pa` in the current folder (or as `outfile.pa`
+  if given), ready for a `module "..."` line or a direct
+  `party <modulename>.pa` run:
+  ```
+  rush>/home: party get stringutils
+  party get: fetching stringutils
+  party get: saved to stringutils.pa
+    add: module "stringutils.pa" to a script to use it
+  rush>/home: edit main.pa
+  ```
+  `party get foo` and `party get foo.pa` name the same module — a
+  redundant trailing `.pa` is stripped before the request goes out —
+  and a bare module name can't contain `/`. It reuses `stake`'s HTTPS
+  machinery (URL parsing, DNS, the TLS exchange), so it shares that
+  command's trust model: **the server's certificate isn't
+  validated**, the same as `curl -k`. It doesn't run or lex what it
+  fetches; the file is just staged on disk like any hand-written one.
 
 ### Compiled programs: `run` and the `.run` format
 
@@ -1022,6 +1087,25 @@ message and then nothing, which is your cue to power off manually.
 
 ## What's new
 
+- **Party modules & `party get` (v0.1.17)** — multi-file Party
+  scripts. A `module "path.pa"` line textually splices that file's
+  source in before lexing (function definitions meant to be shared
+  across files, with cycle protection and a nesting cap of 3), and
+  `party get <modulename> [outfile.pa]` fetches a module from a small
+  HTTPS module server and stages it on disk, ready to `module`-in.
+  `party get` reuses `stake`'s HTTPS machinery and trust model — no
+  certificate validation. See "Party modules & `party get` (0.1.17)"
+  above.
+- **HTTPS `stake` / `sgive` (v0.1.16)** — TLS 1.3 counterparts to
+  `take`/`give`. `stake <url> <file>` GETs over an encrypted connection
+  and saves the body locally; `sgive <url> <file>` reads a local file
+  and POSTs it to an `https://` URL. Both require the `https://` scheme
+  (default port 443) and reuse `take`/`give`'s URL parsing, DNS
+  resolution, and Esc-cancelable transfer path — only the wire
+  transport differs. **The server's certificate is not validated**:
+  the connection is encrypted but the peer's identity is unverified,
+  the same trust model as `curl -k`. A one-time warning is printed the
+  first time `stake` or `sgive` runs in a session.
 - **Party language expansion (v0.1.13)** — four interpreter-level
   features: `rush <expr>` shells out to a Rush command line from inside
   a script; `"{identifier}"` string interpolation splices a variable's
