@@ -512,7 +512,70 @@ own column/row bookkeeping if it's addressing cells directly via
 sidesteps that by only ever drawing into columns 0-78 and rows 0-23,
 one short of each true edge.
 
-## 15. Example programs
+## 15. Color and keyboard builtins
+
+Like every other builtin (sections 9, 10, 13, 14), these are ordinary
+function-shaped builtin names — a script cannot declare its own `func`
+with any of these names.
+
+```
+color("green")      // foreground green from here on
+bgcolor("dblue")    // background dark blue from here on
+display "hi"        // printed green-on-dark-blue
+color_reset()       // back to the default bright-green-on-black
+
+vars k = key()      // non-blocking; 0 if nothing pressed
+```
+
+- `color(name)` — sets the foreground color of subsequent `display`
+  output to the named color. Accepts the same 16 names the shell's
+  `color` command does: `black`, `dblue`, `blue`/`lblue`, `dgreen`,
+  `green`/`lgreen`, `dcyan`, `cyan`/`lcyan`, `dred`, `red`/`lred`,
+  `dmagenta`, `magenta`/`lmagenta`/`purple`, `brown`/`orange`,
+  `gray`/`grey`, `dgray`/`dgrey`, `yellow`, `white`. Statement only —
+  returns no value. A non-string argument, an unrecognized name, or a
+  wrong argument count are runtime errors.
+- `bgcolor(name)` — sets the background color of subsequent output.
+  Same name list as `color`, but only the 8 non-bright names are
+  accepted: `black`, `dblue`, `dgreen`, `dcyan`, `dred`, `dmagenta`,
+  `brown`, `gray`/`grey`. A bright background name (`blue`, `green`,
+  `cyan`, `red`, `magenta`, `yellow`, `white`, ...) is a runtime
+  error — VGA text mode steals the background's top bit for character
+  blink, so a bright background would make the text blink instead.
+  Statement only.
+- `color_reset()` — restores the default foreground and background
+  (`bright green on black`), the same as the shell's `color reset`.
+  Statement only.
+- `key() -> int` — non-blocking keyboard poll. Returns `0` if no key
+  has been pressed since the last `key()` call, otherwise the pending
+  key: an ASCII code for a printable character (letters, digits,
+  space, etc. — lowercase, since the keyboard poll ignores Shift) or
+  one of the arrow sentinels `KEY_UP = 0x11`, `KEY_DOWN = 0x12`,
+  `KEY_LEFT = 0x14`, `KEY_RIGHT = 0x15`. Reading clears the pending
+  key, so each key press is reported exactly once. The key buffer is
+  fed by the same keyboard poll that already runs before every
+  statement and inside `sleep()`'s busy-wait (section 14), so a game
+  loop's `sleep()` call doubles as its input pump — no separate
+  polling primitive is needed. **Esc** is not a key here: it sets the
+  script's kill flag and aborts the run, the same as everywhere else.
+  Break codes, Shift/Ctrl, and other extended keys are ignored.
+
+```
+color("yellow")
+display "warning: low fuel"
+bgcolor("red")
+display "overheat"
+color_reset()
+
+while (true) {
+    vars k = key()
+    if (k == 20) { display "left" }          // 0x14 = KEY_LEFT
+    else if (k == 21) { display "right" }    // 0x15 = KEY_RIGHT
+    sleep(100)
+}
+```
+
+## 16. Example programs
 
 `helloworld.pa`
 ```
@@ -625,6 +688,18 @@ display "middle of the screen"
 sleep(500)
 ```
 
+`colors.pa`
+```
+color("green")
+display "green text"
+bgcolor("dblue")
+display "now on a dark blue background"
+color_reset()
+
+vars k = key()
+if (k != 0) { display "a key is waiting" }
+```
+
 `main.pa` + `utils.pa` (modules)
 ```
 // utils.pa
@@ -641,7 +716,7 @@ display double(21)      // 42
 
 ---
 
-## Not in v0.1.14 (deliberately deferred)
+## Not in v0.1.18 (deliberately deferred)
 
 - `[...]` array-literal syntax and `a[i]` / `a[i] = x` indexing
   expressions — arrays themselves now exist (section 10) but only

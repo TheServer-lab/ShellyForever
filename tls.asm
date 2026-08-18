@@ -2255,8 +2255,14 @@ tls_recv_app_frame:
 ;       tls_app_tx_buf with its length in tls_app_tx_len. (Buffer
 ;       sizing decision, per phases.txt Phase 4 point 4: tls_app_tx_buf
 ;       / tls_app_rx_buf are dedicated buffers, sized off http.asm's
-;       HTTP_TX_MAX=1200 / HTTP_RX_BUF_SIZE=3072 with headroom --
-;       TLS_APP_TX_MAX=2048, TLS_APP_RX_MAX=4096 -- rather than reusing
+;       HTTP_TX_MAX / HTTP_RX_BUF_SIZE with headroom -- TLS_APP_RX_MAX
+;       below is kept equal to HTTP_RX_BUF_SIZE (both 16384) so a
+;       decrypted HTTPS reply is never truncated here before
+;       http_rx_buf/sin.asm even see it. This used to be pinned at
+;       TLS_APP_RX_MAX=4096, left over from when HTTP_RX_BUF_SIZE was
+;       still 3072; that stale, smaller cap was the actual ceiling on
+;       any "sin get" package -- silently truncating far below the
+;       16KB the rest of the chain allowed -- rather than reusing
 ;       tcp_tx_buf/tcp_rx_buf directly. tcp_tx_buf/tcp_rx_buf stay
 ;       exactly as they are for the plain-HTTP path (cmd_tcp / a future
 ;       plain take/give), so this Phase cannot regress them. The
@@ -2271,7 +2277,12 @@ tls_recv_app_frame:
 ;       CF=1 -- error already printed.
 ; ============================================================
 TLS_APP_TX_MAX equ 2048
-TLS_APP_RX_MAX equ 4096
+TLS_APP_RX_MAX equ 16384    ; matches HTTP_RX_BUF_SIZE/TCP_RX_BUF_SIZE -- see
+                             ; the tls_do_exchange header comment above. Used
+                             ; to be 4096, which truncated any HTTPS reply
+                             ; (including "sin get" package bodies) well
+                             ; before http_rx_buf's own 16384-byte limit ever
+                             ; came into play.
 
 tls_do_exchange:
     push rax

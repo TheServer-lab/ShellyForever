@@ -4,6 +4,75 @@ All notable changes to ShellyForever are documented here. The format is
 loosely based on [Keep a Changelog](https://keepachangelog.com/); the
 project does not yet follow strict SemVer.
 
+## [0.1.19] - 2026-08-18
+
+### Added
+
+- **Party expansions — color and keyboard builtins** (`party.asm`):
+  - **`color(name)`** — sets the foreground color of subsequent `display`
+    output, using the same 16 names as the shell's `color` command
+    (`black`, `dblue`, `blue`/`lblue`, `dgreen`, `green`/`lgreen`,
+    `dcyan`, `cyan`/`lcyan`, `dred`, `red`/`lred`, `dmagenta`,
+    `magenta`/`lmagenta`/`purple`, `brown`/`orange`, `gray`/`grey`,
+    `dgray`/`dgrey`, `yellow`, `white`).
+  - **`bgcolor(name)`** — sets the background color. Only the 8
+    non-bright names are accepted; a bright background name is a
+    runtime error because VGA text mode steals the background's top bit
+    for character blink, so a bright background would make the text
+    blink instead.
+  - **`color_reset()`** — restores the default foreground and
+    background (bright green on black), same as the shell's `color
+    reset`.
+  - **`key() -> int`** — non-blocking keyboard poll. Returns `0` if no
+    key has been pressed since the last `key()` call, otherwise the
+    pending key: an ASCII code (lowercase — the poll ignores Shift) or
+    one of the arrow sentinels `KEY_UP`/`KEY_DOWN`/`KEY_LEFT`/`KEY_RIGHT`
+    (0x11/0x12/0x14/0x15). Reading clears the pending key. Fed by the
+    keyboard poll that already runs before every statement and inside
+    `sleep()`'s busy-wait, so a game loop's `sleep()` doubles as its
+    input pump. Esc still aborts the script rather than reporting a key.
+  - All four are ordinary function-shaped builtins (not keywords — a
+    script can't shadow them), same mechanism as `fopen`/`arr_new`/
+    `sleep`/etc. Documented in `PARTY_SPEC.md` §15, with a `colors.pa`
+    example.
+
+### Fixed
+
+- **Party function parameter binding** — `party_func_paramtok` rows used
+  an 8-byte stride instead of 32, so function N+1's param tokens
+  overwrote function N's later params. In tetris, `move_piece(dx,dy)`
+  clobbered `can_place(type,rot,px,py)`'s `px`/`py`, so `px`/`py` inside
+  `can_place` silently resolved to the *globals* instead of the target
+  position — pieces were allowed to drop to py=19 and stack past the
+  board (`BAD idx=203`, array out of bounds). Other scripts failed with
+  `undeclared variable` on a real parameter. Both the collection and
+  invoke reads now use a 32-byte row stride.
+- **`party compile` crashed the OS on large scripts** — the whole source
+  was embedded into `party_run_bin_buf`, a fixed 4096-byte buffer, with
+  an unbounded copy. A script larger than ~4KB (e.g. tetris.pa at 12.8KB)
+  wrote past the buffer into the interpreter's own code that sits right
+  after it, and the OS executed garbage. The buffer is now sized
+  `EDIT_MAX + 128` (fs_io_buf caps sources at EDIT_MAX) and the embed
+  loop has a hard bounds check that reports
+  `compile: error: source too large to embed in .run binary` instead of
+  overflowing.
+
+### Changed
+
+- Banner and build stamp bumped to `v0.1.19` (`kernel.asm`); the build
+  stamp now reads "party expansions".
+- `PARTY_SPEC.md` synced: new §15 "Color and keyboard builtins",
+  examples section renumbered, deferred-feature list retitled to
+  v0.1.18.
+
+### Verified
+
+- End-to-end in QEMU on the real kernel: `party compile tetris.pa`
+  produces `tetris.run` without crashing, and the compiled binary runs
+  (`DONE score=2`, clean board locking); `tm.pa`/`mover.pa` no longer
+  report `undeclared variable`; tetris pieces now block at ny=17/lock at
+  py=16 instead of overrunning the board.
+
 ## [0.1.18] - 2026-08-18
 
 ### Added

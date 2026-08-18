@@ -18,7 +18,15 @@ HTTP_RX_BUF_SIZE equ 16384   ; match TCP_RX_BUF_SIZE: take/stake stage the whole
                              ; body is copied here, so anything bigger than this
                              ; would just be truncated away - 3072 previously cut
                              ; ~3.8KB Party scripts mid-line (matrix_rain.pa)
-HTTP_TX_MAX      equ 1200
+; HTTP_TX_MAX used to be pinned to TCP_PAYLOAD_MAX (one Ethernet frame,
+; 1200 bytes headroom under 1536) because tcp_do_exchange sent the whole
+; built request as a single TCP segment. tcp_do_exchange now sends the
+; request in TCP_PAYLOAD_MAX-sized chunks (see the chunked-send loop in
+; .de_est below), so the real ceiling is however much file data
+; http_rx_buf can hold, not what fits in one segment. Sized to the same
+; HTTP_RX_BUF_SIZE cap that already governs take/stake downloads, plus
+; slack for the POST headers.
+HTTP_TX_MAX      equ HTTP_RX_BUF_SIZE + 512
 
 ; ---- URL parser ----
 ; http_parse_url: rsi = url string. Fills http_host_buf, http_port,
@@ -401,6 +409,7 @@ http_build_post:
 ;        CF=1 -> error (message already printed)
 ; ============================================================
 tcp_do_exchange:
+    push rbp
     push rbx
     push rcx
     push rdx
@@ -493,15 +502,97 @@ tcp_do_exchange:
     mov dword [tcp_rx_len], 0
     mov dword [tcp_rx_prev], 0
 
-    mov r15d, [tcp_tx_len]
+    mov r15d, [tcp_tx_len]        ; total request bytes to send (headers+body,
+                                   ; may be far bigger than one TCP segment)
+    mov r13d, [tcp_cur_seq]       ; base seq number for tcp_tx_buf byte 0
+    xor r12d, r12d                ; bytes sent + acked so far
+
+    ; ---- chunked send: ship tcp_tx_buf TCP_PAYLOAD_MAX bytes at a time,
+    ; waiting for each chunk's ACK before sending the next. This is what
+    ; lets give/sgive push a request bigger than one Ethernet frame -
+    ; tcp_send_segment itself only ever handles a single segment, so the
+    ; chunking has to happen here. ----
+.de_chunk:
+    cmp r12d, r15d
+    jae .de_est_done               ; every byte sent and acknowledged
+
+    mov eax, r15d
+    sub eax, r12d                  ; bytes remaining
+    cmp eax, TCP_PAYLOAD_MAX
+    jbe .de_chunk_len_ok
+    mov eax, TCP_PAYLOAD_MAX
+.de_chunk_len_ok:
+    mov ebx, eax                   ; ebx = this chunk's length
+
+    lea eax, [r13d + r12d]
+    mov [tcp_cur_seq], eax         ; seq number for this chunk's first byte
+    lea eax, [r13d + r12d]
+    add eax, ebx
+    mov ebp, eax                   ; ack value that clears this chunk
+
     lea rsi, [tcp_tx_buf]
-    mov ecx, r15d
+    add rsi, r12
+    mov ecx, ebx
     mov r8d, [tcp_peer_ip]
     mov r9w, [tcp_peer_port]
     mov r10w, [tcp_my_port]
     mov r11w, TCP_FLAG_PSH | TCP_FLAG_ACK
     call tcp_send_segment
     jc .de_sendfail
+
+    mov byte [tcp_retry], 0
+    mov byte [tcp_wait_ticks], TCP_ROUND_SECS
+    call rtc_sec_now
+    mov r14d, eax
+.de_chunk_wait:
+    call kbd_poll
+    cmp byte [kill_flag], 0
+    jne .de_cancel
+    call netpoll
+    cmp byte [tcp_rst_got], 0
+    jne .de_reset
+    mov eax, [tcp_last_ack]
+    cmp eax, ebp
+    jae .de_chunk_acked
+    call rtc_sec_now
+    cmp eax, r14d
+    jne .de_chunk_tick
+    jmp .de_chunk_wait
+.de_chunk_tick:
+    mov r14d, eax
+    dec byte [tcp_wait_ticks]
+    jns .de_chunk_wait          ; still budget left this round - keep polling
+    cmp byte [tcp_retry], TCP_MAX_RETRIES
+    jae .de_timeout
+    inc byte [tcp_retry]
+    mov byte [tcp_wait_ticks], TCP_ROUND_SECS
+    lea rsi, [tcp_tx_buf]
+    add rsi, r12
+    mov ecx, ebx
+    mov r8d, [tcp_peer_ip]
+    mov r9w, [tcp_peer_port]
+    mov r10w, [tcp_my_port]
+    mov r11w, TCP_FLAG_PSH | TCP_FLAG_ACK
+    call tcp_send_segment
+    jc .de_sendfail
+    call rtc_sec_now
+    mov r14d, eax
+    jmp .de_chunk_wait
+.de_chunk_acked:
+    add r12d, ebx
+    jmp .de_chunk
+
+.de_est_done:
+    ; every body byte has been sent and acknowledged; tcp_cur_seq already
+    ; sits one past the last byte (base + total_len), matching what the
+    ; old single-segment path produced here before the FIN step.
+    mov byte [tcp_rx_got], 0
+    mov byte [tcp_fin_got], 0
+    mov byte [tcp_retry], 0
+    mov byte [tcp_wait_ticks], TCP_ROUND_SECS
+    mov dword [tcp_last_ack], 0
+    mov dword [tcp_rx_len], 0
+    mov dword [tcp_rx_prev], 0
 
     call rtc_sec_now
     mov r14d, eax
@@ -542,12 +633,19 @@ tcp_do_exchange:
     jae .de_timeout
     inc byte [tcp_retry]
     mov byte [tcp_wait_ticks], TCP_ROUND_SECS
-    lea rsi, [tcp_tx_buf]
-    mov ecx, r15d
+    ; nothing new landed this round - poke the peer with a bare ACK rather
+    ; than resending the request. The old code re-sent the whole payload
+    ; as one segment here, which only worked because that payload was
+    ; guaranteed to fit in a single frame; now that a give/sgive body can
+    ; be many chunks, blindly replaying all of it in one tcp_send_segment
+    ; call would build a segment far past TCP_PAYLOAD_MAX. A keep-alive
+    ; ACK is enough to confirm the connection is still alive either way.
+    xor rsi, rsi
+    xor ecx, ecx
     mov r8d, [tcp_peer_ip]
     mov r9w, [tcp_peer_port]
     mov r10w, [tcp_my_port]
-    mov r11w, TCP_FLAG_PSH | TCP_FLAG_ACK
+    mov r11w, TCP_FLAG_ACK
     call tcp_send_segment
     jc .de_sendfail
     call rtc_sec_now
@@ -556,10 +654,9 @@ tcp_do_exchange:
 
 .de_reply:
     mov qword [tcp_err_msg], 0
-    ; advance seq + FIN
-    mov eax, [tcp_cur_seq]
-    add eax, r15d
-    mov [tcp_cur_seq], eax
+    ; tcp_cur_seq is already one past the last body byte (set per-chunk
+    ; above), so just close out with FIN+ACK at the current sequence
+    ; number - no further seq math needed here.
     xor rsi, rsi
     xor ecx, ecx
     mov r8d, [tcp_peer_ip]
@@ -611,6 +708,12 @@ tcp_do_exchange:
 .de_timeout:
     cmp dword [tcp_rx_len], 0
     jne .de_reply
+    lea rsi, [msg_dbg_to_phase]
+    call print_string
+    movzx eax, byte [tcp_state]
+    call tcp_print_dec
+    lea rsi, [msg_nl]
+    call print_string
     mov rsi, msg_tcp_timeout
     mov [tcp_err_msg], rsi
     mov al, ATTR_ERROR
@@ -629,6 +732,7 @@ tcp_do_exchange:
     pop rdx
     pop rcx
     pop rbx
+    pop rbp
     ret
 
 ; ---- find HTTP headers end (CRLF CRLF) in tcp_rx_buf ----
@@ -756,6 +860,24 @@ cmd_take:
 
     call tcp_do_exchange
     jc .done
+
+    ; DEBUG: dump the raw reply
+    push rax
+    push rcx
+    push rsi
+    mov rsi, msg_take_dbg_rx
+    call print_string
+    mov eax, [tcp_rx_len]
+    call tcp_print_dec
+    mov rsi, msg_nl
+    call print_string
+    lea rsi, [tcp_rx_buf]
+    call print_string
+    mov rsi, msg_nl
+    call print_string
+    pop rsi
+    pop rcx
+    pop rax
 
     ; reject non-200 responses (e.g. a 404 page) before saving anything
     lea rsi, [tcp_rx_buf]

@@ -6681,8 +6681,17 @@ cmd_mov:
 ;  NON-BLOCKING KEYBOARD POLL  (for Esc-to-kill during scripts)
 ; ============================================================
 ; kbd_poll: checks if a key is available (non-blocking). If it's
-; Esc (scancode 0x01 make code), sets kill_flag. Other keys are
-; consumed and discarded.
+; Esc (scancode 0x01 make code), sets kill_flag same as before. Any
+; other make code is decoded (plain ascii via kbd_unshift, or arrow
+; keys via the KEY_UP/DOWN/LEFT/RIGHT sentinels - same sentinel
+; values get_char returns) and stashed in game_last_key for the
+; party `key()` builtin to pick up - previously these were just
+; discarded. Break codes, Shift/Ctrl, and every other extended key
+; are still ignored (a game only needs arrows + plain letters/space).
+; kbd_poll already runs continuously from several busy-wait loops
+; (sleep_ms, chain-segment scanning, etc.) whenever a foreground
+; script/program is running, so this doesn't need its own loop -
+; those existing call sites double as the game's input pump.
 kbd_poll:
     in al, 0x64
     test al, 1
@@ -6696,9 +6705,54 @@ kbd_poll:
     jmp .no_key
 .kbd_byte:
     in al, 0x60
-    cmp al, 0x01                  ; Esc make code
-    jne .no_key
+    mov bl, al
+
+    cmp byte [kbd_poll_ext_flag], 0
+    je .kp_not_ext
+    mov byte [kbd_poll_ext_flag], 0
+    test bl, 0x80
+    jnz .no_key                    ; ignore break code of an extended key
+    cmp bl, 0x48
+    je .kp_up
+    cmp bl, 0x50
+    je .kp_down
+    cmp bl, 0x4B
+    je .kp_left
+    cmp bl, 0x4D
+    je .kp_right
+    jmp .no_key                    ; any other extended key: ignore
+.kp_not_ext:
+    cmp bl, 0xE0
+    je .kp_set_ext
+    test bl, 0x80
+    jnz .no_key                    ; break code of a plain key: ignore
+    cmp bl, 0x01                   ; Esc make code
+    je .kp_esc
+    cmp bl, 0x53                   ; past the end of kbd_unshift
+    ja .no_key
+    movzx rbx, bl
+    mov al, [kbd_unshift + rbx]
+    cmp al, 0
+    je .no_key
+    mov [game_last_key], al
+    jmp .no_key
+.kp_set_ext:
+    mov byte [kbd_poll_ext_flag], 1
+    jmp .no_key
+.kp_esc:
     mov byte [kill_flag], 1
+    jmp .no_key
+.kp_up:
+    mov byte [game_last_key], KEY_UP
+    jmp .no_key
+.kp_down:
+    mov byte [game_last_key], KEY_DOWN
+    jmp .no_key
+.kp_left:
+    mov byte [game_last_key], KEY_LEFT
+    jmp .no_key
+.kp_right:
+    mov byte [game_last_key], KEY_RIGHT
 .no_key:
     ret
 
@@ -8373,6 +8427,152 @@ aliases_load:
 ;    color reset         back to the default (green)
 ;    color <name>        set it
 ; ============================================================
+; color_name_to_code: rsi = NUL-terminated color name. Matches it
+; against the same 16 names cmd_color accepts below (black, dblue,
+; blue/lblue, dgreen, green/lgreen, dcyan, cyan/lcyan, dred, red/lred,
+; dmagenta, magenta/lmagenta/purple, brown/orange, gray/grey,
+; dgray/dgrey, yellow, white). Out: al=1 and dl=0..15 (the VGA color
+; code) on a match; al=0 (dl undefined) if the name isn't recognized.
+; Shared by cmd_color and party.asm's color()/bgcolor() builtins so
+; the name list only lives in one place. Clobbers rax, rdx, rsi, rdi.
+color_name_to_code:
+    mov rdi, str_col_black
+    call str_eq
+    cmp al, 1
+    je .cntc_black
+    mov rdi, str_col_dblue
+    call str_eq
+    cmp al, 1
+    je .cntc_dblue
+    mov rdi, str_col_blue
+    call str_eq
+    cmp al, 1
+    je .cntc_blue
+    mov rdi, str_col_lblue
+    call str_eq
+    cmp al, 1
+    je .cntc_blue
+    mov rdi, str_col_dgreen
+    call str_eq
+    cmp al, 1
+    je .cntc_dgreen
+    mov rdi, str_col_green
+    call str_eq
+    cmp al, 1
+    je .cntc_green
+    mov rdi, str_col_lgreen
+    call str_eq
+    cmp al, 1
+    je .cntc_green
+    mov rdi, str_col_dcyan
+    call str_eq
+    cmp al, 1
+    je .cntc_dcyan
+    mov rdi, str_col_cyan
+    call str_eq
+    cmp al, 1
+    je .cntc_cyan
+    mov rdi, str_col_lcyan
+    call str_eq
+    cmp al, 1
+    je .cntc_cyan
+    mov rdi, str_col_dred
+    call str_eq
+    cmp al, 1
+    je .cntc_dred
+    mov rdi, str_col_red
+    call str_eq
+    cmp al, 1
+    je .cntc_red
+    mov rdi, str_col_lred
+    call str_eq
+    cmp al, 1
+    je .cntc_red
+    mov rdi, str_col_dmagenta
+    call str_eq
+    cmp al, 1
+    je .cntc_dmagenta
+    mov rdi, str_col_magenta
+    call str_eq
+    cmp al, 1
+    je .cntc_magenta
+    mov rdi, str_col_lmagenta
+    call str_eq
+    cmp al, 1
+    je .cntc_magenta
+    mov rdi, str_col_purple
+    call str_eq
+    cmp al, 1
+    je .cntc_magenta
+    mov rdi, str_col_brown
+    call str_eq
+    cmp al, 1
+    je .cntc_brown
+    mov rdi, str_col_orange
+    call str_eq
+    cmp al, 1
+    je .cntc_brown
+    mov rdi, str_col_gray
+    call str_eq
+    cmp al, 1
+    je .cntc_gray
+    mov rdi, str_col_grey
+    call str_eq
+    cmp al, 1
+    je .cntc_gray
+    mov rdi, str_col_dgray
+    call str_eq
+    cmp al, 1
+    je .cntc_dgray
+    mov rdi, str_col_dgrey
+    call str_eq
+    cmp al, 1
+    je .cntc_dgray
+    mov rdi, str_col_yellow
+    call str_eq
+    cmp al, 1
+    je .cntc_yellow
+    mov rdi, str_col_white
+    call str_eq
+    cmp al, 1
+    je .cntc_white
+    xor al, al
+    ret
+.cntc_black:    mov dl, 0x00
+                jmp .cntc_found
+.cntc_dblue:    mov dl, 0x01
+                jmp .cntc_found
+.cntc_dgreen:   mov dl, 0x02
+                jmp .cntc_found
+.cntc_dcyan:    mov dl, 0x03
+                jmp .cntc_found
+.cntc_dred:     mov dl, 0x04
+                jmp .cntc_found
+.cntc_dmagenta: mov dl, 0x05
+                jmp .cntc_found
+.cntc_brown:    mov dl, 0x06
+                jmp .cntc_found
+.cntc_gray:     mov dl, 0x07
+                jmp .cntc_found
+.cntc_dgray:    mov dl, 0x08
+                jmp .cntc_found
+.cntc_blue:     mov dl, 0x09
+                jmp .cntc_found
+.cntc_green:    mov dl, 0x0A
+                jmp .cntc_found
+.cntc_cyan:     mov dl, 0x0B
+                jmp .cntc_found
+.cntc_red:      mov dl, 0x0C
+                jmp .cntc_found
+.cntc_magenta:  mov dl, 0x0D
+                jmp .cntc_found
+.cntc_yellow:   mov dl, 0x0E
+                jmp .cntc_found
+.cntc_white:    mov dl, 0x0F
+.cntc_found:
+    mov al, 1
+    ret
+
 cmd_color:
     cmp byte [arg1_buf], 0
     jne .col_have_arg
@@ -12834,6 +13034,11 @@ nic_fetch_rx:
     movzx ecx, word [rsi+2]
     and ecx, 0x3FFF
     mov r9d, ecx                  ; raw length incl. the 4-byte CRC
+    cmp ecx, 1518
+    ja .frx_big                   ; insane length: report and skip, never copy
+                                  ; it into the 1536-byte nic_rx_frame (an
+                                  ; overrun here stomps the TCP globals right
+                                  ; after the frame buffer, e.g. tcp_rx_len)
     sub ecx, 4
     jbe .frx_skip                 ; raw length <= 4: error descriptor
     mov [nic_rx_len], ecx
@@ -12869,6 +13074,24 @@ nic_fetch_rx:
     mov word [rdi], 0
     mov al, 1
     jmp .frx_out
+.frx_big:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    lea rsi, [msg_dbg_frxbig]
+    call print_string
+    mov eax, r9d
+    call tcp_print_dec
+    lea rsi, [msg_nl]
+    call print_string
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    jmp .frx_adv                  ; keep the ring aligned past the bogus frame
 .frx_skip:
     mov eax, [nic_capr]
     add eax, 4
@@ -17657,6 +17880,13 @@ ce_cursor_captured: db 0
 ce_saved_row:       db 0
 ce_saved_col:       db 0
 kbd_ext_flag:  db 0                  ; 1 while waiting for the byte after an 0xE0 prefix
+kbd_poll_ext_flag: db 0              ; same idea as kbd_ext_flag but for kbd_poll's own
+                                      ; non-blocking decode, so it doesn't fight get_char
+                                      ; over which byte an 0xE0 prefix belongs to
+game_last_key: db 0                  ; last key kbd_poll decoded that wasn't Esc - ascii,
+                                      ; or a KEY_UP/DOWN/LEFT/RIGHT sentinel. Read+cleared
+                                      ; by the party `key()` builtin (see party_bi_key);
+                                      ; 0 means no key since the last key() call.
 scroll_offset: db 0                  ; 0 = live view, N = N lines scrolled back
 sb_write_idx:  db 0                  ; next slot to write in scrollback_buf (ring)
 sb_count:      db 0                  ; valid lines currently stored in scrollback_buf
@@ -17684,9 +17914,9 @@ wig_str_buf:   times 16 db 0    ; scratch for the wig clock widget
 wig_last_sec:  db 0             ; last second the widget drew (redraw gate)
 
 banner:
-    db "ShellyForever v0.1.18 -- 'help' for commands", 10, 0
+    db "ShellyForever v0.1.19 -- 'help' for commands", 10, 0
 build_stamp:
-    db "build 20260818 -- package manager / sin get", 10, 0
+    db "build 20260818 -- party expansions", 10, 0
 
 prompt_head: db "rush>", 0
 prompt_tail: db ": ", 0
@@ -17836,7 +18066,7 @@ SHELLY_PAL_LEN equ 6
 shelly_palette: db 0x0E, 0x0B, 0x0A, 0x0D, 0x09, 0x0F   ; yel, cyan, grn, mag, lblu, wht
 shelly_rule:  db "  ============================================================", 10, 0
 shelly_title: db "         ShellyForever OS", 0
-shelly_version: db "         v0.1.18", 10, 0
+shelly_version: db "         v0.1.19", 10, 0
 shelly_by:    db "         Developed by Sourasish Das", 10, 0
 shelly_cr:    db "         Copyright 2026. All rights reserved.", 10, 0
 str_col_black:    db "black", 0
@@ -18051,6 +18281,7 @@ msg_ni_mask:       db "MASK: ", 0
 msg_ni_gw:         db "GW  : ", 0
 msg_ni_dns:        db "DNS : ", 0
 msg_nl:            db 10, 0
+msg_dbg_frxbig:    db "FRXBIG len=", 0
 msg_dns_usage:     db "dns: usage: dns <hostname>", 10, 0
 msg_dns_res:       db "dns: ", 0
 msg_dns_equals:    db " = ", 0
@@ -18071,6 +18302,7 @@ msg_tcp_sent:       db "tcp: sent ", 0
 msg_tcp_recv:       db "tcp: received ", 0
 msg_tcp_bytes:      db " bytes.", 10, 0
 msg_tcp_timeout:    db "tcp: timed out waiting for a reply.", 10, 0
+msg_dbg_to_phase:   db "timeout phase state=", 0
 msg_tcp_sendfail:   db "tcp: failed to transmit (TX error - link/chip problem).", 10, 0
 msg_tcp_sendfail_noreply: db "tcp: failed to transmit (no ARP reply - peer/gateway unreachable).", 10, 0
 msg_tcp_cancelled:  db 10, "tcp: cancelled.", 10, 0
@@ -18079,6 +18311,7 @@ msg_take_usage:     db "take: usage: take <url> <file>", 10, 0
 msg_take_badurl:    db "take: bad URL format. Use http://host[:port]/path", 10, 0
 msg_take_createfail: db "take: failed to create file.", 10, 0
 msg_take_saved:     db "take: saved to ", 0
+msg_take_dbg_rx:    db "RX dump len=", 0
 msg_take_getting:   db "take: getting ", 0
 msg_take_from:      db " from ", 0
 msg_take_badpath:   db "take: bad file path.", 10, 0
@@ -18105,7 +18338,7 @@ msg_give_posting:   db "give: posting ", 0
 msg_give_to:        db " to ", 0
 msg_give_nofile:    db "give: no such file.", 10, 0
 msg_give_noreply:   db "give: no reply body.", 10, 0
-msg_give_too_big:   db "give: file too large to POST in one request (headers + body must fit in 1200 bytes).", 10, 0
+msg_give_too_big:   db "give: file too large to POST (headers + body exceed the request buffer).", 10, 0
 msg_stake_usage:     db "stake: usage: stake <url> <file>", 10, 0
 msg_stake_badurl:    db "stake: bad URL format. Use https://host[:port]/path", 10, 0
 msg_stake_createfail: db "stake: failed to create file.", 10, 0
@@ -18122,7 +18355,7 @@ msg_sgive_posting:   db "sgive: posting ", 0
 msg_sgive_to:        db " to ", 0
 msg_sgive_nofile:    db "sgive: no such file.", 10, 0
 msg_sgive_noreply:   db "sgive: no reply body.", 10, 0
-msg_sgive_too_big:   db "sgive: file too large to POST in one request (headers + body must fit in 1200 bytes).", 10, 0
+msg_sgive_too_big:   db "sgive: file too large to POST (headers + body exceed the request buffer).", 10, 0
 msg_https_nocert:    db "https: WARNING -- no certificate validation. The connection is", 10, "  encrypted but the server's identity is NOT verified (like curl -k).", 10, 0
 msg_http_unresolved: db "http: cannot resolve host.", 10, 0
 msg_http_cancelled: db 10, "http: cancelled.", 10, 0
@@ -18976,7 +19209,14 @@ tcp_rx_prev:   dd 0          ; rx length at the previous idle-check tick
 tcp_err_msg:   dq 0          ; ptr to the last tcp/http error message (0 = none)
 tcp_dec_buf:   times 10 db 0
 tcp_rx_buf:    times TCP_RX_BUF_SIZE db 0
-tcp_tx_buf:    times TCP_PAYLOAD_MAX db 0
+tcp_tx_buf:    times HTTP_TX_MAX db 0   ; sized for the biggest thing that can
+                                          ; land here: a full give/sgive POST
+                                          ; request (headers+body), which
+                                          ; tcp_do_exchange now sends out in
+                                          ; TCP_PAYLOAD_MAX-sized chunks rather
+                                          ; than needing it to fit in one.
+                                          ; cmd_tcp still only ever writes up
+                                          ; to TCP_PAYLOAD_MAX bytes here.
 tcp_stream_active: db 0      ; 1 while cmd_take streams a reply to disk
 tcp_stream_sink:  dq 0       ; per-segment callback (http.asm take_stream_sink)
 

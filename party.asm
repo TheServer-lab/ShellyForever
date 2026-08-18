@@ -22,7 +22,7 @@
 ;     against the keyword list) via the existing str_eq helper.
 ; ============================================================
 
-PARTY_MAX_TOKENS equ 2048    ; token array capacity - was 512, too small for
+PARTY_MAX_TOKENS equ 4096    ; token array capacity - was 512, too small for
                               ; even moderate scripts (e.g. matrix_rain.pa
                               ; needs ~775 tokens); party_emit's overflow
                               ; path looks identical to a bad-char lex
@@ -131,7 +131,14 @@ cmd_party:
     cmp al, 1
     je .want_tokens
 
+    ; save/restore [cur_normal_attr] around the run: a script that
+    ; calls color()/bgcolor() shouldn't leave the shell's prompt
+    ; tinted after it exits (see party_bi_color/party_bi_bgcolor).
+    mov al, [cur_normal_attr]
+    mov [party_saved_normal_attr], al
     call party_exec
+    mov al, [party_saved_normal_attr]
+    mov [cur_normal_attr], al
     cmp byte [party_exec_ok], 1
     jne .exec_failed
     ret
@@ -1525,8 +1532,14 @@ party_exec:
 ; uses, so a compiled program needs no separate runtime. On a lex
 ; error prints the failing line to the screen. Clobbers rax-r15 and
 ; the FPU; sets party_exec_ok / party_lex_ok / party_error_line.
+; Saves/restores [cur_normal_attr] around the run, same reasoning as
+; cmd_party: a compiled program that calls color()/bgcolor() shouldn't
+; leave whatever ran it (the shell, or another .run chaining into this
+; one) tinted once it's back in control.
 ; ------------------------------------------------------------
 party_boot_compiled:
+    mov al, [cur_normal_attr]
+    mov [party_boot_saved_attr], al
     mov [party_src_base], rsi
     call party_reset_runtime
     call party_lex
@@ -1539,6 +1552,8 @@ party_boot_compiled:
     mov r14, TOK_EOF
     call party_exec_stmts
 .pbc_out:
+    mov al, [party_boot_saved_attr]
+    mov [cur_normal_attr], al
     ret
 .pbc_lex_fail:
     mov rsi, msg_party_lex_err
@@ -1551,7 +1566,12 @@ party_boot_compiled:
     call print_string
     mov rsi, newline_str
     call print_string
+    mov al, [party_boot_saved_attr]
+    mov [cur_normal_attr], al
     ret
+
+party_boot_saved_attr: db 0
+
 
 ; ------------------------------------------------------------
 ;  BACKGROUND PROCESS CONTEXT SAVE / RESTORE
@@ -1580,8 +1600,8 @@ party_boot_compiled:
 ; party_ctx_table below - if that table's per-entry sizes change
 ; again, update this by hand to match, the same way this session had
 ; to (three times now).
-PARTY_CTX_REGS_OFFS equ 42822 - 24
-PARTY_CTX_SIZE      equ 42822
+PARTY_CTX_REGS_OFFS equ 59206 - 24
+PARTY_CTX_SIZE      equ 59206
 
 party_ctx_table:
     dq party_lex_ok, 7             ; lex_ok, exec_ok, killed, error_line
@@ -1771,7 +1791,7 @@ party_collect_funcs:
     cmp r12, 8
     jae .pcf_err_decl
     lea rdx, [party_func_paramtok]
-    imul rax, r15, 8
+    imul rax, r15, 32
     add rdx, rax
     mov [rdx + r12*4], r13d
     inc byte [party_func_nparams+r15]
@@ -2019,7 +2039,23 @@ party_exec_stmts:
     lea rsi, [party_ident_buf]
     lea rdi, [party_stmt_name_buf]
     call party_strcpy_save
+    ; party_stmt_name_buf is a single shared global. Evaluating <expr>
+    ; can call a function whose body runs its own vars/assign statements,
+    ; which write through this same buffer and clobber the name we just
+    ; saved above. Stash it on the real stack across the recursive call
+    ; and restore it before using it below (same reentrancy issue
+    ; party_while_cond_tok/party_while_body_tok already guard against).
+    push qword [party_stmt_name_buf]
+    push qword [party_stmt_name_buf+8]
+    push qword [party_stmt_name_buf+16]
+    push qword [party_stmt_name_buf+24]
+    push qword [party_stmt_name_buf+32]
     call party_parse_expr
+    pop qword [party_stmt_name_buf+32]
+    pop qword [party_stmt_name_buf+24]
+    pop qword [party_stmt_name_buf+16]
+    pop qword [party_stmt_name_buf+8]
+    pop qword [party_stmt_name_buf]
     cmp byte [party_exec_ok], 1
     jne .pes_out
     lea rsi, [party_stmt_name_buf]
@@ -2044,7 +2080,20 @@ party_exec_stmts:
     lea rsi, [party_ident_buf]
     lea rdi, [party_stmt_name_buf]
     call party_strcpy_save
+    ; See the matching comment in .pes_vars above: <expr> may invoke a
+    ; function whose body reuses party_stmt_name_buf for its own
+    ; statements, so the LHS name has to survive the recursive call.
+    push qword [party_stmt_name_buf]
+    push qword [party_stmt_name_buf+8]
+    push qword [party_stmt_name_buf+16]
+    push qword [party_stmt_name_buf+24]
+    push qword [party_stmt_name_buf+32]
     call party_parse_expr
+    pop qword [party_stmt_name_buf+32]
+    pop qword [party_stmt_name_buf+24]
+    pop qword [party_stmt_name_buf+16]
+    pop qword [party_stmt_name_buf+8]
+    pop qword [party_stmt_name_buf]
     cmp byte [party_exec_ok], 1
     jne .pes_out
     lea rsi, [party_stmt_name_buf]
@@ -3969,6 +4018,26 @@ party_call_builtin:
     call str_eq
     cmp al, 1
     je .pcb_gotoxy
+    lea rsi, [party_call_name_buf]
+    lea rdi, [str_fn_color]
+    call str_eq
+    cmp al, 1
+    je .pcb_color
+    lea rsi, [party_call_name_buf]
+    lea rdi, [str_fn_bgcolor]
+    call str_eq
+    cmp al, 1
+    je .pcb_bgcolor
+    lea rsi, [party_call_name_buf]
+    lea rdi, [str_fn_color_reset]
+    call str_eq
+    cmp al, 1
+    je .pcb_color_reset
+    lea rsi, [party_call_name_buf]
+    lea rdi, [str_fn_key]
+    call str_eq
+    cmp al, 1
+    je .pcb_key
     xor al, al
     ret
 .pcb_rand:
@@ -4001,6 +4070,22 @@ party_call_builtin:
     ret
 .pcb_gotoxy:
     call party_bi_gotoxy
+    mov al, 1
+    ret
+.pcb_color:
+    call party_bi_color
+    mov al, 1
+    ret
+.pcb_bgcolor:
+    call party_bi_bgcolor
+    mov al, 1
+    ret
+.pcb_color_reset:
+    call party_bi_color_reset
+    mov al, 1
+    ret
+.pcb_key:
+    call party_bi_key
     mov al, 1
     ret
 .pcb_arr_new:
@@ -5217,6 +5302,188 @@ party_bi_gotoxy:
 msg_party_sleep_neg:     db 'sleep: ms must not be negative', 0
 msg_party_gotoxy_range:  db 'gotoxy: x/y out of screen bounds', 0
 
+; ---- color(name) -> none; sets the foreground of [cur_normal_attr]
+; (the attribute `display` and print_string draw with) to one of the
+; 16 named VGA text colors below - same names/spelling the `color`
+; shell command accepts (see cmd_color in kernel.asm). Background
+; nibble is left untouched, so an earlier bgcolor()/color() call
+; still holds. cmd_party saves/restores [cur_normal_attr] around a
+; script run, so a colorful script never leaves the shell tinted
+; afterwards. ----
+party_bi_color:
+    cmp r14, 1
+    je .bcl_argc_ok
+    lea rsi, [msg_party_arg_count]
+    call party_set_err
+    ret
+.bcl_argc_ok:
+    lea rdi, [party_scratch1]
+    call party_pop_val
+    cmp byte [party_exec_ok], 1
+    jne .bcl_out
+    cmp byte [party_scratch1], PV_STR
+    jne .bcl_err_type
+    mov rsi, [party_scratch1+16]
+    mov rcx, [party_scratch1+24]
+    call party_copy_color_name
+    lea rsi, [party_color_name_buf]
+    call color_name_to_code
+    cmp al, 1
+    jne .bcl_err_name
+    mov al, [cur_normal_attr]
+    and al, 0xF0                   ; keep bg nibble, drop old fg
+    or al, dl                      ; dl = 0..15 from color_name_to_code
+    mov [cur_normal_attr], al
+    jmp .bcl_none
+.bcl_err_type:
+    lea rsi, [msg_party_color_type]
+    call party_set_err
+    jmp .bcl_out
+.bcl_err_name:
+    lea rsi, [msg_party_color_name]
+    call party_set_err
+    jmp .bcl_out
+.bcl_none:
+    lea rdi, [party_scratch]
+    call party_val_set_none
+    lea rsi, [party_scratch]
+    call party_push_val
+.bcl_out:
+    ret
+
+; ---- bgcolor(name) -> none; sets the background nibble of
+; [cur_normal_attr]. Only the 8 non-bright names are accepted
+; (black/blue/green/cyan/red/magenta/brown/gray) - VGA text mode
+; steals the background's top bit for character blink, so a bright
+; background (lblue, yellow, white, ...) would make the text blink
+; instead of giving a bright background. ----
+party_bi_bgcolor:
+    cmp r14, 1
+    je .bbg_argc_ok
+    lea rsi, [msg_party_arg_count]
+    call party_set_err
+    ret
+.bbg_argc_ok:
+    lea rdi, [party_scratch1]
+    call party_pop_val
+    cmp byte [party_exec_ok], 1
+    jne .bbg_out
+    cmp byte [party_scratch1], PV_STR
+    jne .bbg_err_type
+    mov rsi, [party_scratch1+16]
+    mov rcx, [party_scratch1+24]
+    call party_copy_color_name
+    lea rsi, [party_color_name_buf]
+    call color_name_to_code
+    cmp al, 1
+    jne .bbg_err_name
+    cmp dl, 8
+    jae .bbg_err_bright
+    mov al, [cur_normal_attr]
+    and al, 0x0F                   ; keep fg nibble, drop old bg
+    mov ah, dl
+    shl ah, 4
+    or al, ah
+    mov [cur_normal_attr], al
+    jmp .bbg_none
+.bbg_err_type:
+    lea rsi, [msg_party_color_type]
+    call party_set_err
+    jmp .bbg_out
+.bbg_err_name:
+    lea rsi, [msg_party_color_name]
+    call party_set_err
+    jmp .bbg_out
+.bbg_err_bright:
+    lea rsi, [msg_party_bgcolor_bright]
+    call party_set_err
+    jmp .bbg_out
+.bbg_none:
+    lea rdi, [party_scratch]
+    call party_val_set_none
+    lea rsi, [party_scratch]
+    call party_push_val
+.bbg_out:
+    ret
+
+; ---- color_reset() -> none; restores [cur_normal_attr] to
+; ATTR_NORMAL (fg and bg both), same as the shell's `color reset`. ----
+party_bi_color_reset:
+    cmp r14, 0
+    je .bcr_argc_ok
+    lea rsi, [msg_party_arg_count]
+    call party_set_err
+    ret
+.bcr_argc_ok:
+    mov byte [cur_normal_attr], ATTR_NORMAL
+    lea rdi, [party_scratch]
+    call party_val_set_none
+    lea rsi, [party_scratch]
+    call party_push_val
+    ret
+
+; ---- key() -> int; non-blocking. Returns 0 if no key has arrived
+; since the last key() call, otherwise the pending key: an ascii
+; code (letters/digits/space/etc, lowercase - kbd_poll ignores Shift)
+; or one of the arrow sentinels KEY_UP=0x11/KEY_DOWN=0x12/
+; KEY_LEFT=0x14/KEY_RIGHT=0x15. Reads and clears game_last_key,
+; which kbd_poll fills in as a side effect of the Esc-to-kill check
+; that already runs before every statement (and inside sleep()'s
+; busy-wait) - so a game loop like
+;   while (true) {
+;       k = key()
+;       if (k == KEY_LEFT) { ... }
+;       sleep(200)
+;   }
+; gets responsive input without a separate polling primitive: the
+; sleep() call itself is what's pumping kbd_poll in the background. ----
+party_bi_key:
+    cmp r14, 0
+    je .bky_argc_ok
+    lea rsi, [msg_party_arg_count]
+    call party_set_err
+    ret
+.bky_argc_ok:
+    movzx rax, byte [game_last_key]
+    mov byte [game_last_key], 0
+    lea rdi, [party_scratch]
+    call party_val_set_int
+    lea rsi, [party_scratch]
+    call party_push_val
+    ret
+
+; party_copy_color_name: rsi=ptr, rcx=len (a PV_STR's raw slice, not
+; NUL-terminated). Copies into party_color_name_buf, NUL-terminated,
+; truncating silently if it's too long - an overlong name can never
+; match a real color anyway, so it just falls through to
+; color_name_to_code's "unknown name" path. Clobbers rax, rcx, rsi, rdi.
+party_copy_color_name:
+    lea rdi, [party_color_name_buf]
+    cmp rcx, PARTY_COLOR_NAME_MAX-1
+    jbe .pccn_len_ok
+    mov rcx, PARTY_COLOR_NAME_MAX-1
+.pccn_len_ok:
+.pccn_loop:
+    cmp rcx, 0
+    je .pccn_done
+    mov al, [rsi]
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    dec rcx
+    jmp .pccn_loop
+.pccn_done:
+    mov byte [rdi], 0
+    ret
+
+PARTY_COLOR_NAME_MAX equ 16
+party_color_name_buf: times PARTY_COLOR_NAME_MAX db 0
+party_saved_normal_attr: db 0
+
+msg_party_color_type:      db 'color/bgcolor requires a string', 0
+msg_party_color_name:      db 'unknown color name', 0
+msg_party_bgcolor_bright:  db 'bgcolor only supports black/blue/green/cyan/red/magenta/brown/gray (bright colors would blink instead)', 0
+
 ALIGN 8
 fp_2p32:              dq 4294967296.0
 party_time_str_buf1:  times 16 db 0     ; "YYYY-MM-DD", separate from buf2 so
@@ -6000,7 +6267,7 @@ party_invoke_func:
     cmp byte [party_exec_ok], 1
     jne .pif_abort
     lea rdx, [party_func_paramtok]
-    imul rax, r15, 8
+    imul rax, r15, 32
     add rdx, rax
     mov r13d, [rdx + r12*4]
     call party_copy_tok_text_cur
@@ -6395,6 +6662,14 @@ str_fn_timestr:  db 'timestr', 0
 str_fn_sleep:    db 'sleep', 0
 str_fn_gotoxy:   db 'gotoxy', 0
 
+; Phase 6 builtin function names (color), same not-a-keyword /
+; can't-be-shadowed mechanism as above. See party_bi_color /
+; party_bi_bgcolor / party_bi_color_reset for behavior.
+str_fn_color:       db 'color', 0
+str_fn_bgcolor:     db 'bgcolor', 0
+str_fn_color_reset: db 'color_reset', 0
+str_fn_key:         db 'key', 0
+
 ; Phase 3 open-file-handle table, parallel arrays indexed by handle
 ; slot (party_fh_alloc/party_fh_check). party_fh_pending_mode is
 ; scratch used only inside party_bi_fopen, between validating the
@@ -6558,7 +6833,7 @@ msg_party_compiled2: db " -> ", 0
 
 ALIGN 8
 party_run_out_filename: times 64 db 0
-party_run_bin_buf:      times 4096 db 0
+party_run_bin_buf:      times EDIT_MAX + 128 db 0
 
 derive_run_filename:
     push rsi
@@ -6696,9 +6971,13 @@ party_compile_to_run:
     add rdi, 14
 
     ; embed the whole Party source (the compile command lexed it out of
-    ; fs_io_buf just before calling us), NUL-terminated
+    ; fs_io_buf just before calling us), NUL-terminated. The buffer is
+    ; EDIT_MAX+128 and fs_io_buf never holds more than EDIT_MAX, but the
+    ; guard below keeps a mis-sized source from ever writing past it.
     lea rsi, [fs_io_buf]
 .pc_src_copy:
+    cmp rdi, party_run_bin_buf + EDIT_MAX + 128
+    jae .pc_buf_full
     mov al, byte [rsi]
     mov [rdi], al
     inc rsi
@@ -6760,7 +7039,14 @@ party_compile_to_run:
     pop rdi
     ret
 
+.pc_buf_full:
+    mov rsi, msg_compile_toobig
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+
 msg_compile_fail: db "compile: error: failed to create node or write file", 10, 0
+msg_compile_toobig: db "compile: error: source too large to embed in .run binary", 10, 0
 
 party_compile_fail:
     pop rdi
