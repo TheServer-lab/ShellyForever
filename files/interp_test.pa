@@ -1,0 +1,8 @@
+vars p = 1
+vars q = 2
+display "one={p}"
+display "two {p} and {q}"
+display "x={q}"
+display "plain bit4={q}"
+display "pow16={p} bit4={q}"
+display "interp-done"

@@ -37,7 +37,12 @@ TCP_PAYLOAD_MAX equ 1536 ; fits inside net_build_buf (4096 build area) and
 ; complete and tls_wait_for_record spun until the final timeout. Give the
 ; landing buffer the same headroom as tls_rx_buf so a whole flight fits
 ; between polls.
-TCP_RX_BUF_SIZE equ 16384
+; Also the total cap for the plain-HTTP take/stake path: cmd_take stages the
+; whole reply (headers + body) here before the body is copied to http_rx_buf,
+; so this used to silently truncate any take body over ~16KB. Sized to
+; EDIT_MAX + 512 so every storeable file (up to EDIT_MAX=20480) transfers
+; whole -- matches HTTP_RX_BUF_SIZE.
+TCP_RX_BUF_SIZE equ EDIT_MAX + 512
 ; Wait budget for SYN-ACK / reply waits. A SYN (or a data segment) has to
 ; make a real round trip to a host out past the gateway - unlike ARP/DHCP,
 ; which only ever talk to something on the local segment. The old code gave
@@ -335,8 +340,21 @@ tcp_handle_segment:
     jae .th_est_fin
     sub eax, ecx ; payload length
     jz .th_est_fin
-    mov r15d, eax ; full payload length (for the ACK advance)
-    mov ebx, r15d
+    mov r15d, eax ; full payload length
+    ; TCP is an ordered byte stream.  QEMU's user-mode network nearly
+    ; always delivers each segment exactly once and in order, which used to
+    ; hide the fact that this receiver appended *every* segment addressed to
+    ; our port.  On a real LAN/WAN, a delayed duplicate or an out-of-order
+    ; segment then put bytes in the wrong place in a TLS record (or a .sin
+    ; archive), while our ACK still told the peer that the missing bytes had
+    ; arrived.  Only accept the segment that starts at the next byte we
+    ; expect; re-ACK duplicates/gaps without copying them so TCP retransmits
+    ; the missing data in order.
+    lea rsi, [r13+4]
+    call tcp_load_be32
+    mov r12d, eax                 ; sequence number of this payload
+    cmp eax, [tcp_cur_ack]
+    jne .th_est_reack
     ; append capped at TCP_RX_BUF_SIZE (accumulate across segments)
     mov eax, [tcp_rx_len]
     mov edx, TCP_RX_BUF_SIZE - 1 ; reserve 1 byte for the NUL terminator
@@ -346,11 +364,12 @@ tcp_handle_segment:
                                     ; reservation a full-size response makes
                                     ; the terminator overwrite tcp_tx_buf[0])
     sub edx, eax ; free space left
-    jbe .th_est_fin ; buffer full - ack anyway
+    jbe .th_est_reack ; buffer full -- do not ACK bytes we did not keep
     cmp r15d, edx
     jbe .th_append_all
     mov r15d, edx
 .th_append_all:
+    mov ebx, r15d                 ; ACK only the bytes actually accepted
     lea rdi, [tcp_rx_buf]
     add edi, [tcp_rx_len]
     lea rsi, [r13]
@@ -387,6 +406,7 @@ tcp_handle_segment:
     jbe .th_est_acknoupd ; never let the ACK go backwards
     mov [tcp_cur_ack], eax
 .th_est_acknoupd:
+.th_est_send_ack:
     xor rsi, rsi
     xor ecx, ecx
     mov r8d, [tcp_peer_ip]
@@ -395,6 +415,13 @@ tcp_handle_segment:
     mov r11w, TCP_FLAG_ACK
     call tcp_send_segment
     jmp .th_out
+.th_est_reack:
+    ; A duplicate or a segment beyond a gap: leave tcp_cur_ack unchanged
+    ; and send a duplicate ACK for the next byte we still need.  The peer's
+    ; normal retransmission logic will repair the gap without corrupting the
+    ; receive stream.
+    xor ebx, ebx
+    jmp .th_est_send_ack
 .th_out:
     pop r15
     pop r14

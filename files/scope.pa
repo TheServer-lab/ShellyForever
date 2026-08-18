@@ -1,0 +1,17 @@
+vars H = 20
+func inner(type, px, py) {
+    vars by = py
+    vars row = 1
+    if (by + row >= H) { return 0 }
+    return 1
+}
+func mid(px, py) {
+    vars nx = px
+    vars ny = py + 1
+    return inner(0, nx, ny)
+}
+vars rr = mid(3, 18)
+display "rr={rr}"
+vars ss = inner(0, 3, 19)
+display "ss={ss}"
+display "scope-done"

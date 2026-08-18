@@ -1,0 +1,24 @@
+vars a = 4 / 4
+display "div44={a}"
+vars b = 7 % 2
+display "mod72={b}"
+vars c = 113 / 16
+display "div113_16={c}"
+vars d = 20
+vars e = 19
+vars r = 4 / 4
+vars by = e + r
+display "by={by}"
+if (by >= d) { display "BY20-OK" } else { display "BY20-FAIL" }
+vars m = 113
+vars p = 1
+vars i = 0
+while (i < 4) {
+    p = p * 2
+    i = i + 1
+}
+vars q2 = m / p
+vars q3 = q2 % 2
+display "pow16={p} bit4={q3}"
+if (q3 == 1) { display "BIT4-OK" } else { display "BIT4-FAIL" }
+display "arith-done"

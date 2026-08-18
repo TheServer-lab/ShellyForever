@@ -1,0 +1,12 @@
+vars H = 20
+func canx() {
+    vars row = 1
+    vars by = 0
+    by = row
+    if (by >= H) { return 0 }
+    return 1
+}
+func mover() { return canx() }
+vars rr = mover()
+display "rr={rr}"
+display "tb-done"

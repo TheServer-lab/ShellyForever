@@ -1,8 +1,9 @@
+func f(a, b) { return g(a, b) }
 func g(a, b) {
     vars x = a
     vars y = b
     return x + y
 }
-vars rr = g(3, 4)
+vars rr = f(3, 4)
 display "rr={rr}"
-display "t1-done"
+display "t2-done"

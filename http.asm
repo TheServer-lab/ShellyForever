@@ -13,11 +13,13 @@
 ; ============================================================
 
 HTTP_DEFAULT_PORT equ 80
-HTTP_RX_BUF_SIZE equ 16384   ; match TCP_RX_BUF_SIZE: take/stake stage the whole
-                             ; reply (headers + body) in tcp_rx_buf before the
-                             ; body is copied here, so anything bigger than this
-                             ; would just be truncated away - 3072 previously cut
-                             ; ~3.8KB Party scripts mid-line (matrix_rain.pa)
+; The universal transfer cap: sized to EDIT_MAX + slack so that ANY file the
+; OS can store (a .sin up to EDIT_MAX=20480 bytes is installable) can be
+; downloaded whole. Was 16384, which silently truncated any HTTPS reply or
+; take/stake body over ~16KB - "sin get" saved the cut package and "install"
+; then rejected it with "not a valid .sin package (or truncated)". Before
+; that it was 3072, which cut ~3.8KB Party scripts mid-line (matrix_rain.pa).
+HTTP_RX_BUF_SIZE equ EDIT_MAX + 512
 ; HTTP_TX_MAX used to be pinned to TCP_PAYLOAD_MAX (one Ethernet frame,
 ; 1200 bytes headroom under 1536) because tcp_do_exchange sent the whole
 ; built request as a single TCP segment. tcp_do_exchange now sends the

@@ -2277,12 +2277,13 @@ tls_recv_app_frame:
 ;       CF=1 -- error already printed.
 ; ============================================================
 TLS_APP_TX_MAX equ 2048
-TLS_APP_RX_MAX equ 16384    ; matches HTTP_RX_BUF_SIZE/TCP_RX_BUF_SIZE -- see
-                             ; the tls_do_exchange header comment above. Used
-                             ; to be 4096, which truncated any HTTPS reply
-                             ; (including "sin get" package bodies) well
-                             ; before http_rx_buf's own 16384-byte limit ever
-                             ; came into play.
+; Derived from http.asm's HTTP_RX_BUF_SIZE (which is EDIT_MAX+512) rather than
+; a separate constant: any HTTPS reply that fits http_rx_buf must survive TLS
+; intact, and a "sin get" package can be up to EDIT_MAX bytes. Used to be 4096
+; (truncated every reply), then 16384 (still silently cut packages between
+; 16KB and EDIT_MAX before http_rx_buf ever saw them) - see the tls_do_exchange
+; header comment above.
+TLS_APP_RX_MAX equ HTTP_RX_BUF_SIZE
 
 tls_do_exchange:
     push rax

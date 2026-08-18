@@ -1,0 +1,18 @@
+vars H = 20
+func canx(type, px, py) {
+    vars col = 0
+    vars row = 0
+    vars bx = 0
+    vars by = 0
+    by = py + row
+    if (by >= H) { return 0 }
+    return 1
+}
+func mover(px, py) {
+    vars nx = px
+    vars ny = py + 1
+    return canx(0, nx, ny)
+}
+vars rr = mover(3, 18)
+display "rr={rr}"
+display "tj-done"

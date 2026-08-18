@@ -1,0 +1,11 @@
+vars H = 20
+func canx(py) {
+    vars by = 0
+    by = py
+    if (by >= H) { return 0 }
+    return 1
+}
+func mover() { return canx(19) }
+vars rr = mover()
+display "rr={rr}"
+display "ta-done"

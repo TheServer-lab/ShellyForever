@@ -1,0 +1,44 @@
+vars H = 20
+func pow2(n) {
+    vars p = 1
+    vars i = 0
+    while (i < n) {
+        p = p * 2
+        i = i + 1
+    }
+    return p
+}
+func piece_bit(mask, idx) {
+    vars d = pow2(idx)
+    return (mask / d) % 2
+}
+func canx(type, px, py) {
+    vars m = 240
+    vars idx = 0
+    vars col = 0
+    vars row = 0
+    vars bx = 0
+    vars by = 0
+    while (idx < 16) {
+        if (piece_bit(m, idx) == 1) {
+            display "IT idx={idx} col={col} row={row} px={px} py={py}"
+            col = idx % 4
+            row = idx / 4
+            bx = px + col
+            display "A by={by} row={row} py={py}"
+            by = py + row
+            display "B by={by}"
+            if (by >= H) { return 0 }
+        }
+        idx = idx + 1
+    }
+    return 1
+}
+func mover(px, py) {
+    vars nx = px
+    vars ny = py + 1
+    return canx(0, nx, ny)
+}
+vars rr = mover(3, 18)
+display "rr={rr}"
+display "td-done"

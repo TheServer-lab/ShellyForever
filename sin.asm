@@ -205,7 +205,13 @@ cmd_sin_get:
     jz .write_file
     cmp ecx, (HTTP_RX_BUF_SIZE - 1)
     jbe .body_fits
-    mov ecx, (HTTP_RX_BUF_SIZE - 1)
+    ; response is bigger than the download staging buffer (a package over
+    ; ~EDIT_MAX bytes). Fail loudly instead of saving a truncated .sin that
+    ; "install" would then reject with a cryptic "not a valid .sin package".
+    mov rsi, msg_sin_toobig
+    mov al, ATTR_ERROR
+    call print_string_attr
+    jmp .done
 .body_fits:
     mov dword [http_body_len], ecx   ; effective (capped) length - must store before
                                      ; rep movsb consumes ecx as the copy counter
@@ -394,6 +400,7 @@ msg_sin_badurl:     db "sin: bad package URL", 10, 0
 msg_sin_createfail: db "sin: failed to create file.", 10, 0
 msg_sin_badpath:    db "sin: bad file path.", 10, 0
 msg_sin_nobody:     db "sin: no body in response.", 10, 0
+msg_sin_toobig:     db "sin: package too large to download (over the internal size cap)", 10, 0
 msg_sin_badstatus:  db "sin: server returned status ", 0
 msg_sin_badstatus2: db " -- package not saved.", 10, 0
 msg_sin_kept:       db "sin: package kept as ", 0

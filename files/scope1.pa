@@ -1,0 +1,10 @@
+vars H = 20
+func inner(type, px, py) {
+    vars by = py
+    vars row = 1
+    if (by + row >= H) { return 0 }
+    return 1
+}
+vars rr = inner(0, 3, 19)
+display "rr={rr}"
+display "s1-done"

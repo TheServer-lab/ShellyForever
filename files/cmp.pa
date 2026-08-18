@@ -1,0 +1,10 @@
+vars H = 20
+vars by = 20
+if (by >= H) { display "GUARD20-OK" } else { display "GUARD20-FAIL" }
+vars by2 = 19
+if (by2 >= H) { display "B19-HIT" } else { display "B19-MISS" }
+vars by3 = 20
+if (by3 > H) { display "GT20-HIT" } else { display "GT20-MISS" }
+if (5 >= 3) { display "GE53-OK" } else { display "GE53-FAIL" }
+if (3 >= 5) { display "GE35-HIT" } else { display "GE35-MISS" }
+display "cmp-done"

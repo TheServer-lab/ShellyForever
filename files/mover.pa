@@ -1,0 +1,50 @@
+vars H = 20
+func pow2(n) {
+    vars p = 1
+    vars i = 0
+    while (i < n) {
+        p = p * 2
+        i = i + 1
+    }
+    return p
+}
+func piece_bit(mask, idx) {
+    vars d = pow2(idx)
+    return (mask / d) % 2
+}
+func piece_mask(type) {
+    if (type == 0) { return 240 }
+    return 102
+}
+func canx(type, px, py) {
+    vars m = piece_mask(type)
+    vars idx = 0
+    vars col = 0
+    vars row = 0
+    vars bx = 0
+    vars by = 0
+    while (idx < 16) {
+        if (piece_bit(m, idx) == 1) {
+            col = idx % 4
+            row = idx / 4
+            bx = px + col
+            by = py + row
+            if (by >= H) { return 0 }
+        }
+        idx = idx + 1
+    }
+    return 1
+}
+func mover(px, py) {
+    vars nx = px
+    vars ny = py + 1
+    return canx(0, nx, ny)
+}
+vars rr = 1
+vars ii = 0
+while (ii < 20) {
+    rr = mover(3, 18)
+    if (rr != 0) { display "WRONG ii={ii} rr={rr}" }
+    ii = ii + 1
+}
+display "mover-done"

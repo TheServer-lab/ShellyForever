@@ -1,0 +1,580 @@
+// ============================================================
+//  PARTY TETRIS
+//  Full tetromino set, rotation with simple wall-kicks, hold,
+//  next-piece preview, scoring, levels, line clears.
+//
+//  Controls: left/right arrows move, up arrow rotate CW, z
+//  rotates CCW, down arrow soft-drops, space hard-drops,
+//  c holds, q quits.
+//
+//  Board is stored as 200 cells (10 wide x 20 tall) split
+//  across three arrays (array pool caps at 4 concurrent
+//  arrays x 80 elements each), accessed through board_get/
+//  board_set so the rest of the game just uses one flat
+//  row*10+col index.
+// ============================================================
+
+vars W = 10
+vars H = 20
+
+vars b0 = 0
+vars b1 = 0
+vars b2 = 0
+
+vars score = 0
+vars level = 1
+vars lines = 0
+
+vars px = 0
+vars py = 0
+vars ptype = 0
+vars prot = 0
+vars nptype = 0
+vars holdtype = -1
+vars holdused = 0
+vars gameover = 0
+vars dropms = 700
+vars k = 0
+vars running = 0
+
+// ------------------------------------------------------------
+// board storage
+// ------------------------------------------------------------
+func init_board() {
+    b0 = arr_new(80)
+    b1 = arr_new(80)
+    b2 = arr_new(40)
+}
+
+func board_get(idx) {
+    if (idx < 80) {
+        return arr_get(b0, idx)
+    }
+    if (idx < 160) {
+        return arr_get(b1, idx - 80)
+    }
+    return arr_get(b2, idx - 160)
+}
+
+func board_set(idx, val) {
+    if (idx < 80) {
+        arr_set(b0, idx, val)
+        return
+    }
+    if (idx < 160) {
+        arr_set(b1, idx - 80, val)
+        return
+    }
+    arr_set(b2, idx - 160, val)
+}
+
+// ------------------------------------------------------------
+// piece shapes: each (type,rotation) is a 16-bit mask over a
+// 4x4 box (bit = row*4+col). Standard tetromino rotation data.
+// ------------------------------------------------------------
+func piece_mask(type, rot) {
+    if (type == 0) {
+        if (rot == 0) { return 240 }
+        if (rot == 1) { return 17476 }
+        if (rot == 2) { return 3840 }
+        return 8738
+    }
+    if (type == 1) {
+        return 102
+    }
+    if (type == 2) {
+        if (rot == 0) { return 114 }
+        if (rot == 1) { return 610 }
+        if (rot == 2) { return 624 }
+        return 562
+    }
+    if (type == 3) {
+        if (rot == 0) { return 54 }
+        if (rot == 1) { return 1122 }
+        if (rot == 2) { return 864 }
+        return 561
+    }
+    if (type == 4) {
+        if (rot == 0) { return 99 }
+        if (rot == 1) { return 612 }
+        if (rot == 2) { return 1584 }
+        return 306
+    }
+    if (type == 5) {
+        if (rot == 0) { return 113 }
+        if (rot == 1) { return 550 }
+        if (rot == 2) { return 1136 }
+        return 802
+    }
+    if (rot == 0) { return 116 }
+    if (rot == 1) { return 1570 }
+    if (rot == 2) { return 368 }
+    return 547
+}
+
+func piece_color_name(type) {
+    if (type == 0) { return "cyan" }
+    if (type == 1) { return "yellow" }
+    if (type == 2) { return "purple" }
+    if (type == 3) { return "green" }
+    if (type == 4) { return "red" }
+    if (type == 5) { return "blue" }
+    return "orange"
+}
+
+func pow2(n) {
+    vars p = 1
+    vars i = 0
+    while (i < n) {
+        p = p * 2
+        i = i + 1
+    }
+    return p
+}
+
+func piece_bit(mask, idx) {
+    vars d = pow2(idx)
+    return (mask / d) % 2
+}
+
+// ------------------------------------------------------------
+// collision / locking / line clears
+// ------------------------------------------------------------
+func can_place(type, rot, px, py) {
+    vars mask = piece_mask(type, rot)
+    vars idx = 0
+    vars col = 0
+    vars row = 0
+    vars bx = 0
+    vars by = 0
+    vars cellidx = 0
+    while (idx < 16) {
+        if (piece_bit(mask, idx) == 1) {
+            col = idx % 4
+            row = idx / 4
+            bx = px + col
+            by = py + row
+            if (bx < 0) { return 0 }
+            if (bx >= W) { return 0 }
+            if (by >= H) { return 0 }
+            if (by >= 0) {
+                cellidx = by * W + bx
+                if (board_get(cellidx) != 0) { return 0 }
+            }
+        }
+        idx = idx + 1
+    }
+    return 1
+}
+
+func lock_piece(type, rot, px, py) {
+    vars mask = piece_mask(type, rot)
+    vars idx = 0
+    vars col = 0
+    vars row = 0
+    vars bx = 0
+    vars by = 0
+    vars cellidx = 0
+    vars colorval = type + 1
+    while (idx < 16) {
+        if (piece_bit(mask, idx) == 1) {
+            col = idx % 4
+            row = idx / 4
+            bx = px + col
+            by = py + row
+            if (by >= 0) {
+                cellidx = by * W + bx
+                if (cellidx >= 200 || cellidx < 0) {
+                    display "BAD cellidx={cellidx} by={by} bx={bx} px={px} py={py}"
+                }
+                board_set(cellidx, colorval)
+            }
+        }
+        idx = idx + 1
+    }
+}
+
+func clear_lines() {
+    vars row = H - 1
+    vars cleared = 0
+    vars full = 1
+    vars c = 0
+    vars idx = 0
+    vars r2 = 0
+    vars c2 = 0
+    vars srcidx = 0
+    vars dstidx = 0
+    vars v = 0
+    vars c3 = 0
+    while (row >= 0) {
+        full = 1
+        c = 0
+        while (c < W) {
+            idx = row * W + c
+            if (board_get(idx) == 0) { full = 0 }
+            c = c + 1
+        }
+        if (full == 1) {
+            r2 = row
+            while (r2 > 0) {
+                c2 = 0
+                while (c2 < W) {
+                    srcidx = (r2 - 1) * W + c2
+                    dstidx = r2 * W + c2
+                    v = board_get(srcidx)
+                    board_set(dstidx, v)
+                    c2 = c2 + 1
+                }
+                r2 = r2 - 1
+            }
+            c3 = 0
+            while (c3 < W) {
+                board_set(c3, 0)
+                c3 = c3 + 1
+            }
+            cleared = cleared + 1
+        } else {
+            row = row - 1
+        }
+    }
+    return cleared
+}
+
+// ------------------------------------------------------------
+// drawing
+// ------------------------------------------------------------
+func draw_cell(row, col, val) {
+    vars sx = 3 + col * 2
+    vars sy = 2 + row
+    gotoxy(sx, sy)
+    if (val == 0) {
+        color("white")
+        display "  "
+        return
+    }
+    color(piece_color_name(val - 1))
+    display "[]"
+}
+
+func draw_board() {
+    vars row = 0
+    vars col = 0
+    vars v = 0
+    color("gray")
+    gotoxy(2, 1)
+    display "+--------------------+"
+    gotoxy(2, 22)
+    display "+--------------------+"
+    row = 0
+    while (row < 20) {
+        gotoxy(2, 2 + row)
+        display "|"
+        gotoxy(23, 2 + row)
+        display "|"
+        row = row + 1
+    }
+    row = 0
+    while (row < H) {
+        col = 0
+        while (col < W) {
+            v = board_get(row * W + col)
+            draw_cell(row, col, v)
+            col = col + 1
+        }
+        row = row + 1
+    }
+}
+
+func draw_piece(type, rot, ppx, ppy, mode) {
+    vars mask = piece_mask(type, rot)
+    vars idx = 0
+    vars col = 0
+    vars row = 0
+    vars bx = 0
+    vars by = 0
+    while (idx < 16) {
+        if (piece_bit(mask, idx) == 1) {
+            col = idx % 4
+            row = idx / 4
+            bx = ppx + col
+            by = ppy + row
+            if (by >= 0) {
+                if (mode == 1) {
+                    draw_cell(by, bx, type + 1)
+                } else {
+                    draw_cell(by, bx, 0)
+                }
+            }
+        }
+        idx = idx + 1
+    }
+}
+
+func draw_next() {
+    vars idx = 0
+    vars col = 0
+    vars row = 0
+    vars mask = 0
+    vars sx = 0
+    vars sy = 0
+    color("white")
+    gotoxy(28, 2)
+    display "NEXT:"
+    mask = piece_mask(nptype, 0)
+    idx = 0
+    while (idx < 16) {
+        col = idx % 4
+        row = idx / 4
+        sx = 28 + col * 2
+        sy = 4 + row
+        gotoxy(sx, sy)
+        if (piece_bit(mask, idx) == 1) {
+            color(piece_color_name(nptype))
+            display "[]"
+        } else {
+            color("white")
+            display "  "
+        }
+        idx = idx + 1
+    }
+}
+
+func draw_hold() {
+    vars idx = 0
+    vars col = 0
+    vars row = 0
+    vars mask = 0
+    vars sx = 0
+    vars sy = 0
+    color("white")
+    gotoxy(28, 10)
+    display "HOLD:"
+    if (holdtype >= 0) {
+        mask = piece_mask(holdtype, 0)
+    } else {
+        mask = 0
+    }
+    idx = 0
+    while (idx < 16) {
+        col = idx % 4
+        row = idx / 4
+        sx = 28 + col * 2
+        sy = 12 + row
+        gotoxy(sx, sy)
+        if (piece_bit(mask, idx) == 1) {
+            color(piece_color_name(holdtype))
+            display "[]"
+        } else {
+            color("white")
+            display "  "
+        }
+        idx = idx + 1
+    }
+}
+
+func draw_hud() {
+    color("white")
+    gotoxy(28, 16)
+    display "SCORE: {score}   "
+    gotoxy(28, 17)
+    display "LEVEL: {level}   "
+    gotoxy(28, 18)
+    display "LINES: {lines}   "
+}
+
+func draw_static_ui() {
+    color("white")
+    gotoxy(0, 0)
+    display "PARTY TETRIS"
+    gotoxy(28, 20)
+    display "Controls:"
+    gotoxy(28, 21)
+    display "arrows move/rotate"
+    gotoxy(28, 22)
+    display "space hard drop"
+    gotoxy(28, 23)
+    display "c hold  z rot-ccw  q quit"
+}
+
+func clear_screen() {
+    vars i = 0
+    while (i < 26) {
+        display ""
+        i = i + 1
+    }
+}
+
+// ------------------------------------------------------------
+// gameplay
+// ------------------------------------------------------------
+func spawn_piece() {
+    ptype = nptype
+    nptype = randint(0, 6)
+    prot = 0
+    px = 3
+    py = 0
+    if (can_place(ptype, prot, px, py) == 0) {
+        gameover = 1
+    }
+    draw_next()
+}
+
+func lock_and_next() {
+    vars cleared = 0
+    vars newlevel = 0
+    display "LOCK px={px} py={py} type={ptype} rot={prot} lines={lines}"
+    lock_piece(ptype, prot, px, py)
+    cleared = clear_lines()
+    if (cleared == 1) { score = score + 100 * level }
+    if (cleared == 2) { score = score + 300 * level }
+    if (cleared == 3) { score = score + 500 * level }
+    if (cleared == 4) { score = score + 800 * level }
+    lines = lines + cleared
+    newlevel = lines / 10 + 1
+    if (newlevel > level) {
+        level = newlevel
+        dropms = 700 - (level - 1) * 60
+        if (dropms < 100) { dropms = 100 }
+    }
+    draw_board()
+    spawn_piece()
+    holdused = 0
+    draw_hud()
+}
+
+func move_piece(dx, dy) {
+    vars nx = px + dx
+    vars ny = py + dy
+    if (can_place(ptype, prot, nx, ny) == 1) {
+        px = nx
+        py = ny
+        return 1
+    }
+    return 0
+}
+
+func rotate_piece(dir) {
+    vars newrot = (prot + dir + 4) % 4
+    if (can_place(ptype, newrot, px, py) == 1) {
+        prot = newrot
+        return
+    }
+    if (can_place(ptype, newrot, px - 1, py) == 1) {
+        px = px - 1
+        prot = newrot
+        return
+    }
+    if (can_place(ptype, newrot, px + 1, py) == 1) {
+        px = px + 1
+        prot = newrot
+        return
+    }
+    if (can_place(ptype, newrot, px - 2, py) == 1) {
+        px = px - 2
+        prot = newrot
+        return
+    }
+    if (can_place(ptype, newrot, px + 2, py) == 1) {
+        px = px + 2
+        prot = newrot
+    }
+}
+
+func hard_drop() {
+    vars moved = 1
+    while (moved == 1) {
+        moved = move_piece(0, 1)
+        if (moved == 1) { score = score + 2 }
+    }
+    lock_and_next()
+}
+
+func do_hold() {
+    vars tmp = 0
+    if (holdused == 1) { return }
+    if (holdtype < 0) {
+        holdtype = ptype
+        spawn_piece()
+    } else {
+        tmp = ptype
+        ptype = holdtype
+        holdtype = tmp
+        prot = 0
+        px = 3
+        py = 0
+    }
+    holdused = 1
+    draw_hold()
+}
+
+func new_game() {
+    init_board()
+    score = 0
+    level = 1
+    lines = 0
+    dropms = 700
+    gameover = 0
+    holdtype = -1
+    holdused = 0
+    nptype = randint(0, 6)
+    clear_screen()
+    draw_static_ui()
+    draw_board()
+    draw_hold()
+    spawn_piece()
+    draw_hud()
+}
+
+// ------------------------------------------------------------
+// main loop
+// ------------------------------------------------------------
+new_game()
+running = 1
+vars tick = 0
+vars moved2 = 0
+
+while (running == 1) {
+    if (gameover == 1) {
+        running = 0
+    } else {
+        k = key()
+        draw_piece(ptype, prot, px, py, 0)
+
+        if (k == 20) { move_piece(-1, 0) }
+        if (k == 21) { move_piece(1, 0) }
+        if (k == 17) { rotate_piece(1) }
+        if (k == 122) { rotate_piece(-1) }
+        if (k == 99) { do_hold() }
+        if (k == 113) { running = 0 }
+        if (k == 32) { hard_drop() }
+        if (k == 18) {
+            moved2 = move_piece(0, 1)
+            if (moved2 == 1) {
+                score = score + 1
+            } else {
+                lock_and_next()
+            }
+        }
+
+        tick = tick + 30
+        if (tick >= dropms) {
+            tick = 0
+            moved2 = move_piece(0, 1)
+            if (moved2 == 0) {
+                lock_and_next()
+            }
+        }
+
+        draw_piece(ptype, prot, px, py, 1)
+        draw_hud()
+        sleep(30)
+    }
+}
+
+gotoxy(2, 24)
+color("white")
+if (gameover == 1) {
+    display "GAME OVER! Final score: {score}"
+} else {
+    display "Thanks for playing! Final score: {score}"
+}

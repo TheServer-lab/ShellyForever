@@ -1,0 +1,11 @@
+vars H = 20
+func d1(a, b) { return d2(a, b) }
+func d2(a, b) { return d3(a, b) }
+func d3(a, b) { if (a >= b) { return 1 } else { return 0 } }
+vars r = d1(20, 20)
+display "r={r}"
+vars s = d1(19, 20)
+display "s={s}"
+vars t = d1(20, 19)
+display "t={t}"
+display "depth-done"

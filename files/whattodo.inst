@@ -1,3 +1,3 @@
-name "Matrix Rain"version "1.0"mkdir "/home/programs/matrix"
-copy "matrix.run" "/home/programs/matrix/matrix.run"program "matrix" "/home/programs/matrix/matrix.run"finish
+name "Tetris"version "1.0"mkdir "/home/programs/tetris"
+copy "tetris.run" "/home/programs/tetris/tetris.run"program "tetris" "/home/programs/tetris/tetris.run"finish
 

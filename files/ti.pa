@@ -1,0 +1,9 @@
+vars H = 20
+func f(px, py) {
+    vars row = 1
+    display "L px={px} py={py} row={row}"
+    return 1
+}
+vars rr = f(3, 19)
+display "G rr={rr} H={H}"
+display "ti-done"

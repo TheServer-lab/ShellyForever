@@ -1,0 +1,18 @@
+vars H = 20
+func canx(px, py) {
+    vars row = 1
+    vars by = py + row
+    if (by >= H) { return 0 }
+    return 1
+}
+func movep() {
+    vars nx = 3
+    vars ny = 19
+    return canx(nx, ny)
+}
+func hard() {
+    return movep()
+}
+vars rr = hard()
+display "rr={rr}"
+display "cptest-done"

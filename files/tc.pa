@@ -1,0 +1,17 @@
+vars H = 20
+func canx(py) {
+    vars idx = 0
+    vars row = 0
+    vars by = 0
+    while (idx < 2) {
+        row = idx / 2
+        by = py + row
+        idx = idx + 1
+    }
+    if (by >= H) { return 0 }
+    return 1
+}
+func mover() { return canx(19) }
+vars rr = mover()
+display "rr={rr}"
+display "tc-done"
