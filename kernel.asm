@@ -5967,6 +5967,11 @@ cmd_sys:
     call str_eq
     cmp al, 1
     je .sys_reset
+    mov rsi, arg1_buf
+    mov rdi, str_sys_update
+    call str_eq
+    cmp al, 1
+    je .sys_update
     mov rsi, msg_sys_usage
     mov al, ATTR_ERROR
     call print_string_attr
@@ -5984,6 +5989,17 @@ cmd_sys:
     mov rsi, msg_sys_reset_done
     mov al, [cur_normal_attr]
     call print_string_attr
+    ret
+.sys_update:
+    cmp byte [auth_valid], 0
+    jne .update_ok
+    mov rsi, msg_auth_required
+    mov al, ATTR_ERROR
+    call print_string_attr
+    ret
+.update_ok:
+    mov byte [auth_valid], 0
+    call sys_do_update
     ret
 
 ; sys_do_reset: the actual factory-reset work for "sys reset". Keeps the
@@ -16170,6 +16186,7 @@ cmd_shelly_rainbow:
 %include "zip.asm"
 %include "install.asm"
 %include "sin.asm"
+%include "update.asm"
 
 ; print_prompt: prints "rush>" + current path + ": "
 print_prompt:
@@ -17914,9 +17931,9 @@ wig_str_buf:   times 16 db 0    ; scratch for the wig clock widget
 wig_last_sec:  db 0             ; last second the widget drew (redraw gate)
 
 banner:
-    db "ShellyForever v0.1.19 -- 'help' for commands", 10, 0
+    db "ShellyForever v0.1.20 -- 'help' for commands", 10, 0
 build_stamp:
-    db "build 20260818 -- party expansions", 10, 0
+    db "build 20260821 -- system updates", 10, 0
 
 prompt_head: db "rush>", 0
 prompt_tail: db ": ", 0
@@ -18066,7 +18083,7 @@ SHELLY_PAL_LEN equ 6
 shelly_palette: db 0x0E, 0x0B, 0x0A, 0x0D, 0x09, 0x0F   ; yel, cyan, grn, mag, lblu, wht
 shelly_rule:  db "  ============================================================", 10, 0
 shelly_title: db "         ShellyForever OS", 0
-shelly_version: db "         v0.1.19", 10, 0
+shelly_version: db "         v0.1.20", 10, 0
 shelly_by:    db "         Developed by Sourasish Das", 10, 0
 shelly_cr:    db "         Copyright 2026. All rights reserved.", 10, 0
 str_col_black:    db "black", 0
@@ -18125,6 +18142,7 @@ str_test:   db "-test", 0
 empty_str:  db 0
 str_syscmd:    db "sys", 0        ; the "sys" command word (sys reset)
 str_sys_reset: db "reset", 0
+str_sys_update: db "update", 0
 str_dscan:  db "dscan", 0
 str_storage: db "storage", 0
 str_format: db "fmt", 0
@@ -18458,7 +18476,7 @@ msg_peek_noproc:  db "peek: no such process", 10, 0
 ; --- auth / vars / flags messages ---
 msg_auth_required: db "error: this command requires authentication. Use 'auth <command>' first.", 10, 0
 msg_auth_granted:  db "Authentication granted.", 10, 0
-msg_sys_usage:      db "sys: use 'auth sys reset' to factory-reset this system", 10, 0
+msg_sys_usage:      db "sys: use 'auth sys reset' to factory-reset this system, or 'auth sys update' to check for/install a newer boot.bin/stage2.bin/kernel_body.bin", 10, 0
 msg_sys_reset_done: db "System reset complete. All files and variables were wiped and default system files recreated.", 10, 0
 msg_vars_header:   db "Variables:", 10, 0
 msg_vars_sep:     db " = ", 0
@@ -18534,6 +18552,8 @@ help_text:
     db "  sdown              shut down (requires auth)", 10
     db "  sys reset          factory-reset: wipe all files/vars and recreate", 10
     db "                      default system files (requires auth)", 10
+    db "  sys update         check for/install a newer boot.bin/stage2.bin/", 10
+    db "                      kernel_body.bin from the network (requires auth)", 10
     db "  ;                  chain commands, e.g. show hi ; show bye", 10
     db "  ~                  pipe output, e.g. calc 1+2*3 ~ = a ; show a", 10
     db "  $                  comment line (lines starting with $ are skipped)", 10
@@ -18897,13 +18917,18 @@ help_sdown:
     db "  Save to disk, then shut down. Requires auth: auth sdown", 10, 0
 
 help_sys:
-    db "sys reset", 10
-    db "  Factory-reset this system - use if something is badly wrong and", 10
-    db "  you want a clean slate. Deletes every file and folder, clears all", 10
-    db "  variables and aliases, then recreates the default system files", 10
-    db "  (sys/, alias.sly, sysconfig) and saves to disk. Mounted external", 10
-    db "  drives are not touched. This cannot be undone.", 10
-    db "  Requires auth: auth sys reset", 10, 0
+    db "sys reset / sys update", 10
+    db "  sys reset: factory-reset this system - use if something is badly", 10
+    db "  wrong and you want a clean slate. Deletes every file and folder,", 10
+    db "  clears all variables and aliases, then recreates the default", 10
+    db "  system files (sys/, alias.sly, sysconfig) and saves to disk.", 10
+    db "  Mounted external drives are not touched. This cannot be undone.", 10
+    db "  Requires auth: auth sys reset", 10
+    db "  sys update: check the network for a newer boot.bin/stage2.bin/", 10
+    db "  kernel_body.bin and, if found, download and write them straight", 10
+    db "  to their fixed disk sectors. Reboot afterward to apply. No", 10
+    db "  rollback if it fails partway - re-run 'auth sys update' to retry.", 10
+    db "  Requires auth: auth sys update", 10, 0
 
 help_semicolon:
     db "; (command chaining)", 10
@@ -19207,7 +19232,9 @@ tcp_rx_len:    dd 0
 tcp_tx_len:    dd 0
 tcp_rx_prev:   dd 0          ; rx length at the previous idle-check tick
 tcp_err_msg:   dq 0          ; ptr to the last tcp/http error message (0 = none)
-tcp_dec_buf:   times 10 db 0
+tcp_dec_buf:   times 11 db 0     ; 10 decimal digits (max u32 = 4294967295)
+                                  ; + NUL terminator -- tcp_print_dec fills
+                                  ; this right-to-left from the far end
 tcp_rx_buf:    times TCP_RX_BUF_SIZE db 0
 tcp_tx_buf:    times HTTP_TX_MAX db 0   ; sized for the biggest thing that can
                                           ; land here: a full give/sgive POST
