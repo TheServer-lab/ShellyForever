@@ -263,6 +263,14 @@ tcp_handle_segment:
     push r14
     push r15
     mov r13, rsi ; TCP header base
+    ; only the connected peer may talk to this port pair: a segment from
+    ; any other host (a LAN scanner hitting our ephemeral port, spoofed
+    ; junk) is dropped before it can touch the state machine -- its RSTs
+    ; included. nic_send_ip stores IP addresses raw, so the wire-order
+    ; source dword compares directly against tcp_peer_ip.
+    mov eax, [nic_rx_frame + 14 + 12]   ; IPv4 header src addr, as stored
+    cmp eax, [tcp_peer_ip]
+    jne .th_out
     ; src port must match the peer's
     movzx eax, byte [r13]
     shl eax, 8
@@ -296,6 +304,17 @@ tcp_handle_segment:
     jz .th_out
     test r14b, TCP_FLAG_ACK
     jz .th_out
+    ; the SYN-ACK's ACK must cover OUR ISN (+1): a stale duplicate from an
+    ; earlier attempt on this same port pair -- exactly what the ephemeral
+    ; port randomization in tls_connect_and_handshake/cmd_tcp defends
+    ; against -- or a forged/random SYN-ACK would otherwise install foreign
+    ; sequence state here and desync everything that follows
+    lea rsi, [r13+8]
+    call tcp_load_be32               ; eax = segment ACK number
+    mov edx, [tcp_isn]
+    inc edx
+    cmp eax, edx
+    jne .th_out
     lea rsi, [r13+4]
     call tcp_load_be32
     mov [tcp_peer_seq], eax
@@ -485,7 +504,11 @@ tcp_print_dec:
     push rdi
     mov ecx, 10
     lea rdi, [tcp_dec_buf]
-    add rdi, 9
+    add rdi, 10                      ; NUL goes in the LAST byte of
+                                      ; tcp_dec_buf (11 bytes = 10 digits
+                                      ; + terminator); this used to be +9,
+                                      ; so a 10-digit value wrote its first
+                                      ; digit one byte BEFORE the buffer
     mov byte [rdi], 0
 .tpd_loop:
     xor edx, edx

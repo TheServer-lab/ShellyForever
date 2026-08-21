@@ -994,6 +994,24 @@ tls_pump:
     mov ecx, eax
     rep movsb
     add [tls_rx_used], eax
+    ; Whatever didn't fit STAYS in tcp_rx_buf: TCP already acknowledged
+    ; those bytes, so zeroing tcp_rx_len here would strand a hole in the
+    ; middle of a TLS record that the peer will never repair (it believes
+    ; we hold them) -- the same failure shape as tcp_handle_segment's old
+    ; ack-anyway overflow, one layer up. Shift the remainder to the front
+    ; and keep tcp_rx_len honest instead.
+    mov ecx, [tcp_rx_len]
+    sub ecx, eax                     ; bytes that didn't fit this round
+    jz .tls_pump_drained
+    lea rsi, [tcp_rx_buf]
+    add rsi, rax
+    lea rdi, [tcp_rx_buf]
+    push rcx
+    rep movsb
+    pop rcx
+    sub [tcp_rx_len], eax
+    jmp .tls_pump_done
+.tls_pump_drained:
     mov dword [tcp_rx_len], 0
 .tls_pump_done:
     pop rdi
@@ -1028,6 +1046,13 @@ tls_poll_single_frame:
     movzx edx, byte [tls_rx_buf + 4]
     or eax, edx
     add eax, 5
+    ; sanity: a declared record bigger than the largest legal TLSCiphertext
+    ; (header included) is corrupted or hostile and can NEVER complete --
+    ; report it via tls_oversize_got so tls_wait_for_record fails fast with
+    ; a real message instead of spinning out its whole timeout budget
+    ; waiting for bytes that cannot exist
+    cmp eax, TLS_RX_BUF_SIZE
+    ja .tls_psf_oversize
     cmp [tls_rx_used], eax
     jb .tls_psf_need
     ; record complete: type + payload
@@ -1038,6 +1063,10 @@ tls_poll_single_frame:
     clc
     jmp .tls_psf_out
 .tls_psf_need:
+    stc
+    jmp .tls_psf_out
+.tls_psf_oversize:
+    mov byte [tls_oversize_got], 1
     stc
 .tls_psf_out:
     pop rax
@@ -1441,13 +1470,16 @@ tls_handshake_after_connect:
     jmp .tls_ha_done
 .tls_ha_fail_wait:
     ; al comes straight from tls_wait_for_record: 1=timeout, 2=RST,
-    ; 3=cancelled -- surface which one instead of a blanket "failed".
+    ; 3=cancelled, 5=oversize record header -- surface which one instead
+    ; of a blanket "failed".
     cmp al, 1
     je .tls_ha_fw_timeout
     cmp al, 2
     je .tls_ha_fw_rst
     cmp al, 3
     je .tls_ha_fw_cancel
+    cmp al, 5
+    je .tls_ha_fw_oversize
     jmp .tls_ha_fail                 ; unrecognized reason -- generic message
 .tls_ha_fw_timeout:
     mov rsi, msg_tls_hs_timeout
@@ -1463,6 +1495,11 @@ tls_handshake_after_connect:
     mov byte [kill_flag], 0
     mov rsi, msg_tls_cancelled
     call print_string
+    stc
+    jmp .tls_ha_done
+.tls_ha_fw_oversize:
+    mov rsi, msg_tls_oversize
+    call tls_error_print
     stc
     jmp .tls_ha_done
 .tls_ha_fail_sh:
@@ -1537,7 +1574,8 @@ tls_handshake_after_connect:
 ;  into tls_frame_buf and consumed from the stream, so each call
 ;  yields the next record. CF=0: dl=content type, ecx=payload len,
 ;  rsi=payload ptr (into tls_frame_buf), tls_last_frame_len set.
-;  CF=1: al = reason (1=timeout, 2=RST, 3=cancelled) -- added in Phase 4
+;  CF=1: al = reason (1=timeout, 2=RST, 3=cancelled, 5=oversize record
+;  header -- see tls_oversize_got) -- added in Phase 4
 ;  so tls_do_exchange can salvage already-received data on a timeout
 ;  without treating a RST/cancel the same way. NOTE: rax is NOT saved/
 ;  restored here (same hazard class as tls_record_encrypt/decrypt in
@@ -1553,12 +1591,18 @@ tls_wait_for_record:
     push r15
     mov byte [tls_wait_ticks], TCP_ROUND_SECS
     mov byte [tls_retry], 0
+    mov byte [tls_oversize_got], 0   ; fresh wait, clean slate -- the flag
+                                      ; is set asynchronously by
+                                      ; tls_poll_single_frame below
     call rtc_sec_now
     mov [tls_last_sec], eax
 .tls_wfr_loop:
     ; try to extract a frame from what we already have
     call tls_poll_single_frame
     jnc .tls_wfr_got
+    cmp byte [tls_oversize_got], 0
+    jne .tls_wfr_oversize            ; impossible record length: no amount
+                                      ; of waiting will ever complete it
     ; nothing complete: poll transport
     call kbd_poll
     cmp byte [kill_flag], 0
@@ -1617,6 +1661,9 @@ tls_wait_for_record:
     jmp .tls_wfr_stc
 .tls_wfr_rst:
     mov al, 2
+    jmp .tls_wfr_stc
+.tls_wfr_oversize:
+    mov al, 5                        ; see tls_oversize_got / reason table
     jmp .tls_wfr_stc
 .tls_wfr_timeout:
     mov al, 1
@@ -1761,6 +1808,71 @@ tls_resend_ch:
                                       ; way once the round budget still
                                       ; expires and tls_wait_for_record times
                                       ; out normally
+    pop rax
+    mov [tcp_cur_seq], eax           ; restore -- unaffected by a retransmit
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; ============================================================
+;  tls_resend_app -- tls_resend_ch's application-data twin: retransmit
+;  the already-built request (tls_app_tx_buf/tls_app_tx_len) as a true
+;  retransmission while tls_exchange_on_session/tls_do_exchange wait for
+;  the reply. The request goes out as ONE small TCP segment; if that
+;  segment is dropped in transit, the server never sees a request at all,
+;  so passive waiting can never produce a reply -- exactly the hole the
+;  ClientHello resend hook exists to plug (see tls_wfr_resend_hook).
+;  Two sequence numbers have to be rewound for a byte-identical resend:
+;    - tcp_cur_seq back to the TCP seq the record was originally sent at
+;      (tls_ad_seq), same as tls_resend_ch;
+;    - tls_c_ap_seq back to the TLS record number it was encrypted with
+;      (tls_ad_tlsseq) -- the AES-GCM nonce is iv XOR seq, so only the
+;      original seq reproduces the original ciphertext. If the original
+;      DID arrive, the server sees a duplicate TLS record number and
+;      discards it per RFC 8446; if it didn't, this delivers it. Either
+;      way both sides stay in sync.
+;  Used as tls_wait_for_record's resend hook by the app-data phases --
+;  callers arm it right before sending the request and disarm it the
+;  moment any record comes back (a reply of any kind proves the server
+;  got the request).
+; ============================================================
+tls_resend_app:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    mov rsi, msg_tls_resend_app
+    call print_string                ; visible proof this actually fired,
+                                      ; same as tls_resend_ch's own trace
+    mov eax, [tcp_cur_seq]           ; save the current "next new data" seq
+    push rax
+    mov eax, [tls_ad_seq]
+    mov [tcp_cur_seq], eax           ; rewind to the request's own TCP seq
+    mov rax, [tls_c_ap_seq]          ; save current TLS client app-record no.
+    push rax
+    mov rax, [tls_ad_tlsseq]
+    mov [tls_c_ap_seq], rax          ; rewind so re-encryption is identical
+    lea rsi, [tls_app_tx_buf]
+    mov ecx, [tls_app_tx_len]
+    mov dl, CT_APPLICATION_DATA
+    call tls_send_app_record         ; ignore CF -- best-effort, same as
+                                      ; tls_resend_ch; a real failure still
+                                      ; surfaces via the round budget
+                                      ; expiring into a normal timeout
+    pop rax
+    mov [tls_c_ap_seq], rax          ; restore TLS record no. either way
     pop rax
     mov [tcp_cur_seq], eax           ; restore -- unaffected by a retransmit
     pop r11
@@ -2210,6 +2322,8 @@ tls_recv_app_frame:
     je .tls_raf_wfr_rst
     cmp al, 3
     je .tls_raf_wfr_cancel
+    cmp al, 5
+    je .tls_raf_wfr_oversize
     mov rsi, msg_tcp_timeout
     call tls_error_print
     mov al, 1
@@ -2227,6 +2341,13 @@ tls_recv_app_frame:
     call print_string
     mov al, 3
     stc
+    jmp .tls_raf_out
+.tls_raf_wfr_oversize:
+    mov rsi, msg_tls_oversize
+    call tls_error_print
+    mov al, 5
+    stc
+    jmp .tls_raf_out
 .tls_raf_out:
     pop r13
     pop r12
@@ -2311,6 +2432,15 @@ tls_do_exchange:
     mov byte [tls_close_notify_got], 0
 
     ; ---- encrypt + send the request as one application_data record ----
+    ; arm the retransmit hook first -- see tls_exchange_on_session /
+    ; tls_resend_app: a dropped request segment can never produce a
+    ; reply on its own, so waiting passively just burns the full budget.
+    mov eax, [tcp_cur_seq]
+    mov [tls_ad_seq], eax
+    mov rax, [tls_c_ap_seq]
+    mov [tls_ad_tlsseq], rax
+    mov qword [tls_wfr_resend_hook], tls_resend_app
+
     lea rsi, [tls_app_tx_buf]
     mov ecx, [tls_app_tx_len]
     mov dl, CT_APPLICATION_DATA
@@ -2335,6 +2465,9 @@ tls_do_exchange:
 .tls_dx_recv_go:
     call tls_recv_app_frame
     jc .tls_dx_recv_fail
+    ; a record came back, whatever it is -- the server demonstrably got
+    ; our request, so stop resending it
+    mov qword [tls_wfr_resend_hook], 0
     cmp al, 2
     je .tls_dx_close                 ; close_notify -- clean end
     jmp .tls_dx_recv                 ; data appended or harmlessly skipped
@@ -2378,6 +2511,11 @@ tls_do_exchange:
 .tls_dx_fail:
     stc
 .tls_dx_done:
+    mov qword [tls_wfr_resend_hook], 0   ; belt-and-braces: every exit path
+                                          ; flows through here (the loop
+                                          ; already disarms on the first
+                                          ; received frame) -- never leave
+                                          ; a stale hook armed across calls
     pop r13
     pop r12
     pop rdi
@@ -2389,10 +2527,319 @@ tls_do_exchange:
     ret
 
 ; ============================================================
+;  tls_open_session / tls_exchange_on_session / tls_close_session --
+;  a persistent-connection alternative to tls_do_exchange for
+;  callers that need several request/response round trips over one
+;  TCP+TLS connection instead of a fresh handshake per request. See
+;  update.asm's chunked component fetch, the motivating case: a
+;  large file split into many Range-GET chunks was doing a full
+;  fresh TLS handshake per ~16KB chunk, which in practice against a
+;  real CDN was both slow and unreliable (handshake timeouts,
+;  app-data timeouts, and outright connection resets, all observed
+;  in the same run).
+;
+;  tls_do_exchange itself is untouched -- cmd_stake/cmd_sgive/cmd_tcp
+;  and anything else doing a single one-shot request keep using it
+;  exactly as before. These three are purely additive.
+; ============================================================
+
+; tls_open_session: connect + handshake only, connection left open
+; afterward (no request sent). IN: rsi=hostname, dx=port. OUT: CF=0
+; open and ready for tls_exchange_on_session, CF=1 failed (error
+; already printed, same as tls_connect_and_handshake).
+tls_open_session:
+    call tls_connect_and_handshake
+    jc .tos_fail
+    mov qword [tls_c_ap_seq], 0
+    mov qword [tls_s_ap_seq], 0
+    mov dword [tls_app_rx_len], 0
+    mov byte [tls_close_notify_got], 0
+    clc
+    ret
+.tos_fail:
+    stc
+    ret
+
+; tls_exchange_on_session: send one request and receive exactly one
+; Content-Length-delimited response over an already-open session,
+; WITHOUT closing the connection afterward.
+;
+; Unlike tls_do_exchange, this can't use "wait for close_notify/FIN"
+; to know the response is complete -- a server keeping the
+; connection alive for more requests has no reason to send either
+; between them. So this parses Content-Length out of the response
+; headers as soon as they've arrived and stops once that many body
+; bytes are in, the normal HTTP/1.1 way (see tls_parse_content_length
+; below).
+;
+; IN: caller has placed the request in tls_app_tx_buf/tls_app_tx_len
+;     (same convention as tls_do_exchange).
+; OUT: CF=0 -- rax = body ptr into tls_app_rx_buf, ecx = body len
+;      (from Content-Length -- if the connection dies partway through
+;      delivering that many bytes, that's CF=1 below, not a short
+;      ecx here; ecx is only ever set once the full Content-Length
+;      has actually arrived).
+;      CF=1 -- transport error, a FIN/close_notify before the body
+;      was complete, or no parseable Content-Length. Caller should
+;      treat the session as dead and call tls_close_session before
+;      opening a fresh one -- this never leaves a session worth
+;      continuing to reuse.
+tls_exchange_on_session:
+    push rbx
+    push rdx
+    push rsi
+    push rdi
+    push r12
+
+    mov dword [tls_app_rx_len], 0
+    mov byte [tls_close_notify_got], 0
+
+    ; arm the retransmit hook BEFORE sending: the request leaves as one
+    ; small TCP segment, and if that segment is dropped in transit the
+    ; server never sees a request, so no amount of passive waiting will
+    ; ever produce a reply -- same hole tls_resend_ch plugs for the
+    ; ClientHello, this is its app-data twin (see tls_resend_app).
+    mov eax, [tcp_cur_seq]
+    mov [tls_ad_seq], eax
+    mov rax, [tls_c_ap_seq]
+    mov [tls_ad_tlsseq], rax
+    mov qword [tls_wfr_resend_hook], tls_resend_app
+
+    lea rsi, [tls_app_tx_buf]
+    mov ecx, [tls_app_tx_len]
+    mov dl, CT_APPLICATION_DATA
+    call tls_send_app_record
+    jc .tos2_fail
+
+    xor r12d, r12d                ; 0 = Content-Length not parsed yet;
+                                   ; once known, r12d = total bytes
+                                   ; this response needs (header
+                                   ; block + body)
+.tos2_recv:
+    cmp byte [tcp_fin_got], 0
+    jne .tos2_fail                ; the peer closing before we have a
+                                   ; full body is always an error on a
+                                   ; persistent connection -- there's
+                                   ; no "salvage what we have" case
+                                   ; here the way tls_do_exchange has
+    call tls_recv_app_frame
+    jc .tos2_fail
+    ; a record came back, whatever it is -- the server demonstrably got
+    ; our request, so stop resending it
+    mov qword [tls_wfr_resend_hook], 0
+    cmp al, 2
+    je .tos2_fail                 ; close_notify mid-response: also
+                                   ; an error, same reason as above
+
+    test r12d, r12d
+    jnz .tos2_check
+    call tls_parse_content_length
+    jc .tos2_recv                 ; headers not fully in yet, keep going
+    mov r12d, eax
+
+.tos2_check:
+    mov eax, [tls_app_rx_len]
+    cmp eax, r12d
+    jb .tos2_recv
+
+    call tls_find_body_start
+    jc .tos2_fail
+    clc
+    jmp .tos2_out
+.tos2_fail:
+    mov qword [tls_wfr_resend_hook], 0   ; never leave the hook armed across
+                                          ; calls -- a stale hook would keep
+                                          ; resending an old request into a
+                                          ; later, unrelated wait
+    stc
+.tos2_out:
+    pop r12
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rbx
+    ret
+
+; tls_close_session: send close_notify + TCP FIN|ACK on a session
+; opened with tls_open_session. Best-effort, like tls_do_exchange's
+; own close tail: a failed send here isn't itself reported as an
+; error, since the caller is closing the session either way (after
+; its last request, or abandoning it following a transport failure)
+; and there's nothing more useful to do with a send failure at that
+; point.
+tls_close_session:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push r8
+    push r9
+    push r10
+    push r11
+
+    lea rsi, [tls_close_notify_payload]
+    mov ecx, 2
+    mov dl, CT_ALERT
+    call tls_send_app_record
+
+    xor rsi, rsi
+    xor ecx, ecx
+    mov r8d, [tcp_peer_ip]
+    mov r9w, [tcp_peer_port]
+    mov r10w, [tcp_my_port]
+    mov r11w, TCP_FLAG_FIN | TCP_FLAG_ACK
+    call tcp_send_segment
+
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; tls_find_body_start: scans tls_app_rx_buf (tls_app_rx_len bytes)
+; for the header/body boundary (CRLFCRLF). Local equivalent of
+; https.asm's https_find_body, duplicated here (rather than called
+; from tls.asm) so this file doesn't gain a dependency on https.asm,
+; which currently depends on tls.asm and not the other way around.
+; OUT: CF=0 -- rax = body ptr, ecx = body length (tls_app_rx_len
+;      minus the offset of the body start)
+;      CF=1 -- no CRLFCRLF found yet
+tls_find_body_start:
+    push rbx
+    push rdx
+    push rsi
+    push rdi
+    lea rsi, [tls_app_rx_buf]
+    mov ecx, [tls_app_rx_len]
+    test ecx, ecx
+    jz .tfbs_nob
+.tfbs_scan:
+    cmp ecx, 3
+    jbe .tfbs_nob
+    cmp byte [rsi], 13
+    jne .tfbs_next
+    cmp byte [rsi+1], 10
+    jne .tfbs_next
+    cmp byte [rsi+2], 13
+    jne .tfbs_next
+    cmp byte [rsi+3], 10
+    jne .tfbs_next
+    lea rax, [rsi+4]
+    mov ecx, [tls_app_rx_len]
+    lea rdx, [tls_app_rx_buf]
+    add rdx, rcx
+    sub rdx, rax
+    mov ecx, edx
+    clc
+    jmp .tfbs_out
+.tfbs_next:
+    inc rsi
+    dec ecx
+    jmp .tfbs_scan
+.tfbs_nob:
+    stc
+.tfbs_out:
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rbx
+    ret
+
+; tls_parse_content_length: scans tls_app_rx_buf (as received so far)
+; for a complete header block (CRLFCRLF) and a "Content-Length: "
+; header within it.
+; OUT: CF=0 -- eax = header-block-end offset + parsed Content-Length,
+;      i.e. the total byte count tls_app_rx_len needs to reach for
+;      this response to be complete.
+;      CF=1 -- header block not fully received yet, or it was and
+;      had no parseable Content-Length. tls_exchange_on_session
+;      treats both the same way (keep waiting) since it's called
+;      again as more data arrives either way; a response that turns
+;      out to have no Content-Length at all just never completes and
+;      eventually times out in tls_wait_for_record, same as any other
+;      dead connection -- tls_do_exchange's read-until-close model is
+;      the tool for a no-Content-Length response, not this one.
+tls_parse_content_length:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+
+    call tls_find_body_start
+    jc .tpcl_out_fail
+
+    lea rdx, [tls_app_rx_buf]
+    sub rax, rdx
+    mov ebx, eax                  ; ebx = header-block-end offset
+
+    lea rsi, [tls_app_rx_buf]
+    mov ecx, ebx
+.tpcl_scan:
+    cmp ecx, TLS_CL_HEADER_LEN
+    jb .tpcl_out_fail
+    push rcx
+    push rsi
+    mov rdi, tls_cl_header_name
+    mov edx, TLS_CL_HEADER_LEN
+.tpcl_cmp:
+    test edx, edx
+    jz .tpcl_match
+    mov al, [rsi]
+    cmp al, [rdi]
+    jne .tpcl_nomatch
+    inc rsi
+    inc rdi
+    dec edx
+    jmp .tpcl_cmp
+.tpcl_match:
+    pop rsi
+    pop rcx
+    add rsi, TLS_CL_HEADER_LEN
+    call parse_uint_run           ; eax = parsed value, advances rsi
+    add eax, ebx                  ; total = header_end + content_length
+    jmp .tpcl_out_ok
+.tpcl_nomatch:
+    pop rsi
+    pop rcx
+    inc rsi
+    dec ecx
+    jmp .tpcl_scan
+.tpcl_out_fail:
+    stc
+    jmp .tpcl_ret
+.tpcl_out_ok:
+    clc
+.tpcl_ret:
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+tls_cl_header_name: db "Content-Length: "
+TLS_CL_HEADER_LEN equ ($ - tls_cl_header_name)
+
+; ============================================================
 ;  data
 ; ============================================================
 TLS_TRANSCRIPT_MAX equ 16384
-TLS_RX_BUF_SIZE    equ 16384
+; Largest legal TLSCiphertext payload per RFC 8446 section 5.2: 2^14 + 256.
+TLS_RECORD_MAX     equ 16640
+; The stream buffer has to hold the 5-byte record header + ONE complete
+; max-size record contiguously, or such a record can never finish arriving.
+; Used to be plain 16384 -- smaller than a single legal max record's wire
+; footprint (5 + 16640 = 16645) -- so any server sending full-size records
+; (perfectly RFC-legal) stalled the connection into a guaranteed timeout,
+; with tls_pump silently discarding the already-ACKed tail it had no room
+; for. Every derived buffer below (tls_hsmsg_buf/tls_plain/tls_tx_buf/
+; tls_frame_buf/tls_rx_buf) scales off this constant automatically.
+TLS_RX_BUF_SIZE    equ TLS_RECORD_MAX + 5
 
 tls_zero32:    times 32 db 0
 tls_basepoint9: db 9
@@ -2515,6 +2962,19 @@ tls_wfr_resend_hook: dq 0
 tls_ch_seq:          dd 0        ; tcp_cur_seq the ClientHello was sent at,
                                   ; so a retransmit can reuse the same seq
                                   ; instead of the (already advanced) next one
+tls_ad_seq:          dd 0        ; tcp_cur_seq the app-data request was sent
+                                  ; at -- tls_resend_app rewinds to it for a
+                                  ; true retransmission (see tls_resend_ch)
+tls_ad_tlsseq:       dq 0        ; tls_c_ap_seq at the moment the app-data
+                                  ; request was encrypted -- the AES-GCM nonce
+                                  ; is iv XOR seq, so a byte-identical resend
+                                  ; has to rewind this too, not just the TCP
+                                  ; sequence number
+tls_oversize_got:    db 0        ; tls_poll_single_frame saw a record whose
+                                  ; declared length exceeds TLS_RECORD_MAX --
+                                  ; unrecoverable garbage that can never
+                                  ; complete; reported by tls_wait_for_record
+                                  ; as reason 5, cleared at each new wait
 tls_dns_buf:        times 128 db 0
 tls_dns_ip_idx:     dd 0        ; which entry of nic_dns_ips we're on
 
@@ -2539,6 +2999,8 @@ tls_empty_hash:
 msg_tls_retry_ip:     db "tls: no reply from that address, trying ", 0
 msg_tls_connecting:   db "tls: connecting to ", 0
 msg_tls_resend_ch:    db "tls: no ServerHello yet -- resending ClientHello", 10, 0
+msg_tls_resend_app:   db "tls: no reply yet -- resending request", 10, 0
+msg_tls_oversize:     db "tls: peer sent an oversized/corrupt record header", 10, 0
 msg_tls_colon:        db ":", 0
 msg_tls_nl:           db 10, 0
 msg_tls_connected:    db 10, "tls: connected.", 10, 0
