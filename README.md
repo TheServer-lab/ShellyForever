@@ -1,1421 +1,248 @@
 # ShellyForever
 
-**Version:** 0.1.18
+**A complete x86_64 operating system written in pure assembly.**  
+*No libc. No OpenSSL. No GRUB. Just raw silicon and stubbornness.*
 
-A 64-bit shell-based OS written entirely in x86-64 NASM assembly, from scratch —
-no C, no BIOS libraries beyond boot-time disk/keyboard calls, no existing kernel.
+---
 
-## What's actually in here
+## 🖥️ What is ShellyForever?
 
-- **`boot.asm`** — the boot sector (512 bytes, fits in one disk sector).
-  Runs in 16-bit real mode, loads `kernel.bin` off disk, switches to 32-bit
-  protected mode, builds minimal page tables, switches to 64-bit long mode,
-  and jumps into the kernel.
-- **`kernel.asm`** — the OS itself. From scratch:
-  - A VGA text-mode driver (writes directly to `0xB8000`), with scrolling.
-  - A PS/2 keyboard driver (polls the `8042` controller, decodes scancode
-    set 1, handles shift for letters/symbols, backspace, enter).
-  - **`rush`**, the custom shell: prompt, line editor, a tokenizer that
-    understands `"quoted strings with spaces"`, and a command dispatcher.
-  - An in-memory filesystem tree rooted at `/home` (folders + files), with
-    recursive copy/move/delete of whole subtrees.
-  - A simple `name = value` variable table (int64), reused by `calc`.
-  - A built-in line editor for file content (`edit`).
-  - Multi-block (chained) files on a 256-node **SFFS v4** volume — a
-    single file can span multiple filesystem nodes, up to ~40 KB, and
-    isn't capped at one node's content size. Older v2/v3 volumes still
-    load fine and are upgraded in place on the next `sync`. See
-    "SFFS v4 on-disk format" below.
-  - A polled networking stack: hand-written drivers for the RTL8139
-    (legacy), Intel e1000, and Realtek RTL8168/8169/8161 ("PCIe GBE
-    Family Controller") NICs, plus Ethernet II + ARP + IPv4 + ICMP echo +
-    UDP + a DNS client. See "Networking" below.
-  - A text-based web browser (`browse`) that fetches HTTP pages, strips
-    the HTML to readable text, and follows links. See "The browser:
-    `browse`" below.
-  - A `/sys` system folder, auto-seeded on a fresh filesystem, holding
-    `alias.sly` (aliases) and `sysconfig.sly` (system settings) — both
-    persist across `sync`/`rboot`/`sdown` like any other file. See
-    "System configuration: `sysconfig.sly`" below.
-  - A compiled executable format (`.run`) — `run <file.run>` loads a
-    small headered binary, hands it a kernel API table (print, input,
-    kill-check), and tracks it in the process table like a script. See
-    "Compiled programs: `run`" below.
-  - A package manager — `mksin <folder>` builds a `.sin` installer
-    package, `install <file.sin>` installs one by running its
-    `whattodo.inst` script (creating folders, copying files, registering
-    the program so typing its id launches it), `uninstall <id>` removes a
-    registered program, and `sin get <name>` fetches and installs a
-    package by name over HTTPS in one step. See "Package manager:
-    `mksin`, `install`, and `sin get`" below.
-  - **Party**, a small built-in scripting language (`.pa` files) with
-    its own variables, expressions, control flow, and functions — the
-    interpreter now implements the full v0.1 spec end-to-end.
-    `party compile <file.pa>` compiles a script straight to a `.run`
-    executable instead of only interpreting it. See "Party" below and
-    `PARTY_SPEC.md`.
-  - A factory-reset command, `sys reset` (requires auth) — wipes the
-    OS volume back to an empty filesystem, clears variables/aliases,
-    and recreates the default `/sys` files, for when a system's state
-    is badly wrong and you want a clean slate. See "Factory reset:
-    `sys reset`" below.
+ShellyForever is a hobby operating system that boots on real hardware (and QEMU) from a custom BIOS bootloader. It includes a full networking stack with TLS 1.3 support, a text-mode web browser, a custom filesystem, a package manager, a programming language, and a PC speaker audio system — all written from scratch in x86_64 assembly.
 
-## Commands implemented
+**It fits in under 1.2 MB.**
 
-| Command | Example | Behavior |
-|---|---|---|
-| `cf` | `cf docs`, `cf ..`, `cf /home` | change folder |
-| `mkf` | `mkf docs` | make a folder in the current directory |
-| `mkfl` | `mkfl something.txt "some text"` | make a file with content (`-force`/`-silent`/`-info`/`-test`) |
-| `del` | `del something.txt` | delete a file in the current folder (requires auth) |
-| `rname` | `rname old.txt new.txt` | rename a file or folder here |
-| `owrite` | `owrite hi.txt "new content"` | overwrite an existing file's content in place |
-| `cpy` | `cpy docs docs_backup` | copy a file or folder here (recursive for folders) |
-| `mov` | `mov docs archive` | move/rename a file or folder here (recursive for folders) |
-| `show` | `show "hello world"`, `show a` | print a message, or a variable's value |
-| `list` | `list` | list contents of current folder |
-| `view` | `view something.txt` | print a file's content |
-| `find` | `find notes.txt` | search every drive for a file/folder by name, print its full path |
-| `lookfor` | `lookfor "todo" notes.txt`, `lookfor "todo" line 100, 200 notes.txt limit 5` | search a file's content for text, like grep |
-| `edit` | `edit something.txt` | open the built-in editor for a file — Left/Right/Home/End move the cursor through existing content, Delete removes forward (Esc, then y/n to save) |
-| `<name> = <value>` | `a = 5` | set a variable to a literal or another variable's value |
-| `rmv` | `rmv a` | remove a variable |
-| `vars` | `vars` | list all variables |
-| `vars rmv all` | `auth vars rmv all` | clear all variables (requires auth) |
-| `calc` | `calc 1 + 2 * 3` | evaluate a math expression |
-| `date` | `date` | print the current date (from the RTC clock chip) |
-| `time` | `time` | print the current time, HH:MM:SS 24-hour (from the RTC) |
-| `wig` | `wig time` | live clock widget in the top-right corner, updates every second (Esc to stop) |
-| `shelly` | `shelly` | print the splash banner: a rainbow ShellyForever OS title, the build version, the developer credit, and the copyright line |
-| `write` | `show hi ~ write file.txt` | write text to a file (creates it, or overwrites); handy as a `~` pipe target |
-| `rr` | `rr script.rsh` | run a rush script file (`$` = comment line) |
-| `run` | `run hello.run` | run a compiled ShellyForever `RUN 0.1` executable; typing a bare `name.run` does the same |
-| `party` | `party hello.pa` | run a program in **Party** (`.pa`), a small built-in scripting language — own variables, expressions, `if`/`else`, `while`, `func`/`return`, and `display` output. See "Party" below and `PARTY_SPEC.md` |
-| `party compile` | `party compile hello.pa` | compile a Party script straight to a `hello.run` executable instead of interpreting it |
-| `party get` | `party get math` | fetch `<modulename>.pa` from the module server over HTTPS and save it locally, ready for a `module "..."` line |
-| `mksin` | `mksin calculator` | build a `<folder>.sin` installer package from a folder laid out as `whattodo.inst` + `files/` |
-| `install` | `install calculator.sin` | install a `.sin` package: run its `whattodo.inst` instructions, copy its files into place, and register the program so typing its id launches it |
-| `uninstall` | `uninstall calculator` | remove a program previously installed with `install`, by the id it was registered under |
-| `sin get` | `sin get calculator` | download a `.sin` package by name over HTTPS and install it in one step (`-keep` to keep the downloaded file) |
-| `prs` | `prs`, `prs kill 1`, `prs kill rushrun` | list processes, or kill by PID or name |
-| `auth` | `auth sdown`, `auth vars rmv all` | elevate privileges for one dangerous command |
-| `sys reset` | `auth sys reset` | factory-reset the OS volume: wipe every file and variable, recreate default system files (requires auth) |
-| `current` | `current` | print current path |
-| `wipe` | `wipe` | clear the screen |
-| `help` | `help` | list commands |
-| `dscan` | `dscan` | scan all ATA and AHCI drives for SFFS volumes (shows each drive's `disk<N>` target label) |
-| `fmt` | `fmt data` | format the first unformatted drive with an SFFS label (`-force` to reuse one) |
-| `fmt` | `fmt disk1 data` | format a SPECIFIC drive by the `disk<N>` label `dscan` shows for it |
-| `mount` | `mount data` | mount a formatted drive's volume under `/<label>/` |
-| `unmount` | `unmount data` | detach a mounted drive's volume (data stays on disk; `mount` re-attaches it) |
-| `label` | `label old new` | rename a formatted drive's label in place, without touching its files |
-| `ali` | `ali gs list ~ show` | create an alias: shorthand for a stored command (or chain of commands) |
-| `alis` | `alis` | list all aliases and their bodies |
-| `rmv ali` | `rmv ali gs` | remove one alias |
-| `color` | `color cyan`, `color list`, `color reset` | change the normal-text output color (16 VGA colors) |
-| `sync` | `sync` | save the filesystem (and mounted volumes) to disk |
-| `rboot` | `rboot` | save to disk, then restart (requires auth) |
-| `sdown` | `sdown` | save to disk, then shut down (requires auth) |
-| `netinfo` | `netinfo` | show the NIC's MAC address and static IP/mask/gateway/DNS config |
-| `net` | `net ip 10.0.2.20`, `net gw 10.0.2.2`, `net dns 8.8.8.8`, `net on`, `net off`, `net reset` | change static IP/gw/DNS, or bring NIC up / shut down / restart without reboot |
-| `dns` | `dns google.com` | resolve a hostname via the configured DNS server |
-| `bounce` | `bounce 10.0.2.2` | send one ICMP echo (ping) with a ~2-3s timeout |
-| `monitor` | `monitor google.com` | ping repeatedly, one line per reply, until Esc |
-| `tcp` | `tcp 10.0.2.2 8000` | open a TCP connection, send a payload, and print the reply |
-| `take` | `take http://10.0.2.2:8000/notes.txt notes.txt` | HTTP GET a file from a server, save to local file |
-| `give` | `give http://10.0.2.2:8000/upload notes.txt` | HTTP POST a local file to a server endpoint |
-| `stake` | `stake https://10.0.2.2:8443/notes.txt notes.txt` | HTTPS (TLS 1.3) GET a file from a server, save to local file (no cert validation) |
-| `sgive` | `sgive https://10.0.2.2:8443/upload notes.txt` | HTTPS (TLS 1.3) POST a local file to a server endpoint (no cert validation) |
-| `browse` | `browse http://10.0.2.2:8000/` | fetch a page over HTTP, strip HTML to text, follow `[N]` links, back/forward/bookmarks (see below) |
+---
 
-### Line editing: history, tab completion, cursor movement, and scrollback
+## ✨ Features
 
-- **Tab** — command / filename completion (see below).
-- **Up / Down** — recall previous commands (like bash). Your in-progress
-  line is preserved if you arrow up through history and then back down past
-  the most recent entry. History holds the last 20 non-empty lines entered
-  this session (not persisted across reboot).
-- **Left / Right** — move the cursor one character at a time within the
-  current line, without disturbing already-typed text. Typing or Backspace
-  at a mid-line cursor position inserts/removes right there and reflows the
-  rest of the line, rather than only ever appending at the end.
-- **Home / End** — jump the cursor to the start or end of the current line
-  in one keystroke.
-- **Delete** — remove the character to the right of the cursor (forward
-  delete), complementing Backspace's delete-to-the-left.
-- **Ctrl+Up / Ctrl+Down** — scroll the screen back to review output that's
-  scrolled off the top (up to 100 lines of scrollback), without disturbing
-  whatever you're mid-typing at the prompt. Typing a character, pressing
-  Enter, or recalling history all snap the view back to live automatically.
-  Works at the shell prompt and inside the `edit` command's editor.
+### 🖥️ Core System
 
-Left/Right/Home/End/Delete work the same way inside `edit`'s in-file editor:
-the cursor can move freely through the file's content (not just append at
-the end), and inserts/deletes/newlines happen wherever the cursor sits, with
-the visible page redrawn around it on every keystroke.
+- Custom two-stage BIOS bootloader (512-byte MBR + stage2)
+- 64-bit Long Mode with identity-mapped paging
+- PS/2 keyboard polling (no interrupts yet)
+- Custom SFFS filesystem (Shelly File System)
 
-### Tab completion
+### 🌐 Networking
 
-Pressing **Tab** at the prompt completes what you're typing:
+- RTL8168 PCIe NIC driver (polling-based)
+- Full TCP/IP stack with retransmission
+- DHCP client (automatic IP assignment)
+- DNS resolver with multi-IP failover
+- TLS 1.3 handshake (X25519 + ChaCha20-Poly1305 + SHA-256)
+- HTTP/1.1 and HTTPS support (`stake` GET, `sgive` POST)
+- Persistent TLS sessions for multiple requests
 
-- **First token on the line** — completes a built-in command name.
-  `vi` + Tab becomes `view ` (a unique match gets a trailing space).
-- **Any later token** — completes a file or folder name directly inside the
-  current directory. `view aa` + Tab becomes `view aaa.txt`; a folder match
-  gets a trailing `/` (`cf doc` + Tab → `cf docs/`).
-- **Ambiguous prefix** — completes as far as all candidates agree; if that's
-  already the whole shared prefix, the candidates are listed on their own
-  line and the prompt and line are redrawn, so you can keep typing and Tab
-  again (`d` + Tab lists `del dscan date`).
+### 📦 Package Management
+
+- `.sin` package format (stored ZIP, no compression)
+- `whattodo.inst` installer scripts (`name`, `version`, `mkdir`, `copy`, `program`, `finish`)
+- Registry (`/home/sys/programes.sly`) maps commands to binaries
+- `sin install`, `sin uninstall`, and `sin get` commands
+- `-keep` flag to preserve packages after installation
+
+### 🎮 Programming Language (Party)
+
+- Interpreted (`.pa`) and compiled (`.run`) modes
+- Native compiler (runs on ShellyForever itself)
+- Exposed intrinsics: `beep()`, `stake()`, `sgive()`, `fs_read()`, `print()`, etc.
+- `pip`-like module manager for Party libraries
+
+### 🔊 Audio
+
+- PC speaker support (port `0x61` + PIT channel 2)
+- `beep <hz> <ms>` command (raw frequency/duration)
+- `.ss` (Shelly Sound) format (plain-text music notation)
+- Startup chime (C Major arpeggio)
+
+### 🔄 System Update
+
+- `auth sys update` command
+- Fetches new `boot.bin`, `stage2.bin`, and `kernel_body.bin` from the Shellybin repository
+- Range-GET downloads in 16 KB chunks
+- CRC32 verification on each component
+- Pivot sector (LBA 1) for atomic boot switching
+- **Warning: This will damage any other bootloaders (GRUB, etc.)**
+
+### 🛡️ Security Model
+
+- `auth admin` / `auth member` / `auth guest` privilege levels
+- Password support (optional, SHA-256 hashed)
+- `devmode on/off` bypasses passwords for development
+- Scripts run with current user privileges (guest by default)
+- `rr script.rsh` runs Rush scripts (read before running)
+
+### 🖥️ Shell Commands (Rush)
+
+| Command | Description |
+|---|---|
+| `list` | List files in a directory |
+| `cpy` | Copy a file |
+| `mov` | Move/rename a file |
+| `auth del` | Delete a file (admin only) |
+| `mkf` | Create a directory |
+| `mkfl` | Create an empty file |
+| `view` | Print a file to screen |
+| `upper` | Print first N lines of a file |
+| `lower` | Print last N lines of a file |
+| `time` | Show system date/time |
+| `me` | Show current user |
+| `shelly` | Show OS version |
+| `show` | Print a message |
+| `bounce` | Ping a host |
+| `monitor` | Continuous ping |
+| `stake` | Download a file over HTTPS |
+| `sgive` | Upload a file over HTTPS |
+| `sin install` | Install a `.sin` package |
+| `sin uninstall` | Uninstall a package |
+| `sin get` | Fetch and install a package from a URL |
+| `prs` | List running processes |
+| `kill` | Kill a process |
+| `prog.run` | Run a program (foreground) |
+| `prog.run -back` | Run a program in the background |
+| `front` | Bring a background job to the foreground |
+| `cf` | Change directory |
+| `current` | Show current directory |
+| `help` | Show help for a command |
+| `auth` | Run a command with privilege escalation |
+| `auth sys reset` | Factory reset (not reboot!) |
+| `auth sdown` | Shutdown the system |
+| `devmode` | Enable/disable developer mode |
+| `rr` | Run a Rush script |
+
+---
+
+## 🔧 System Requirements
+
+- **CPU:** x86_64 (Intel or AMD)
+- **RAM:** 64 MB minimum (tested on 2 GB)
+- **Storage:** ATA/IDE hard disk or SSD (no USB yet)
+- **Network:** RTL8168 PCIe NIC (common on older motherboards)
+- **Audio:** PC speaker (requires a physical buzzer on the motherboard header)
+- **BIOS:** Legacy BIOS (no UEFI support)
+
+---
+
+## ⚠️ Warnings
+
+**This OS is not ready for daily use.** It is a hobby project written in pure assembly. Use it on real hardware at your own risk.
+
+- **`auth sys update`** writes directly to disk sectors. It will **destroy any other bootloaders** (GRUB, Windows Boot Manager, etc.) on the device.
+- **`auth sys reset`** is a **factory reset**, not a reboot. It will erase all user data.
+- The network stack has a ~50–85% success rate on real hardware. Use `net reset` to retry.
+- The `.ss` audio parser has a Heisenbug: it works only when a 1-byte diagnostic padding is present.
+
+---
+
+## 🚀 Getting Started
+
+### Building from Source
+
+1. Clone the repository:
+
+   ```bash
+   git clone https://github.com/TheServer-lab/ShellyForever.git
+   cd ShellyForever
+   ```
+
+2. Assemble the kernel (requires NASM):
+
+   ```bash
+   make
+   ```
+
+3. Write the bootloader + kernel to a disk image:
+
+   ```bash
+   make image
+   ```
+
+4. Boot in QEMU:
+
+   ```bash
+   make qemu
+   ```
+
+5. Write to a USB stick (real hardware):
+
+   ```bash
+   dd if=shelly.img of=/dev/sdX bs=512 conv=fsync
+   ```
+
+### First Boot
+
+- The OS boots directly into the Rush shell.
+- Try `shelly` to see the version.
+- Try `bounce google.com` to test networking.
+- Try `stake https://raw.githubusercontent.com/TheServer-lab/shellybin/main/sys/version.sly version.sly` to download a file over HTTPS.
+- Try `view version.sly` to read it.
+- Try `beep 440 250` to test the PC speaker.
+
+---
+
+## 📂 Directory Structure
 
 ```text
-rush>/home: ca<Tab>                      ->  rush>/home: calc
-rush>/home: view a<Tab>                  ->  rush>/home: view aaa.txt
-rush>/home: view b<Tab>
-bbb.txt bcd.txt
-rush>/home: view b
+/
+├── boot.bin                 # MBR + bootloader
+├── stage2.bin               # Stage 2 bootloader
+├── kernel_body.bin          # Main kernel
+├── home/
+│   ├── sys/
+│   │   ├── programes.sly    # Command registry
+│   │   ├── sysconfig.sly    # System configuration
+│   │   ├── password.sly     # Hashed admin password
+│   │   └── version.sly      # Current OS version
+│   └── user/                 # User home directories
+├── bin/                      # System binaries
+└── tmp/                      # Temporary files
 ```
 
-### Command chaining with `;`
+---
 
-You can chain multiple commands on a single line using `;`:
+## 🧪 Tested Hardware
 
-```
-rush>/home: show hello ; show world
-hello world
-rush>/home: mkfl a.txt "first" ; mkfl b.txt "second" ; list
-a.txt
-b.txt
-rush>/home:
-```
+- **Motherboard:** ASUS P8Z77-V (Intel H77 chipset)
+- **NIC:** RTL8168/8111 (onboard)
+- **CPU:** Intel Core i5-3570K
+- **RAM:** 8 GB DDR3
+- **Storage:** 120 GB SATA SSD
 
-Semicolons inside double quotes are treated literally:
+---
 
-```
-rush>/home: show "do not ; split this"
-do not ; split this
-```
+## 🐛 Known Issues
 
-This also works inside `rr` script files, so a single `.rsh` line can run
-multiple commands in sequence. Press Esc to interrupt a running script at any
-point — including between `;`-chained segments on the same line.
+- **xHCI (USB 3.0):** Not supported. Use USB 2.0 (EHCI) or the network stack.
+- **Intel HDA Audio:** Works in QEMU but not on real hardware.
+- **Network Reliability:** ~50–85% success rate on real hardware. Use `net reset`.
+- **`.ss` Parser Heisenbug:** Works with diagnostic padding, fails without it.
 
-### Piping output with `~`
+---
 
-You can pipe the output of one command into another with `~`:
+## 📜 License
 
-```
-rush>/home: calc 1 + 1 * 5 ~ = a ; show a
-6
-```
+This source code is **available for educational purposes only**.
 
-The left side of `~` runs normally except its output is captured instead of
-being printed. What happens with that captured text depends on the right
-side:
+You may read, study, and learn from it, but you may not copy, redistribute, or use it as the basis for your own project without explicit permission.
 
-- **`= <name>`** (or `=<name>` with no space) parses the captured text as a
-  decimal integer and stores it in that variable, just like a normal
-  `<name> = <value>` assignment:
-  ```
-  rush>/home: calc 10 - 3 ~ = b
-  rush>/home: show b
-  7
-  ```
-- **Any other command** gets the captured text appended as one extra quoted
-  argument and is then run as-is:
-  ```
-  rush>/home: calc 3 * 3 ~ show
-  9
-  rush>/home: view notes.txt ~ mkfl copy.txt
-  ```
-  (the second example pipes a file's content into a new file, using `view`'s
-  output as `mkfl`'s content argument)
+**ShellyForever is a work of art. Please respect the time and effort that went into it.**
 
-Like `;`, a `~` inside double quotes is treated literally, not as a pipe, and
-this works inside `rr` scripts too. Only one `~` per chained segment is
-supported (i.e. `a ~ b ~ c` is not).
+---
 
-### Comments with `$`
+## 💬 Acknowledgements
 
-Any line whose first character is `$` is treated as a comment and skipped by
-both the interactive shell and the `rr` script runner:
+- The OSDev Wiki — for documentation on bootloaders, GDT, paging, etc.
+- RFC 8446 — for TLS 1.3
+- Local repair shop — for the free PC speaker buzzer
 
-```
-rush>/home: $ this is a comment
-rush>/home: show hi
-hi
-```
+---
 
-### Elevation system (auth)
+## 📞 Contact
 
-Dangerous commands — `sdown`, `rboot`, `del`, `vars rmv all`, `rmv ali
-all`, and `sys reset` — require authentication. Prefix the command with
-`auth` (like `sudo`):
+- **Author:** TheServer-lab
+- **Source:** https://github.com/TheServer-lab/ShellyForever
+- **Discord:** [Join the ShellyForever community](https://discord.gg/vuUcJCY8bu)
 
-```
-rush>/home: sdown
-error: this command requires authentication. Use 'auth <command>' first.
-rush>/home: auth sdown
-Authentication granted.
-Shutting down...
-```
+---
 
-The auth flag is temporary — it applies only to the one command following
-`auth`, then resets. Chain with `;` works too:
-
-```
-rush>/home: auth del notes.txt ; show "done"
-Authentication granted.
-done
-```
-
-### Factory reset: `sys reset`
-
-`auth sys reset` wipes the OS volume back to a clean, empty system —
-meant as a recovery path for when something is badly wrong (a corrupted
-or cluttered filesystem, a config that's fighting you, or you just want
-to start over) rather than reformatting the whole drive by hand.
-
-```
-rush>/home: sys reset
-error: this command requires authentication. Use 'auth <command>' first.
-rush>/home: auth sys reset
-Authentication granted.
-System reset complete. All files and variables were wiped and default system files recreated.
-```
-
-What it does:
-
-- Deletes every file and folder on the OS volume (nodes `0..OS_NODES-1`),
-  restoring a single empty root — but **keeps the volume's existing
-  label**, so the system's identity doesn't change.
-- Clears every session variable and alias.
-- Recreates the default `/sys` files (`alias.sly`, `sysconfig.sly`) with
-  their seed content, the same as a brand-new filesystem gets.
-- Saves the result to disk immediately — there's no separate `sync`
-  step required afterwards.
-- Leaves any mounted external drives (nodes `OS_NODES..MAX_NODES-1`)
-  completely untouched; `sys reset` only ever wipes the boot/OS volume.
-
-This is destructive and cannot be undone — there's no `-force`-style
-confirmation beyond the `auth` gate itself, same as `sdown`/`rboot`/`del`.
-
-### Flags: `-force`, `-silent`, `-info`, `-test`
-
-`mkfl` supports four flags (passed as extra arguments after the content):
-
-| Flag | Effect |
-|---|---|
-| `-force` | Overwrite an existing file (prints a warning) |
-| `-silent` | Suppress the `-force` overwrite warning |
-| `-info` | Print verbose info: filename and content length |
-| `-test` | Dry run: report what would happen, make no changes |
-
-```
-rush>/home: mkfl hi.txt "first" ; show hi
-rush>/home: mkfl hi.txt "second"
-error: that name already exists here
-rush>/home: mkfl hi.txt "second" -force
-mkfl: overwriting existing file hi.txt
-rush>/home: mkfl hi.txt "third" -force -silent
-rush>/home: mkfl hi.txt "fourth" -info
-mkfl: creating 'hi.txt' (6 bytes)
-```
-
-`-test` works with or without content, and reports the same outcome a real
-run would have without ever touching the filesystem:
-
-```
-rush>/home: mkfl newfile.txt -test
-mkfl: [test] would create 'newfile.txt' (0 bytes) - test mode, no changes made
-rush>/home: mkfl hi.txt -test
-mkfl: [test] 'hi.txt' already exists - would fail (use -force to overwrite)
-rush>/home: mkfl hi.txt "changed" -force -test
-mkfl: [test] would overwrite 'hi.txt' (7 bytes) - test mode, no changes made
-```
-
-### Overwriting files with `owrite`
-
-`mkfl` makes a new file (or overwrites one with `-force`); `owrite` is the
-simpler counterpart for when the file is already there and you just want to
-replace its content:
-
-```
-rush>/home: mkfl hi.txt "Hello"
-rush>/home: owrite hi.txt "Hello, there."
-rush>/home: view hi.txt
-Hello, there.
-```
-
-Unlike `mkfl -force`, `owrite` requires the file to already exist (it errors
-with `owrite: no such file: <path>` otherwise) and never creates one.
-
-### Party: the built-in scripting language
-
-`party <file.pa>` runs a program in **Party**, a small scripting language
-with its own variables, expression evaluator, and control flow. The full
-spec is in `PARTY_SPEC.md`. As of 0.1.11 the interpreter adds `%`, `&&`/
-`||`, multi-name `vars`, and user input to the v0.1 feature set; 0.1.13
-expands it further with `rush` (shelling out to a Rush command line from
-inside a script), `"{identifier}"` string interpolation, an in-language
-file API (`fopen`/`fread`/`fwrite`/`fclose`/`fexists`/`fdelete`), and
-fixed-size arrays (`arr_new`/`arr_len`/`arr_get`/`arr_set`/`arr_free`).
-0.1.17 adds multi-file scripts: a `module "path.pa"` line splices
-another file's source in before lexing, and `party get <modulename>`
-fetches a module from a small module server over HTTPS and saves it
-locally. See "Party language expansion (0.1.13)" and "Party modules &
-`party get` (0.1.17)" below for details.
-
-```
-vars a = "hi"
-vars n = 5
-
-func double(x) {
-    return x * 2
-}
-
-if (a == "hi") {
-    display "Hello world"
-    display double(n)
-}
-```
-
-What's in there:
-
-- **Types:** `int`, `float`, `bool`, `string` (quoted text; a bare word is
-  always a variable reference, never a string).
-- **Variables:** declare with `vars a = value`, or list several at once —
-  `vars x, y = 7, z` declares `x` and `z` (each int `0`) and `y` (as `7`);
-  reassign with `name = value`; using an undeclared variable is an error.
-- **Operators:** `()`, `* / %` (`%` is int-only), `+ -`, comparisons
-  `< <= > >=`, equality `== !=`, logical `&&` / `||` (any-type truthy
-  coercion; eager — no short-circuit), and statement-level `=`.
-- **Control flow:** `if` / `else if` / `else` and `while`, with mandatory
-  `{ }` braces on every block.
-- **Functions:** `func name(a, b) { return ... }` — fixed arity, recursion
-  allowed (depth-limited call stack), callable before their `func` block
-  appears. No mandatory `main()`: top-level statements run top-to-bottom.
-- **Output:** `display <expr>` prints the value followed by a newline.
-- **Input:** `read <var>` reads one keyboard line into a declared variable
-  as a string (Esc aborts the script); the read string shares a single
-  buffer, so a later `read` overwrites an earlier one.
-- **Shelling out:** `rush <expr>` (`<expr>` must be a string) runs one
-  Rush command line — including `;`-chains and quoted args — from inside
-  a script, e.g. `rush "mkf docs ; cf docs"`.
-- **String interpolation:** `"hello {name}"` splices an already-declared
-  variable's string form into a literal; `{{`/`}}` escape a literal
-  brace. `{<expr>}` and `{fn(...)}` aren't supported yet — identifiers
-  only.
-- **File access:** `fopen(path, "r"|"w"|"a")`, `fread(h)` (whole-file),
-  `fwrite(h, text)`, `fclose(h)`, `fexists(path)`, `fdelete(path)` give a
-  script real file I/O without shelling out to `rush`.
-- **Arrays:** `arr_new(n)` makes a fixed-size array (up to
-  `PARTY_ARR_CAP` elements, up to `PARTY_ARR_MAX` concurrently-alive
-  arrays), `arr_get`/`arr_set` index it, `arr_len` reports its size,
-  `arr_free` releases the slot. Elements are ordinary Party values,
-  including nested arrays; `display` prints an array as `[e0, e1, ...]`.
-- **Modules:** a `module "path.pa"` line splices that file's whole
-  source in at that point, before lexing — a textual include, same
-  idea as C's `#include`. `party get <modulename> [outfile.pa]` fetches
-  a module from a small module server over HTTPS and stages it on
-  disk, ready to `module`-in. See "Party modules & `party get`
-  (0.1.17)" below.
-- **Not in v0.1.14:** no `[...]`/`a[i]` bracket syntax for arrays (use
-  the `arr_*` builtins above), no growable arrays, no `{<expr>}` string
-  interpolation, no string concatenation with `+`, no server-side
-  networking (see `PARTY_SPEC.md`).
-
-`party foo.pa -tokens` dumps the raw token stream instead of executing, and
-**Esc** interrupts a running script.
-
-#### Compiling: `party compile`
-
-`party compile <file.pa>` compiles a Party script straight to a
-ShellyForever `RUN 0.1` executable (`<file>.run`, written alongside the
-source) instead of interpreting it. The full v0.1 language compiles —
-not a subset — so any script that runs under `party foo.pa` compiles
-under `party compile foo.pa` too.
-
-```
-rush>/home: party compile foo.pa
-rush>/home: run foo.run
-```
-
-The resulting `.run` file uses the same three-line header and kernel
-API table (print/input/kill-check) as any other compiled program — see
-"Compiled programs: `run`" below — so it's a normal `prs`-visible,
-`prs kill`-able process, and a bare `foo.run` at the prompt runs it
-too, exactly like a hand-assembled `.run` file.
-
-#### Party language expansion (0.1.13)
-
-Four features landed this release, all interpreter-level (no changes
-needed to `party compile` — anything the interpreter can do, a compiled
-`.run` script can do too):
-
-- **`rush <expr>`** — shells out to one Rush command line from inside a
-  script (`<expr>` must evaluate to a string). `;`-chains and quoted
-  args work the same as typing the line at the prompt:
-  ```
-  rush "mkf backups ; cpy notes.txt backups"
-  ```
-  There's no output capture yet — a rushed command prints straight to
-  the screen, with no way to pull that text back into a Party variable.
-- **String interpolation** — `"hello {name}"` splices the string form of
-  an already-declared variable into a literal; `{{` / `}}` escape a
-  literal brace. Only bare `{identifier}` is supported — no `{<expr>}`
-  or `{fn(...)}` yet, and using an undeclared name, an empty `{}`, or an
-  unterminated `{` is a runtime error rather than a silent blank.
-- **File access** — `fopen`/`fread`/`fwrite`/`fclose`/`fexists`/
-  `fdelete` give a script real file I/O without shelling out to `rush`:
-  ```
-  vars h = fopen("notes.txt", "w")
-  fwrite(h, "hello from party")
-  fclose(h)
-  display fread(fopen("notes.txt", "r"))
-  ```
-- **Arrays** — `arr_new(n)` allocates a fixed-size array; `arr_get`/
-  `arr_set`/`arr_len`/`arr_free` round it out. Arrays are handle-based
-  (like file handles), not deep-copied, and up to 4 can be alive at
-  once, each up to 16 elements — deliberately small, since the same
-  table is duplicated per background-process context by `run -back`.
-  ```
-  vars a = arr_new(3)
-  arr_set(a, 0, "hi")
-  display a          $ [hi, 0, 0]
-  ```
-
-See `PARTY_SPEC.md` sections 8-11 for the full grammar, and the
-"Not in v0.1.14" list above for what's still deferred (bracket-syntax
-array indexing, growable arrays, `{<expr>}` interpolation, string
-concatenation, and server-side networking).
-
-#### Party modules & `party get` (0.1.17)
-
-Multi-file scripts, in two parts: a preprocessor directive for
-splicing files together locally, and a command for fetching a file
-worth splicing in the first place.
-
-- **`module "path.pa"`** — a line of exactly this form textually
-  splices that file's whole text in at that point, before lexing,
-  the same idea as C's `#include` or Python's `exec` of another
-  file's source. A module is typically just function definitions
-  meant to be called from the including script, but top-level
-  statements in it run too, in place, in file order. Runs before
-  `party_lex`, so it's invisible to the rest of the interpreter — one
-  token array over one flattened source buffer, exactly like a
-  single-file script — and both `party foo.pa` and
-  `party compile foo.pa` pick it up automatically.
-  ```
-  $ mathlib.pa
-  func square(x) {
-      return x * x
-  }
-
-  $ main.pa
-  module "mathlib.pa"
-  display square(6)     $ 36
-  ```
-  Included paths resolve relative to `cur_dir`, same as the
-  top-level script. Each resolved path is only ever expanded once per
-  run (repeating a `module` line, or two files that both include a
-  third, doesn't duplicate it), and modules may include modules up to
-  3 levels deep — a module that includes itself, directly or
-  indirectly, fails with a clean error instead of hanging.
-- **`party get <modulename> [outfile.pa]`** — fetches
-  `<modulename>.pa` over HTTPS from a small module server and saves
-  it as `<modulename>.pa` in the current folder (or as `outfile.pa`
-  if given), ready for a `module "..."` line or a direct
-  `party <modulename>.pa` run:
-  ```
-  rush>/home: party get stringutils
-  party get: fetching stringutils
-  party get: saved to stringutils.pa
-    add: module "stringutils.pa" to a script to use it
-  rush>/home: edit main.pa
-  ```
-  `party get foo` and `party get foo.pa` name the same module — a
-  redundant trailing `.pa` is stripped before the request goes out —
-  and a bare module name can't contain `/`. It reuses `stake`'s HTTPS
-  machinery (URL parsing, DNS, the TLS exchange), so it shares that
-  command's trust model: **the server's certificate isn't
-  validated**, the same as `curl -k`. It doesn't run or lex what it
-  fetches; the file is just staged on disk like any hand-written one.
-
-### Compiled programs: `run` and the `.run` format
-
-`run <file.run>` loads and executes a compiled ShellyForever **RUN 0.1**
-binary — machine code, not a script. Typing a bare `name.run` at the
-prompt does the same thing, so a `.run` file can double as its own
-command.
-
-A `.run` file starts with a plain-text three-line header, and the
-executable code follows immediately after it:
-
-```
-[ShellyForever]
-[run 0.1]
-program = v1
-<raw x86-64 machine code from here to end of file>
-```
-
-`run` reads the whole file into memory, checks the three header lines
-line-by-line, and — if they match — jumps straight into the code that
-follows. Before jumping in, it:
-
-- **Allocates a process slot**, so the running program shows up in `prs`
-  (as `run`) and can be stopped with `prs kill <pid>` / `prs kill run`,
-  the same as an `rr` script.
-- **Builds a small kernel API table** (function pointers for
-  `print_string`, `print_string_attr`, `get_char`, a newline-string
-  pointer, and a kill-check poll routine) and passes its address in
-  `rdi`, so the compiled program can print, read input, and cooperate
-  with Esc/`prs kill` without linking against the kernel directly.
-
-An unrecognized or missing header prints `run: error: invalid or missing
-RUN 0.1 header` rather than jumping into arbitrary bytes; a missing file
-or missing argument fail the same way `rr`/`party` do.
-
-### Package manager: `mksin`, `install`, and `sin get`
-
-A `.sin` file ("Shelly Installer") is how programs are packaged and
-distributed. It's a stored-mode `.zip` (exactly the format `pack`
-produces) containing two things:
-
-- **`whattodo.inst`** — a tiny instruction script that says what
-  installing should do: declare the package's `name`/`version`, `mkdir`
-  folders, `copy` files from the package's `files/` folder onto the
-  filesystem, and `program <id>` to register a launchable program id.
-  The `.inst` parser accepts LF, CR, and CRLF line endings, so a
-  package edited with Windows-style line endings installs the same as
-  one written on a Unix box.
-- **`files/`** — the actual files `whattodo.inst` copies out.
-
-Four commands cover the lifecycle:
-
-- **`mksin <folder>`** — build `<folder>.sin` from a folder you've
-  already laid out as a package (`whattodo.inst` + `files/`). It
-  validates the folder shape and the `whattodo.inst` script first —
-  unknown instructions, missing arguments, non-absolute destination
-  paths, and `copy` sources missing from `files/` are all reported
-  (with a line number) before anything is written:
-  ```
-  rush>/home: mksin matrix
-  pack: packed 2 file(s) into matrix.zip
-  mksin: built matrix.sin
-  ```
-- **`install <file.sin>`** — validate the package and run its
-  instructions: create the folders it asks for, copy its `files/`
-  entries out, and register the `program <id>` in
-  `/home/sys/programs.sly` so the program can be launched later just by
-  typing that id. Unknown instructions, a missing/invalid package, or a
-  truncated archive are rejected with an error and the install stops
-  (steps already applied aren't rolled back). Esc cancels an install in
-  progress:
-  ```
-  rush>/home: install matrix.sin
-  install: installing matrix.sin
-  install: package: Matrix Rain
-  install: installed matrix.sin
-  rush>/home: matrix
-  run /home/programs/matrix/matrix.run (pid 1)
-  ```
-- **`uninstall <id>`** — remove a program by the id it was registered
-  under: deletes its registered executable and its
-  `/home/sys/programs.sly` entry. Other files the package may have
-  copied are left in place.
-- **`sin get <programname> [-keep]`** — fetch and install in one step:
-  downloads `<programname>.sin` over HTTPS (TLS 1.3, the same
-  no-certificate-validation trust model as `stake`/`sgive`) from the
-  shellybin package repo and hands it straight to `install`. On success
-  the downloaded package is deleted once install finishes; pass `-keep`
-  to leave it in the current folder. The name may only contain letters,
-  digits, `-`, and `_` (no `/`, `..`, or whitespace), and a non-200
-  response (e.g. a typo'd name) is reported without saving or installing
-  anything:
-  ```
-  rush>/home: sin get calculator
-  sin: fetching calculator
-  sin: removed downloaded package
-  ```
-
-### The RTC clock: `date`, `time`, and `wig time`
-
-The kernel reads the MC146818 RTC/CMOS clock chip (ports `0x70`/`0x71`,
-waiting out the update-in-progress flag, decoding BCD, and normalizing 12-hour
-to 24-hour) to back three commands:
-
-- **`date`** — prints the current date as `YYYY-MM-DD`.
-- **`time`** — prints the current time as `HH:MM:SS` (24-hour).
-- **`wig time`** — the "widget" command: draws a live clock in the top-right
-  corner of the screen that updates every second, until you press **Esc**.
-  It writes straight to VGA memory, so your prompt and cursor aren't disturbed
-  while it runs.
-
-Both `date` and `time` are normal commands, so their output flows through the
-`~` pipe just like anything else — `date ~ write today.txt` saves the date
-into a file.
-
-### Writing piped output to a file: `write`
-
-`write <path> <content>` creates a file with that content, or overwrites an
-existing file's content in place. It's designed to be the target of a `~`
-pipe, which appends the captured output as the content argument:
-
-```
-rush>/home: show hi ~ write file.txt
-rush>/home: view file.txt
-hi
-rush>/home: date ~ write today.txt ; view today.txt
-2038-08-03
-rush>/home: calc 2 + 2 ~ write sum.txt ; view sum.txt
-4
-```
-
-It also works standalone (`write notes.txt "some text"`). It refuses if a
-*folder* already has the name (use `del`/`rname` to resolve), but happily
-overwrites an existing file — like a shell `>` redirect.
-
-### Searching: `find` and `lookfor`
-
-`find <name>` looks for a file or folder by exact name across every drive —
-the boot volume and any mounted ones — and prints the full path of every
-match:
-
-```
-rush>/home: mkf docs ; mkfl docs/notes.txt "todo: buy milk"
-rush>/home: find notes.txt
-/home/docs/notes.txt
-rush>/home: find nope.txt
-find: no matches
-```
-
-`lookfor <text> <file> [limit <n>]` is a small grep: it searches a file's
-content one line at a time (a "line" is whatever's between newline bytes in
-that file's content) and prints every matching line, up to `limit` matches
-(50 by default):
-
-```
-rush>/home: lookfor "todo" docs/notes.txt
-todo: buy milk
-rush>/home: lookfor "todo" docs/notes.txt limit 5
-todo: buy milk
-```
-
-Add `line <a>, <b>` (1-indexed, inclusive) to restrict the search to just
-that range of lines:
-
-```
-rush>/home: lookfor "todo" line 100, 200 docs/notes.txt limit 50
-```
-
-Both the search text and file path accept the usual path syntax (`docs/x`,
-`../x`, `/home/x`), and the search text can be quoted if it has spaces.
-
-Prompt looks exactly like you asked:
-
-```
-rush>/home: mkfl something.txt "some text"
-rush>/home: view something.txt
-some text
-rush>/home: mkf docs
-rush>/home: cf docs
-rush>/home/docs: show "hello world"
-hello world
-rush>/home/docs: cf ..
-rush>/home:
-```
-
-## Building it yourself
-
-```bash
-sudo apt install nasm
-./build.sh
-```
-
-This produces `shellyforever.img`, a raw bootable disk image.
-
-## Running it
-
-**QEMU (easiest, works anywhere):**
-```bash
-qemu-system-x86_64 -drive format=raw,file=shellyforever.img
-```
-
-**Real 64-bit hardware (legacy/BIOS boot only, not UEFI):**
-```bash
-sudo dd if=shellyforever.img of=/dev/sdX bs=4M status=progress
-```
-Replace `/dev/sdX` with your USB drive (**not** a partition, not your hard
-disk — double check with `lsblk` first). Boot from it via your BIOS boot
-menu with legacy/CSM mode enabled.
-
-**VirtualBox/VMware:** create a new VM, "Other/Unknown 64-bit" OS, attach
-`shellyforever.img` as a raw/IDE disk, boot.
-
-## Disk persistence
-
-The filesystem survives reboots. There's a hand-written ATA PIO driver
-(primary/secondary buses, both master/slave, LBA28, polling BSY/DRQ — no
-IRQs, matching the polled keyboard driver's style) that reads and writes raw
-sectors, plus a hand-written AHCI driver (PCI class-code scan for the
-controller, MMIO register access, up to `AHCI_MAX_PORTS` (4) ports polled to
-completion per command, no interrupts here either) for real SATA controllers
-that don't expose legacy IDE at all. `dscan`/`fmt`/`mount`/`sync` treat both
-transports as one unified list of device slots — ids `0..3` are the legacy
-ATA slots, ids `4..4+AHCI_MAX_PORTS-1` are AHCI ports discovered at boot.
-
-The boot volume itself isn't pinned to device 0 anymore, either: on boot,
-the kernel tries device 0 (legacy ATA) first, and if nothing answers there —
-the normal case on a real, SATA-only board with no PATA/IDE controller — it
-falls back to whichever AHCI port slot actually has a disk, remembering
-which device the OS volume lives on for `sync`/`rboot`/`sdown` to write back
-to. Without this, a real machine whose only disk is SATA would report "No
-disk detected" forever even though `dscan` could see the drive just fine.
-
-### SFFS v4 on-disk format
-
-Each disk volume is self-contained and starts at sector (LBA) 500 — well
-clear of the boot sector and the kernel's own sectors (the filesystem
-region has moved up twice as the kernel grew, most recently from LBA 400
-to make room for the browser):
-
-- **Superblock** (1 sector): `SFFS` magic, version byte, then a 32-byte
-  label.
-- **Type / parent / next / name / content** sectors: one node table per
-  volume (`node_type`, `node_parent`, `node_next`, 16 name sectors, 80
-  content sectors — 256 nodes per volume as of v4, up from 64), scoped
-  per volume with *relative* parent indices (`0xFFFF` = volume root), so
-  the same layout works on any drive. `CONTENT_LBA` is computed from
-  `NAME_LBA + NAME_SECTORS` rather than hardcoded, so the two regions
-  can't collide if the node count changes again later. A volume now
-  needs ~100 sectors past `FS_LBA_START` (was ~28 under the old 64-node
-  layout).
-- **Older v2 volumes** (no `node_next` sector; content starts one sector
-  earlier, 64 nodes) and **v3 volumes** (has `node_next`, but still the
-  old 64-node-sized name/content regions) both still load and read fine
-  — a `sync` upgrades either one to v4 in place, first clearing nodes
-  64..255 of that volume's slice so the bigger table is already in use
-  the moment you next `mkfl`/`mkf`/`edit`.
-
-v4 exists because the old 64-node table was shared by folders, files,
-*and* every chain-continuation node a file needed once its content
-passed ~159 bytes — so a handful of ordinary-sized files could exhaust
-the table well before the disk itself was anywhere near full ("error:
-filesystem is full" with plenty of free sectors left). Widening
-`VOL_NODES` to 256 keeps the exact same chain-of-nodes design (nothing
-that walks `node_next` had to change) and buys a lot more headroom
-before that happens.
-
-### Multi-block files (SFFS v4)
-
-A file's content used to be capped at a single node's ~160-byte slot. Now a
-file whose content is longer than that is stored as a chain: its own node
-holds the first ~159 bytes, and `node_next` points at a continuation node
-(a new node type, invisible to path lookup, `list`, and the allocator) that
-holds the next ~159 bytes, and so on until `node_next` is `0xFFFF`. Deleting
-a file frees every node in its chain.
-
-This raises the practical cap on a single file's size from ~160 bytes to
-40 KB under SFFS v4's 256-node table (a lone big file can use the volume's
-entire node table if nothing else needs a node) — plenty for text, notes,
-and config files. `view`, `show`, `lookfor`, `find`, `edit`, `owrite`, and
-`del` all work transparently across chained files; nothing about how you
-use those commands changes.
-
-```
-rush>/home: mkfl big.txt "..." ; view big.txt
-```
-behaves exactly the same whether `big.txt` fits in one node or spans a
-dozen — the chaining is invisible from the shell.
-
-### System configuration: `sysconfig.sly`
-
-Every fresh filesystem gets a `/sys` folder (the same one aliases already
-lived in) seeded with two files:
-
-- **`alias.sly`** — the serialized alias table (unchanged from earlier
-  versions; see `ali`/`alis` above).
-- **`sysconfig.sly`** — a plain `key = value` settings file, seeded with:
-
-  ```
-  mouse = off
-  internet = on
-  auto_sync = on
-  ```
-
-Like everything else in the filesystem, `/sys/sysconfig.sly` is just a
-regular (chained) file: `view /sys/sysconfig.sly` reads it, `edit` or
-`owrite` change it, and it survives `sync`/`rboot`/`sdown` and reloads
-on the next boot exactly like your `/home` documents do — no separate
-save path to remember. `ensure_sys_folder` only *creates* the default
-copy once, on a brand-new (or freshly `fmt`'d) filesystem; loading an
-existing one restores whatever `/sys` already had on disk, seeded or
-hand-edited.
-
-Note: unlike `alias.sly` (which `aliases_load` actively re-parses at
-boot to rebuild the alias table), `sysconfig.sly` isn't read back to
-*apply* its settings yet — `mouse`, `net on`/`net off`, and `sync`'s
-auto-sync toggle are still separate live commands. Right now the file
-gives you one persistent place to keep track of your preferred
-settings; wiring it up to actually configure the corresponding toggles
-at boot is a natural next step (see below).
-
-### One boot drive, up to two mounted drives
-
-- The boot drive's volume is the OS filesystem (rooted at `/home`).
-- `dscan` probes all legacy ATA slots (primary/secondary × master/slave) and
-  every AHCI port found on the controller, and reports which contain SFFS
-  volumes.
-- `fmt <label>` formats the first *unformatted* drive present (the boot
-  drive is skipped unless you pass `-force`).
-- `mount <label>` finds the drive whose label matches, loads it into memory
-  under `/<label>/` next to `/home`, and you can `cf /<label>` into it like
-  any folder.
-- `unmount <label>` detaches a mounted volume: the mount slot is dropped
-  (so `sync` stops writing that drive) and `/<label>/` disappears from the
-  filesystem, but the drive's data is left untouched — `dscan` + `mount`
-  re-attach it later. It refuses while your current directory is inside the
-  volume.
-- `label <old> <new>` renames a drive's label in place by rewriting just its
-  superblock — the drive's files are left untouched. Refuses if `<new>` is
-  already used by another drive. If that drive happens to be mounted at the
-  time, the live mount name updates immediately too.
-- `sync`, `rboot`, and `sdown` write the boot volume *and* every mounted
-  volume back to their own drives.
-
-On boot, the kernel loads the boot volume's region; if the magic/version
-don't check out (blank disk, or an older on-disk format) it falls back to
-`fs_init` and starts fresh. Because `shellyforever.img` is a real disk
-image, this persists not just across `reboot`/`sdown` inside one QEMU
-session, but across separate QEMU invocations (and real hardware) as long as
-you keep using the same image file. The old single-blob-at-LBA-100 format
-was tested end-to-end in QEMU; the SFFS v2 multi-volume format has been
-assembled but not yet boot-tested.
-
-## Networking
-
-The kernel brings up whichever NIC it finds at boot — a hand-written driver
-for each of three chips, tried in this order:
-
-1. **RTL8139** — the classic QEMU default NIC (`-nic model=rtl8139` /
-   the emulator's default), a simple ring-buffer RX/TX design.
-2. **Intel e1000** — QEMU's `-nic model=e1000`, and a common real/virtual
-   gigabit chip, using descriptor rings.
-3. **Realtek RTL8168/8169/8161** ("PCIe GBE Family Controller") — the
-   gigabit Realtek chip found on most real desktop motherboards. Also
-   descriptor-ring based, but reached over port I/O like the RTL8139
-   driver rather than MMIO like the e1000 driver.
-
-If none of the three is present, every networking command reports there's
-no NIC and the rest of the OS behaves exactly as it always did — networking
-is entirely additive.
-
-All three drivers, including the RTL8168 path most real desktop boards will
-actually use, are now verified working end-to-end on real hardware (`dhcp`,
-`netinfo`, and `tcp` all confirmed), not just QEMU. Getting there took a few
-real-hardware-only fixes that QEMU's virtual devices never exercise: the
-e1000 backend's MMIO registers needed the same uncached identity-map
-treatment the AHCI driver already had (a cacheable mapping could read back
-a stale value instead of what the device just wrote), and the RTL8168 PHY
-needed an explicit power-up/renegotiate poke — without it, a PHY left
-powered-down by firmware meant the link never came up even though the MAC
-reset succeeded and the driver reported the NIC as present. See
-`milestones.txt` for the full writeup.
-
-On top of whichever driver is active: Ethernet II framing, ARP (with a
-small resolve cache), IPv4 with checksums, ICMP echo (ping), UDP, a DNS client,
-a DHCP client, and a minimal polled **TCP** engine. IP/mask/gateway/DNS default
-to QEMU's `slirp` user-networking
-values (`10.0.2.15` / `255.255.255.0` / gw `10.0.2.2` / dns `10.0.2.3`), and can be
-configured automatically via **`dhcp`** (recommended for real hardware) or manually with `net`.
-
-| Command | Example | Behavior |
-|---|---|---|
-| `netinfo` | `netinfo` | print the NIC's MAC address and current IP/mask/gateway/DNS |
-| `net` | `net ip 10.0.2.20`, `net gw 10.0.2.2`, `net dns 8.8.8.8` | change the static IP, gateway, or DNS server |
-| `dhcp` | `dhcp` | request IP address, subnet mask, gateway, and DNS server via DHCP |
-| `dns` | `dns google.com` | resolve a hostname to an IPv4 address via the configured DNS server |
-| `bounce` | `bounce 10.0.2.2` | send a single ICMP echo request; prints the reply or times out (~2-3s) |
-| `monitor` | `monitor google.com` | ping repeatedly, one line per reply, until you press **Esc** |
-| `tcp` | `tcp 10.0.2.2 8000` | open a TCP connection to a host/port, optionally send a payload, print the reply |
-
-```
-rush>/home: netinfo
-MAC : 52:54:00:12:34:56
-IP  : 10.0.2.15
-MASK: 255.255.255.0
-GW  : 10.0.2.2
-DNS : 10.0.2.3
-rush>/home: dns google.com
-google.com = 142.250.premium.address
-rush>/home: bounce 10.0.2.2
-reply from 10.0.2.2, 32 bytes
-rush>/home: monitor google.com
-reply from 172.217.x.x, 32 bytes
-reply from 172.217.x.x, 32 bytes
-^[
-rush>/home:
-```
-
-Everything is polled (no interrupts), matching the keyboard and disk
-drivers — `bounce`/`monitor`/`dns`/`tcp` block the shell while they wait, and
-`monitor` and `tcp` check for **Esc** on every poll so they can be interrupted
-like `wig time` or a running `rr` script.
-
-### TCP: the `tcp` command
-
-`tcp <host> <port> [payload]` runs a minimal client TCP exchange: it resolves
-the host (raw IPv4 address directly, or a hostname via the configured DNS
-server), does a 3-way handshake (SYN → SYN-ACK → ACK) with sequence/ack
-tracking, sends the payload if one was given, advertises a small receive
-window, and accumulates the peer's reply until the connection closes (FIN),
-printing what came back. It reads up to 1024 bytes of response. It is
-Esc-cancelable while it waits.
-
-```
-rush>/home: tcp 10.0.2.2 8000
-tcp: connecting to 10.0.2.2:8000
-tcp: connected.
-tcp: sent 0 bytes.
-tcp: received 870 bytes.
-HTTP/1.0 200 OK
-Content-type: text/html; charset=utf-8
-...
-rush>/home:
-```
-
-Because it reads until FIN (no content-length handling yet), the peer should
-close the connection when it's done — plain HTTP/1.0 servers like Python's
-`http.server` do. Retransmission is polled with a 1s RTC tick and is bounded;
-a full RTO with exponential backoff is still future work.
-
-**Testing in QEMU:** add a NIC to your invocation, e.g.
-```bash
-qemu-system-x86_64 -drive format=raw,file=shellyforever.img \
-  -netdev user,id=n0 -device rtl8139,netdev=n0
-```
-(swap `rtl8139` for `e1000` or a modern Realtek gigabit model to exercise
-the other two drivers). `slirp` user networking answers ARP/ICMP/DNS itself
-and doesn't require any host firewall changes. To test `tcp` end-to-end, run
-`python -m http.server 8000 --bind 127.0.0.1` on the host — `slirp`'s gateway
-(10.0.2.2) is the host's loopback, so `tcp 10.0.2.2 8000` reaches it.
-
-**Not yet implemented:** there's no HTTP `take`/`give` (get/put) yet — the
-`tcp` command is a raw byte exchange. Turning it into
-`take http://host/path <file>` and `give http://host/upload <file>` (HTTP/1.0
-GET/POST with content-length) is planned next; see `milestones.txt`.
-
-### HTTP take / give
-
-`take <url> <file>` downloads a file over HTTP/1.0 and saves the response
-body to the given local file (creating or overwriting it in the current
-directory). `give <url> <file>` reads a local file and POSTs its content
-to the URL with `Content-Type: text/plain` and a `Content-Length` header,
-then prints the server's reply. Both commands resolve the hostname from
-the URL via DNS, do a full TCP handshake + send + receive + close, and are
-Esc-cancelable while they wait.
-
-```
-rush>/home: take http://10.0.2.2:8000/notes.txt notes.txt
-take: getting /notes.txt from 10.0.2.2
-take: saved to notes.txt
-rush>/home: give http://10.0.2.2:8000/upload notes.txt
-give: posting /upload to 10.0.2.2
-HTTP/1.0 200 OK
-...
-rush>/home:
-```
-
-To test against Python's `http.server` (which serves GET only):
-
-```bash
-# host:
-python -m http.server 8000 --bind 127.0.0.1
-
-# ShellyForever (QEMU):
-take http://10.0.2.2:8000/somefile.txt somefile.txt
-view somefile.txt
-```
-
-Files larger than ~160 bytes are fine — the SFFS v4 chained-file system
-stores them across multiple filesystem nodes.
-
-Only plain HTTP is supported (no HTTPS). The response body is extracted
-by scanning for the blank line (`\r\n\r\n`) after the HTTP response headers,
-so it works with most HTTP/1.0 and HTTP/1.1 servers.
-
-### The browser: `browse`
-
-`browse <url>` opens a Lynx-style text web browser. It fetches the page
-over HTTP (the Milestone D http/tcp stack), strips the HTML to readable
-text, and collects every `<a href>` link, rendered as `[N]` markers inline.
-Keys while viewing a page:
-
-- **a digit** (`1`-`9`, also the keypad) — follow link `[N]`
-- **Enter** — follow the selected/first link
-- **`b`** — back (session history, up to `BROWSE_HIST_MAX` pages)
-- **`f`** — forward
-- **`a`** — add the current page to session bookmarks
-- **`l`** — list bookmarks (a number follows one)
-- **`t`** — save the current page's raw body to a file (take-style)
-- **`q`** — quit back to the shell
-
-```
-rush>/home: browse http://10.0.2.2:8000/
-  ShellyForever Browser    URL:
-Welcome
-
-Welcome to the ShellyForever test site.
-
-[1]About
-
-[b]ack [f]wd [a]dd-bm [l]ist-bm [t]save [q]uit
-```
-
-The keypad digits and keypad Enter work too, so the whole browser is
-usable from the number pad. Page text is capped at `BROWSE_PAGE_MAX`
-(~1.5 KB, the `tcp_rx_buf`); up to `BROWSE_LINKS_MAX` (64) links per
-page and 16 history/bookmark entries.
-
-To test locally:
-
-```bash
-# host:
-python -m http.server 8000 --bind 127.0.0.1
-
-# ShellyForever (QEMU):
-browse http://10.0.2.2:8000/
-```
-
-## Shutdown (`sdown`)
-
-There's no ACPI table parsing in this kernel, so `sdown` doesn't negotiate a
-real ACPI shutdown. Instead it saves the filesystem, then pokes the legacy
-"magic port" shutdown hooks that QEMU, Bochs, and VirtualBox each recognize
-(ports `0x604`, `0xB004`, and `0x4004` respectively). If none of those match
-whatever you're running it on (including real hardware), the CPU just halts
-safely instead of doing anything unsafe — you'd see the "Shutting down..."
-message and then nothing, which is your cue to power off manually.
-
-## Known limitations / what "from scratch" currently means
-
-- No interrupts/IDT — keyboard and disk I/O are both polled, which is simple
-  and reliable for a single-tasking shell but would need to change for
-  multitasking or overlapping disk I/O.
-- No memory manager beyond a flat identity-mapped first 2MB — fine for a
-  kernel this size, would need a real allocator to grow much further.
-- No ACPI — `sdown` relies on emulator-specific legacy ports rather than a
-  negotiated ACPI shutdown (see above).
-- 256 nodes per volume (SFFS v4), with the in-memory node table sized for
-  the boot volume plus up to `MAX_MOUNTS` (2) mounted volumes — 768 nodes
-  total in memory. File/folder names capped at 32 bytes, a single node
-  still holds ~160 bytes but files now chain across nodes (see
-  "Multi-block files" above) up to 40 KB, line input capped at ~220
-  chars — easy to bump, just constants at the top of `kernel.asm` (the
-  on-disk format size adjusts automatically since it's computed from
-  those same constants).
-  Worth knowing: `mkfl`/`rname`/`cpy`/`mov` don't currently check that a
-  destination name is short enough to fit in that 32-byte slot before
-  copying it in.
-- `cf`/`mkf`/`rname` operate one directory at a time (no path arguments
-  like `../docs`), while `cpy`/`mov` accept full paths on both sides —
-  `cpy docs/notes.txt backup/` copies into an existing destination folder,
-  and `../x` works for either argument.
-- `~` piping captures a command's printed output into a fixed-size buffer
-  (192 bytes) and, for the generic (non-`= name`) case, rebuilds the right
-  side's command line by wrapping that captured text in double quotes before
-  re-parsing it — a captured value that itself contains a `"` will break
-  that reconstruction, and very long captured output (e.g. piping `list` on
-  a folder with many files) is silently truncated rather than growing the
-  buffer.
-- Persistence is whole-table snapshotting (like a save file), not an
-  incremental/journaled on-disk format — simple and robust for this scale,
-  but a `sync` rewrites the whole reserved region every time.
-- `kernel.bin` occupies LBA 1..486 — `KERNEL_SECTORS` in `boot.asm` has
-  already been bumped several times, from its original 199, to make room
-  for the filesystem chaining, networking, and browser code. If you add
-  enough new code to cross that budget again, bump `KERNEL_SECTORS` once
-  more — it's a one-line change, but the bootloader will silently load a
-  truncated kernel if you forget, which looks like an unrelated crash.
-  (The on-disk SFFS region now starts at LBA 500 — bumped from 400 — so
-  keep the kernel's reserved region clear of that.)
-
-## Natural next steps, in order of payoff
-
-1. **Browser polish** — the `browse` command already fetches pages and
-   follows links; session-only bookmarks could become persistent files,
-   and a larger page buffer (currently ~1.5 KB, capped by `tcp_rx_buf`)
-   would render longer pages.
-2. **Path arguments** for `cf`/`rname` (e.g. `cf docs/sub`,
-   `rname notes.txt docs/notes.txt`) — `cpy`/`mov` already accept full
-   paths on both sides; the remaining directory-local commands are the
-   gap.
-3. **Autosave on mutation** instead of requiring explicit `sync`/`rboot`/`sdown`,
-   if you'd rather not think about it (tradeoff: more disk writes).
-4. **A real memory allocator** once you want dynamic-sized files/folders
-   instead of fixed slot counts.
-5. **Password-based auth** instead of the current one-shot `auth` flag, so
-   elevated sessions can span multiple commands without re-authenticating.
-6. **Apply `sysconfig.sly` at boot** — the file persists (see "System
-   configuration" above) but isn't parsed back into the live `mouse`/
-   `net`/auto-sync toggles yet; boot could read it the way `aliases_load`
-   already re-parses `alias.sly`.
-
-## What's new
-
-- **Package manager & `sin get` (v0.1.18)** — programs can now be
-  packaged, shipped, and installed as `.sin` files. `mksin <folder>`
-  builds an installer package from a folder laid out as `whattodo.inst`
-  + `files/` (validating the script before writing anything);
-  `install <file.sin>` runs the package's instructions — creating
-  folders, copying files, and registering the program so typing its id
-  at the prompt launches it; `uninstall <id>` removes a registered
-  program. `sin get <programname> [-keep]` ties it together: it
-  downloads a package by name over HTTPS and installs it in one step,
-  deleting the downloaded file unless `-keep` is given. This release
-  also fixed the `.inst` parser rejecting CR/CRLF line endings, and two
-  filesystem/runtime bugs that silently corrupted copied binary `.run`
-  files (`cpy`) and let `run` execute stale memory on a truncated one.
-  See "Package manager: `mksin`, `install`, and `sin get`" above.
-- **Party modules & `party get` (v0.1.17)** — multi-file Party
-  scripts. A `module "path.pa"` line textually splices that file's
-  source in before lexing (function definitions meant to be shared
-  across files, with cycle protection and a nesting cap of 3), and
-  `party get <modulename> [outfile.pa]` fetches a module from a small
-  HTTPS module server and stages it on disk, ready to `module`-in.
-  `party get` reuses `stake`'s HTTPS machinery and trust model — no
-  certificate validation. See "Party modules & `party get` (0.1.17)"
-  above.
-- **HTTPS `stake` / `sgive` (v0.1.16)** — TLS 1.3 counterparts to
-  `take`/`give`. `stake <url> <file>` GETs over an encrypted connection
-  and saves the body locally; `sgive <url> <file>` reads a local file
-  and POSTs it to an `https://` URL. Both require the `https://` scheme
-  (default port 443) and reuse `take`/`give`'s URL parsing, DNS
-  resolution, and Esc-cancelable transfer path — only the wire
-  transport differs. **The server's certificate is not validated**:
-  the connection is encrypted but the peer's identity is unverified,
-  the same trust model as `curl -k`. A one-time warning is printed the
-  first time `stake` or `sgive` runs in a session.
-- **Party language expansion (v0.1.13)** — four interpreter-level
-  features: `rush <expr>` shells out to a Rush command line from inside
-  a script; `"{identifier}"` string interpolation splices a variable's
-  string form into a literal; an in-language file API (`fopen`/`fread`/
-  `fwrite`/`fclose`/`fexists`/`fdelete`) gives scripts real file I/O
-  without shelling out; and fixed-size arrays (`arr_new`/`arr_get`/
-  `arr_set`/`arr_len`/`arr_free`, up to 4 alive at once, 16 elements
-  each). All four compile through `party compile` for free, with no
-  compiler changes needed. See "Party language expansion (0.1.13)"
-  above.
-- **Fixed: background scripts eating keystrokes (v0.1.12)** — a
-  background process's `while` loop called `kbd_poll` on every
-  iteration unconditionally, which reads and discards whatever byte is
-  waiting at the keyboard controller. That meant a `run <file> -back`
-  script with a `while` loop would silently consume keystrokes you
-  typed at the live shell prompt, one dropped character per loop
-  iteration, alongside the process. `kbd_poll` inside the loop is now
-  skipped while `party_bg_active` is set, matching the guard the
-  top-level statement loop already had — background scripts no longer
-  touch the keyboard at all; only a foreground `party`/`run` script
-  still polls for Esc-to-kill there.
-- **In-line cursor movement — shell and `edit` (v0.1.10)** — the prompt's
-  line editor (`read_line`) and the file editor (`edit`) both now support
-  Left/Right/Home/End for moving the cursor within existing text, and
-  Delete for forward-deleting the character ahead of it. Typing or
-  Backspace at a mid-line/mid-file cursor position inserts or removes
-  right there and reflows what follows, instead of only ever appending at
-  the end. See "Line editing: history, tab completion, cursor movement,
-  and scrollback" above.
-- **`shelly` splash screen now shows the build version (v0.1.10)** — the
-  splash banner prints a `v0.1.10` line under the rainbow `ShellyForever
-  OS` title, above the developer credit and copyright line, so `shelly`
-  doubles as a quick way to check which build is running.
-- **`sys reset` — factory reset (v0.1.9)** — `auth sys reset` wipes the
-  OS volume back to an empty filesystem (keeping its label), clears all
-  variables and aliases, recreates the default `/sys` files, and saves
-  immediately. Mounted external drives are untouched. See "Factory
-  reset: `sys reset`" above.
-- **SFFS v4 — 256 nodes per volume (v0.1.9)** — `OS_NODES` raised from
-  64 to 256, raising the practical per-file cap from ~10 KB to 40 KB.
-  Older v2/v3 volumes still load fine and upgrade to v4 in place on the
-  next `sync`. See "SFFS v4 on-disk format" above.
-- **Party compiler (v0.1.9)** — `party compile <file.pa>` compiles a
-  Party script straight to a `.run` executable instead of only
-  interpreting it; the full v0.1 language compiles, not just a subset.
-  The interpreter itself now also implements the complete v0.1 spec
-  end-to-end. See "Party" above.
-- **Compiled `.run` executables (v0.1.8)** — `run <file.run>` (or typing a
-  bare `name.run`) loads a compiled ShellyForever `RUN 0.1` binary, checks
-  its three-line text header, allocates a process slot (visible in `prs`,
-  killable by `prs kill`), and jumps into the machine code that follows,
-  passing it a kernel API table (print/input/kill-check) in `rdi`. See
-  "Compiled programs: `run`" above.
-- **System configuration persistence (v0.1.8)** — a `/sys` folder is now
-  seeded with `sysconfig.sly` (`mouse`/`internet`/`auto_sync` settings)
-  alongside the existing `alias.sly`. It's a normal chained file, so it
-  survives `sync`/`rboot`/`sdown` like anything else in `/home`; it isn't
-  auto-applied at boot yet. See "System configuration: `sysconfig.sly`"
-  above.
-- **`browse <url>` — a text-based web browser (v0.1.7)** — fetches an HTTP
-  page, strips the HTML to readable text, and renders links as `[N]`
-  markers you can follow with a digit or keypad digit + Enter. Back/forward
-  history, session bookmarks (`[a]dd-bm` / `[l]ist-bm`), `[t]save` (writes
-  the raw page body to a file), and `[q]uit`. Keypad digits / keypad Enter
-  work throughout the browser. See "The browser: `browse`" above.
-- **HTTP `take` / `give` (v0.1.5)** — `take <url> <file>` does an HTTP/1.0
-  GET and saves the response body to a local file in the current directory;
-  `give <url> <file>` reads a local file and POSTs it to the URL. Both
-  commands parse `http://host[:port]/path` URLs, resolve the hostname via
-  DNS, perform a full TCP exchange (handshake + send + receive + FIN), and
-  are Esc-cancelable while they wait. `take` strips HTTP response headers
-  (scanning for the CRLF-CRLF blank line) and writes the plain body via
-  `fs_write_file`, so files of any size up to ~10 KB work transparently
-  across the SFFS v3 chained-file system.
-- **Real-hardware bring-up fixes (v0.1.4)** — three bugs that only show up
-  on real hardware (invisible to QEMU's virtual devices), found and fixed
-  after `tcp` reached a real RTL8168 board and initially failed:
-  - The boot filesystem was pinned to device 0 (legacy ATA); a SATA-only
-    board with no PATA/IDE controller always reported "No disk detected"
-    even though the AHCI driver had found the drive. `fs_load` now falls
-    back to the AHCI slots `ahci_init` found when device 0 doesn't answer.
-  - The e1000 driver's MMIO registers weren't marked uncached (AHCI's ABAR
-    already was) — could read back stale values on real silicon.
-  - The RTL8168 PHY power-up/renegotiate routine existed but was never
-    called, so a PHY left powered-down by firmware meant the link never
-    came up — silently, since `nic_present` still got set regardless.
-  `tcp` (and `dhcp`/`netinfo`) are now confirmed working end-to-end on real
-  hardware. See `milestones.txt` for the full writeup.
-- **`tcp` command (v0.1.4)** — a minimal polled TCP engine: handshake,
-  send, and read-until-FIN against any reachable host. Also fixed three
-  real bugs that surfaced while bringing it up (RTL8139 RX starvation
-  from uncleared ROK bits, never-ACKed FINs, and an ACK echo loop). See
-  "TCP: the `tcp` command" above.
-- **Networking (v0.1.3)** — a polled Ethernet/ARP/IPv4/ICMP/UDP/DNS stack,
-  with drivers for the RTL8139, Intel e1000, and Realtek RTL8168 NICs.
-  New commands: `netinfo`, `net ip|gw|dns <a.b.c.d>`, `dns <host>`,
-  `bounce <host>`, `monitor <host>`, `dhcp`. See "Networking" above.
-- **`party` (v0.1.3)** — a simple built-in scripting language with its own
-  variables, expressions, `if`/`else`/`while`, `func`/`return`, and
-  `display` output. `party foo.pa` runs a program. See "Party" above and
-  `PARTY_SPEC.md`.
-- **Multi-block files / SFFS v3 (v0.1.3)** — files are no longer capped at
-  one node's ~160-byte content slot; they chain across nodes up to ~10 KB.
-  Older v2 volumes still load fine and are upgraded on `sync`. See
-  "Multi-block files (SFFS v3)" above.
-- **`unmount <label>` (v0.1.2)** — detach a mounted drive's volume. The mount
-  slot is dropped (so `sync` stops writing that drive back) and `/<label>/`
-  disappears from the filesystem, but the data on the drive is left untouched.
-  It refuses while your current directory is inside the volume. See "One boot
-  drive, up to two mounted drives" above.
-- **RTC clock: `date`, `time`, and `wig time`** — a new CMOS/RTC driver (ports
-  `0x70`/`0x71`, BCD decode, 12→24-hour conversion) backs a `date` command
-  (`YYYY-MM-DD`), a `time` command (`HH:MM:SS`), and `wig time`, a live clock
-  widget drawn in the top-right corner of the screen that updates every second
-  until you press Esc. See "The RTC clock" above.
-- **`write`** — `show hi ~ write file.txt` pipes a command's output into a
-  file, creating it or overwriting an existing file's content (like a `>`
-  redirect). See "Writing piped output to a file" above.
-- **`-test` flag for `mkfl`** — dry run: reports whether a file would be
-  created, overwritten, or rejected (already exists, no `-force`), and the
-  content length that would be written, without touching the filesystem.
-  Works whether or not content text is given (`mkfl new.txt -test` or
-  `mkfl new.txt "text" -test`). See "Flags" above.
-- **Aliases (`ali`/`alis`/`rmv ali`)** — `ali <name> <commands>` stores a
-  command (or `;`/`~` chain) verbatim under `<name>`; running `<name>`
-  re-runs it fresh, so it always sees the current variables/files. Aliases
-  can call other aliases (nested up to 8 deep). `alis` lists them all;
-  `rmv ali <name>` removes one; `auth rmv ali all` clears every alias.
-  ```
-  rush>/home: ali testmath calc 5 + 5 ~ = a ; show a
-  rush>/home: testmath
-  10
-  rush>/home: alis
-  Aliases:
-  testmath: calc 5 + 5 ~ = a ; show a
-  rush>/home: rmv ali testmath
-  ```
-- **`color`** — change the color normal output (`show`, `list`, etc.) is
-  printed in. All 16 standard VGA colors are available, with dark/light
-  variants: `color cyan`, `color dblue`, `color list` (see every name),
-  `color reset` (back to green). Prompt (yellow) and error (red) text are
-  left alone, since those colors are meaningful cues.
-- **Targeted `fmt`** — `dscan` now shows an original `disk<N>` label for
-  every drive that isn't already an SFFS volume, so you can format a
-  *specific* drive instead of whichever happens to be first-unformatted:
-  ```
-  rush>/home: dscan
-    device 1 (primary slave): present, not SFFS - fmt target: disk1
-  rush>/home: fmt disk1 backups
-  Formatted backups on primary slave. Use 'sync' to save, then 'mount backups'.
-  ```
-  `fmt <label>` (no target) still works exactly as before, for when there's
-  only one drive to format. Reformatting a drive that already has an SFFS
-  volume - whether targeted by its `disk<N>` label or its current label -
-  requires `-force`, same as before.
-- **Loading spinner** — `dscan`, `fmt`, `mount`, and `sync` animate a small
-  `|/-\` spinner in place while they scan, load, or write sectors, so a
-  multi-drive scan, a format, a mount, or a filesystem save doesn't look
-  like the shell has frozen.
-- **`shelly`** — a splash banner command: prints the `ShellyForever OS`
-  title one rainbow-colored character at a time, followed by the current
-  build version (`v0.1.10`), the developer credit (`Developed by Sourasish
-  Das`), and the copyright line (`Copyright 2026. All rights reserved.`).
-- **`find` and `lookfor`** — `find <name>` searches every drive for a file
-  or folder by exact name and prints its full path; `lookfor <text> <file>
-  [limit <n>]` greps a file's content line by line, optionally restricted
-  to a `line <a>, <b>` range. See "Searching: `find` and `lookfor`" above.
-- **`owrite`** — overwrites an existing file's content in place
-  (`owrite hi.txt "new content"`), without `mkfl`'s create-or-`-force`
-  semantics. See "Overwriting files with `owrite`" above.
-- **`~` pipes** — pipe one command's output into another:
-  `calc 1 + 1 * 5 ~ = a` stores calc's result in the variable `a`;
-  `calc 3 * 3 ~ show` pipes the result into `show`. See "Piping output with
-  `~`" above.
-- **Command history (Up/Down)** and **scrollback (Ctrl+Up/Ctrl+Down)** — see
-  "Line editing: history, tab completion, and scrollback" above.
-- **Tab completion** — Tab completes command names on the first token and
-  file/folder names in the current directory on later tokens, listing
-  ambiguous candidates. See "Tab completion" above.
-- **`;` command chaining** — run multiple commands on one line:
-  `show hello ; show world`. Semicolons inside double quotes are literal.
-  Works in both the interactive shell and `rr` script files.
-- **`$` comment lines** — lines starting with `$` are skipped by the shell
-  and the `rr` script runner.
-- **`rr` script runner** — `rr script.rsh` executes each line of a rush
-  script file. Lines starting with `$` are comments. Press Esc to interrupt.
-  `;` chaining works inside scripts too.
-- **`prs` process manager** — `prs` lists running scripts; `prs kill <pid>`
-  or `prs kill rushrun` terminates them.
-- **Elevation system (`auth`)** — dangerous commands (`sdown`, `rboot`, `del`,
-  `vars rmv all`) require `auth` prefix, like `sudo`. The auth flag is
-  one-shot: it applies only to the immediately following command.
-- **`vars` command** — lists all variables, or clears all with
-  `auth vars rmv all`.
-- **SFFS v2 multi-volume storage** — `dscan` scans the ATA bus for SFFS
-  disks, `fmt <label>` formats an unformatted drive, and `mount <label>`
-  attaches it under `/<label>/` beside `/home`. Up to 2 mounted drives on
-  top of the boot drive.
-- **Flags: `-force`, `-silent`, `-info`** — `mkfl` now supports:
-  - `-force`: overwrite an existing file (prints a warning)
-  - `-silent`: suppress the `-force` overwrite warning
-  - `-info`: print verbose info (filename + content length)
-  - (`-test` added later — see the entry at the top of this section)
-
-I built and test-assembled this (including `find`, `lookfor`, and `owrite`)
-in a sandbox with QEMU available. The `-test` flag was verified end-to-end
-with an automated QEMU boot (screendump of the running shell confirmed the
-create/overwrite/blocked-without-`-force` messages all print correctly and
-no file content changes on disk). Earlier features were checked by assembling
-cleanly with no errors and a careful hand trace of the logic, but weren't all
-run interactively — worth exercising yourself in QEMU to catch anything a
-static read-through can't, and happy to help debug from there if something
-misbehaves.
-
-The multi-block-file and networking work described above (v0.1.3) was
-assembled cleanly with `nasm -f bin` and hand-traced, including a fix to
-`nic_fetch_rx` (it was missing its RTL8168 branch entirely — RX for that
-driver silently ran the RTL8139 ring-buffer code instead of walking its own
-descriptor ring). No QEMU was available in the environment used for this
-pass, so none of it has been boot-tested yet — exercise `bounce`/`monitor`/
-`dns`/`net`, and a chained-file round trip (`mkfl` a file bigger than ~160
-bytes, then `view`/`sync`/reboot it), yourself before relying on it.
+> *"It requires two things: a good Ethernet cable and luck."*  
+> — ShellyForever Developer
