@@ -1,0 +1,692 @@
+PARTY LANGUAGE — MULTI-SESSION BUILD PLAN
+==========================================
+Read this file first, every session, before touching party.asm /
+kernel.asm / tcp.asm / http.asm. Update it before you stop, even if
+a phase is only half done — write down exactly which sub-step you
+stopped on and what the next concrete edit is, not just "in progress".
+
+Files involved (as uploaded):
+  party.asm    - lexer, parser, tree-walking interpreter, .run compiler
+  kernel.asm   - the ShellyForever OS: shell, fs_*, dispatch, cmd_* handlers
+  tcp.asm      - TCP client state machine (no server/listen support yet)
+  http.asm     - HTTP 1.0 client (cmd_take = GET, cmd_give = POST), built on tcp.asm
+  PARTY_SPEC.md - the language spec; keep this in sync with every phase,
+                  spec-first (design the syntax there, then implement)
+
+kernel.asm %includes party.asm, tcp.asm, http.asm directly (see
+kernel.asm:15398-15400) — they're one assembled unit, not separate
+translation units. Also %includes splash.asm, browse.asm, mouse.asm,
+which were NOT part of this upload, so a full `nasm` build could not
+be verified in this environment. party.asm alone was syntax-checked
+standalone with nasm (undefined-external errors only, as expected —
+no real syntax errors). Verify a full build in the real dev tree
+before shipping each phase.
+
+Key facts learned about the existing code (don't re-derive these):
+  - Party value = 32 bytes: byte0 = type (PV_NONE=0, PV_INT=1,
+    PV_FLOAT=2, PV_BOOL=3, PV_STR=4), then [+8] qword (int or double
+    payload), [+16] qword (string ptr, into source/read buffer, NOT
+    guaranteed NUL-terminated), [+24] qword (string length).
+  - Token = 8 bytes {type:u8, reserved:u8, length:u16, start:u32},
+    start/length slice into the source buffer (fs_io_buf).
+  - Statement dispatch lives in party_exec_stmts (party.asm ~1083+),
+    a big cmp-chain on the leading token type, one .pes_<name> block
+    per statement kind. Follow that pattern for every new statement.
+  - Keywords: add the TOK_ constant, the kw_ string, one str_eq
+    branch in the lexer's identifier path (~party.asm:449-535), and
+    an entry in party_tok_names (~party.asm:3607, keep it in the
+    same order as the TOK_ constants — it's index-addressed) for the
+    `-tokens` debug dump.
+  - The shell's command line -> cmd_* dispatch path: line_buf holds
+    the raw line, process_chain (kernel.asm ~300) splits on `;`
+    (quote-aware) and calls process_segment per piece, which
+    tokenizes into cmd_buf/arg1_buf.. via next_token and calls
+    do_dispatch_call -> dispatch (kernel.asm ~774, one long str_eq
+    chain to cmd_* handlers). LINE_MAX = 220.
+  - fs_* file API (kernel.asm ~8251+): fs_resolve_path, fs_find_child,
+    fs_create_node, fs_read_file, fs_write_file, fs_write_binary_file,
+    fs_read_binary_file, fs_delete_node/tree, fs_file_len. This is
+    what any in-language file API (Phase 3) should call directly,
+    the same way cmd_cat/cmd_mkfl already do — don't shell out to
+    `rush` for it, that's the point of Phase 3.
+  - HTTP: http_build_get / http_build_post build a request into a
+    buffer; tcp_do_exchange (http.asm ~335) does the actual
+    connect+send+recv over tcp.asm; http_find_body splits headers
+    from body. cmd_take / cmd_give (http.asm) are the existing
+    `take <url>` / `give <url> <body>` shell commands built on top of
+    this — Phase 5's in-language HTTP client should call the same
+    lower-level pieces those commands call, not shell out to `rush`.
+  - tcp.asm is a CLIENT state machine only (SYN sent by us). There is
+    no accept()/listen backlog anywhere in the uploaded kernel. A
+    Party-callable "make servers" feature (Phase 6) is a kernel
+    networking feature first and a Party binding second — expect it
+    to be the biggest phase by far, is not just adding a keyword.
+  - The `.run` compiler (party_compile_to_run, party.asm ~3835) does
+    NOT actually ahead-of-time-compile general statements. It embeds
+    the raw Party source into the .run file after a 14-byte stub, and
+    `run x.run` calls back into the same tree-walking interpreter via
+    a boot hook (party_boot_compiled). party_emit_lit_display exists
+    but is unused machinery for a narrower literal-display case.
+    PRACTICAL UPSHOT: any new statement/builtin added to the
+    interpreter (party_exec_stmts and friends) works automatically
+    for compiled .run programs too, with no compiler changes needed,
+    as long as it doesn't require compile-time-only information.
+    Only touch party_compile_to_run if a phase needs something the
+    interpreter itself can't already do at runtime.
+  - party_ctx_table / PARTY_CTX_SIZE (party.asm ~850, the background-
+    process suspend/resume mechanism used by `run x.run -back`): every
+    piece of new *global, per-run* interpreter state (new value
+    tables, new scratch buffers actually used mid-statement) needs an
+    entry added here, and PARTY_CTX_SIZE bumped by hand to match - it
+    is NOT computed from the table automatically. Miss this and a
+    background process's parked state silently drops/corrupts the new
+    data on suspend/resume while a plain `party foo.pa` (no `-back`)
+    keeps working fine, which is an easy way to ship something that
+    looks tested but isn't. Also remember this table's total size is
+    multiplied by kernel.asm's MAX_PROCESSES (proc_bg_ctx) - and
+    MAX_PROCESSES was already trimmed 4->2 there to fit the kernel's
+    BSS under the 0xA0000 real-mode ceiling, so growing this table has
+    a real, tight memory cost, not just a bookkeeping one. Phase 4
+    (arrays) was the first phase after the initial three to touch this
+    table; see its section for the exact bump.
+
+================================================================
+PHASE 1 — `rush` command                              [DONE this session]
+================================================================
+Goal: let a Party script shell out to one Rush/ShellyForever command
+line, covering file creation/editing, http (take/give), networking,
+and "party compile" from inside a script, per the request, without
+reimplementing any of it inside the interpreter.
+
+Syntax (now in PARTY_SPEC.md section 8):
+    rush <expr>          ; <expr> must be a string; runtime type error
+                          ; otherwise (msg_party_rush_type)
+
+Implementation (all in party.asm):
+  - TOK_RUSH = 33, TOK_COUNT_KNOWN bumped to 34.
+  - kw_rush "rush", matched in the lexer's identifier path.
+  - str_tok_rush "RUSH" added to party_tok_names (must stay in TOK_
+    order — it's the last entry, so this was a pure append).
+  - party_exec_stmts: new .pes_rush block. Parses the expr, pops it,
+    requires PV_STR, copies min(len, LINE_MAX-1) bytes into line_buf,
+    NUL-terminates, calls kernel's process_chain (so `;` chaining and
+    quoted args inside the rushed string work too), then continues
+    the statement loop.
+  - msg_party_rush_type "rush requires a string" error message.
+  - No compiler changes needed (see "practical upshot" above).
+
+NOT done / known gaps (pick these up in a later phase if wanted):
+  - No output capture: `rush "cat notes.txt"` prints to the screen,
+    there's no way to get that text back into a Party variable.
+    kernel.asm already has a capture mechanism for the shell's own
+    "~" pipe (pipe_capture_buf/pipe_capture_len/pipe_capture_on,
+    see process_segment ~kernel.asm:508+) — a future `rush` variant
+    (e.g. `vars out = rushcap "cat notes.txt"`) could set
+    pipe_capture_on around the process_chain call and wrap the
+    captured bytes into a PV_STR pointing at pipe_capture_buf. Worth
+    doing alongside Phase 3 rather than bolted on separately, since
+    at that point there's a real "give me a string back" convention
+    to reuse for file reads too.
+  - No recursion guard: `rush "party foo.pa"` inside a running Party
+    script recurses into the interpreter with no explicit depth
+    limit beyond the real call stack. Probably fine (matches how
+    the shell already lets you nest `party`/`run` manually) but note
+    it in case stack-depth bugs show up later.
+  - Not tested on real hardware/emulator this session (no boot
+    environment available) — only nasm-syntax-checked. Smoke-test
+    `rush "mkf x.txt"`, `rush "display" ` (should type-error, no —
+    wait, `display` isn't a valid rush target test; use
+    `rush "ls"` and `rush "cat x.txt ; ls"`) before relying on it.
+
+================================================================
+PHASE 2 — String interpolation                        [DONE this session]
+================================================================
+Goal: `"hello {name}"` embeds a variable's string form inline.
+
+Scope decision (locked in before coding, per the "nail down first"
+list this file had): went with the smallest slice explicitly listed
+as acceptable — bare `{identifier}` only, not `{identifier(...)}`
+and not full `{<expr>}`. Reason: party_parse_expr operates over the
+already-lexed global token array (indexed by r13), and the text
+inside a string literal was never tokenized — reusing it would mean
+either re-lexing the `{...}` substring into a throwaway token run
+and re-entering the parser on it, or splitting string literals into
+multiple tokens at lex time (option (b) below). Both are real work
+and a bigger diff than this phase needs; `{identifier}` covers the
+common "print a variable in context" case with a much smaller,
+easier-to-verify change. Full `{<expr>}` / call support is now the
+first deferred item in PARTY_SPEC.md's "Not in v0.1.12" list —
+picking either sub-approach above is the right starting question for
+whoever does that follow-up.
+
+Rule set implemented (now in PARTY_SPEC.md section 1):
+  - `{identifier}` — bare, already-declared var name only, same
+    identifier grammar as everywhere else (first char [a-zA-Z_],
+    rest [a-zA-Z0-9_]).
+  - `{{` / `}}` escape to a literal `{` / `}`. A lone `}` is always
+    literal (only `{` can open a substitution, so only `{` needs
+    escaping — `}}` is supported for symmetry but not required).
+  - Undeclared name inside `{}`, empty `{}`, a name starting with a
+    digit, and an unterminated `{` are all runtime errors (msg_party_
+    undef_var / msg_party_interp_badident / msg_party_interp_unterm),
+    consistent with "undeclared variable is an error, not a silent
+    default" (section 3).
+  - Interpolation only inside string literals; no new operators.
+
+Went with approach (a) from this file's original notes: the lexer is
+completely unchanged (still one plain TOK_STR per literal, token
+count/shape identical — TOK_COUNT_KNOWN did NOT change this phase),
+and the `{...}` scan/substitution happens when the literal is turned
+into a runtime value.
+
+Implementation (all in party.asm, inserted just before
+party_parse_primary):
+  - party_val_to_string: rbx=value ptr -> rsi=ptr,rcx=len. Stringifies
+    int/float/bool into the existing party_num_buf scratch (reusing
+    int_to_str / party_float_to_str, the same routines party_print_
+    value already calls); PV_STR passes its slice straight through,
+    no copy. NOTE: did not refactor party_print_value itself to call
+    this — it works fine as-is and touching it risked a regression
+    for zero benefit; party_val_to_string is the new shared piece the
+    original note asked for, display just doesn't route through it.
+  - party_str_has_lbrace: cheap rsi/rcx scan for a '{' byte — the
+    opt-in check so a literal with no '{' (the common case) skips
+    interpolation and keeps pointing straight into the source buffer,
+    byte-for-byte the same as before this phase (zero behavior change,
+    zero aliasing risk for plain strings).
+  - party_pel_append: appends N bytes into the party_interp_buf
+    cursor with a capacity check, erroring (msg_party_interp_overflow)
+    rather than silently truncating on overflow.
+  - party_eval_string_literal: the main scan/substitute loop over
+    party_interp_buf (PARTY_INTERP_MAX=1024), described above.
+  - party.asm:.pp_str (in party_parse_primary): now checks
+    party_str_has_lbrace first; no '{' -> unchanged party_val_set_str
+    path; has '{' -> party_eval_string_literal, then
+    party_val_set_str pointing at party_interp_buf instead of source.
+  - New buffers: party_interp_buf (1024B), party_interp_ident_buf
+    (PARTY_IDENT_MAX, for the scanned identifier name),
+    party_pel_char_scratch (1B, lets single-char escapes/pass-through
+    reuse party_pel_append instead of a separate one-byte code path).
+  - New messages: msg_party_interp_unterm, msg_party_interp_badident,
+    msg_party_interp_overflow.
+  - No compiler changes needed (same "practical upshot" as Phase 1 —
+    this is pure interpreter-level work).
+  - `+` on strings: confirmed NOT implemented (party_op_add's type
+    checks only accept PV_BOOL/PV_INT/PV_FLOAT on both sides — a
+    PV_STR operand falls through to .bop_err_type) and left that way;
+    interpolation didn't need it and stayed self-contained per the
+    "or keep interpolation self-contained" fallback this file
+    originally suggested.
+  - Aliasing: an interpolated literal's value points at the shared
+    party_interp_buf, same model `read` already uses (party_read_buf)
+    and the same model plain string literals already use (pointing
+    into the shared source buffer) — documented in PARTY_SPEC.md
+    section 1 with the same "consume before the next one" caveat.
+  - party.asm syntax-checked standalone with nasm after the change:
+    same result as Phase 1 — undefined-external-symbol noise only
+    (kernel.asm-defined labels), no new real errors introduced.
+
+NOT done / known gaps (pick up in a later phase if wanted):
+  - No `{<expr>}` or `{ident(...)}` — see scope decision above.
+  - No string concatenation (`+` on strings) — still not implemented,
+    on purpose (see above).
+  - Not tested on real hardware/emulator this session (no boot
+    environment available), same caveat as Phase 1. Smoke-test
+    `display "hi {name}"` (declared and undeclared `name`),
+    `display "{{}}"`, `display "unterminated {"`, and a var holding
+    an interpolated string that's displayed twice in a row with
+    another interpolation evaluated in between (should show the
+    aliasing/overwrite behavior) before relying on this.
+
+================================================================
+PHASE 3 — In-language file access API                 [DONE this session]
+================================================================
+Goal: give scripts real file I/O without shelling out via `rush`.
+
+Surface implemented, now in PARTY_SPEC.md section 9:
+    vars h = fopen("notes.txt", "r")   ; or "w" / "a"
+    vars text = fread(h)               ; whole-file read (matches
+                                        ; fs_read_file - not streaming)
+    fwrite(h, "some text")             ; appends; statement only
+    fclose(h)
+    vars exists = fexists("notes.txt")
+    fdelete("notes.txt")
+
+Starting state this session: party.asm already contained a fully
+written `party_call_builtin` dispatcher plus `party_bi_fopen` /
+`party_bi_fread` / `party_bi_fwrite` / `party_bi_fclose` /
+`party_bi_fexists` / `party_bi_fdelete` (with the handle-table helpers
+`party_fh_alloc` / `party_fh_check` / `party_copy_str_to_cpath`) — but
+it did NOT actually work:
+  1. `party_parse_call` never called `party_call_builtin`. It went
+     straight to `party_func_find`, so every one of these names just
+     errored "unknown function" — the builtin path was dead code.
+  2. The data these functions reference was entirely missing: the
+     handle table itself (`party_fh_used` / `party_fh_node` /
+     `party_fh_mode` / `party_fh_pending_mode` / `party_fh_path_buf`),
+     the builtin-name strings compared in the dispatcher
+     (`str_fn_fopen` etc.), and all sixteen `msg_party_f*` error
+     messages. None of these symbols existed anywhere in party.asm or
+     kernel.asm — a real build would have failed at link time (or, if
+     someone had earlier syntax-checked party.asm standalone the way
+     this file's own instructions say, `nasm` would have reported
+     them as undefined externals mixed in among the *expected*
+     kernel.asm-side ones, easy to miss without a diff against a
+     known-good baseline).
+This session finished it rather than rewriting it, since the
+builtin bodies themselves matched everything in the "Handle table"
+paragraph originally in this file (fixed array of {in_use, fs node
+ref}, capacity 12, straight fs_resolve_path/fs_find_child/
+fs_create_node/fs_read_binary_file/fs_write_binary_file calls,
+matching cmd_cat/cmd_mkfl/cmd_edit/cmd_rm) and were, on inspection,
+correct.
+
+What was actually added (all in party.asm):
+  - `party_parse_call`, right after args are parsed and before the
+    `party_func_find` lookup: `push r13` / `call party_call_builtin`
+    / `pop r13`, then branch to `.ppc_out` on `al == 1`. r13 is the
+    parser's token cursor and must survive this call either way;
+    `party_call_builtin`'s own header comment documents that it
+    clobbers r8-r13 on a match (the builtin bodies use r11/r12/r13 as
+    scratch), so it has to be saved/restored around the call rather
+    than trusted to preserve it. This also means builtins are checked
+    *before* user functions, so a script can't shadow `fopen` etc.
+    with its own `func fopen(...)` — matches the doc comment already
+    sitting on `party_call_builtin` ("A user script cannot redefine
+    these names").
+  - Data section additions: `str_fn_fopen/fread/fwrite/fclose/
+    fexists/fdelete` (the plain names, compared against
+    `party_call_name_buf`); the handle table
+    `party_fh_used`/`party_fh_node`/`party_fh_mode`/
+    `party_fh_pending_mode`/`party_fh_path_buf` sized off the
+    existing `PARTY_FH_MAX equ 12` / `PARTY_PATH_MAX equ 200`; and
+    the 16 `msg_party_f*` error strings the builtin bodies already
+    referenced by name.
+  - One small wording fix along the way: `party_bi_fdelete`'s
+    argument-type-error branch reused `msg_party_fexists_type`
+    ("fexists requires a string") verbatim, which would print a
+    confusing message for an `fdelete` call. Reworded the shared
+    message to "path argument must be a string" so it reads sensibly
+    from either builtin; did not touch which builtins share it, only
+    the text.
+  - No compiler changes needed (same "practical upshot" as Phases
+    1-2 — calling through `party_parse_call`/`party_parse_primary` is
+    interpreter-level, and the `.run` compiler just re-enters the
+    same interpreter at runtime).
+  - No new statement keyword, no lexer/TOK_ changes — these are
+    ordinary identifiers followed by `(`, exactly like a user
+    function call, exactly as this file originally called for.
+
+Verified this session:
+  - party.asm syntax-checked standalone with nasm (installed
+    locally: no boot/emulator environment here either, same caveat
+    as every prior session). Compared the full undefined-symbol set
+    against the unmodified upload: the fix *removes* the ~40
+    previously-undefined `str_fn_*` / `party_fh_*` / `msg_party_f*`
+    symbols and introduces zero new ones — every remaining error is
+    the same pre-existing kernel.asm-side extern noise (fs_*,
+    print_string, str_eq, etc.) that Phases 1-2 also saw. This is a
+    stronger check than "no errors" alone would have been, since
+    Phase 3's actual bug (dead code, not a syntax error) doesn't show
+    up as a nasm error at all — nasm only caught the *symptom*
+    (missing symbol definitions), not the missing call-site wiring.
+    The wiring gap was found by grepping for callers of
+    `party_call_builtin` and finding none.
+
+NOT done / known gaps (pick these up in a later phase if wanted):
+  - Not tested on real hardware/emulator this session — only
+    nasm-syntax-checked, same caveat as every prior phase. Smoke-test
+    `files.pa` (PARTY_SPEC.md section 12) end to end: fopen "w" on a
+    new path, fwrite, fclose, fexists true, fopen "r" + fread round
+    trip, fdelete, then fexists false, and error paths (fopen "r" on
+    a missing file, fwrite to a handle opened "r", fread/fwrite/
+    fclose on an already-closed or out-of-range handle, fdelete on a
+    missing path, fopen on a folder path) before relying on it.
+  - Also untested: `party compile files.pa` + `run files.run` — should
+    work automatically per the "practical upshot" note (top of this
+    file), since builtins are pure interpreter-level dispatch with no
+    compile-time component, but "should" isn't "verified".
+  - fwrite is read-modify-write (reads the whole file, appends in a
+    buffer, writes the whole thing back) since fs_* has no
+    incremental-append primitive — fine at this scale, but a script
+    doing many small fwrites to a large file will be O(n^2). Not
+    worth fixing without a real streaming-append fs_* primitive,
+    which is out of scope here.
+  - PARTY_FH_MAX = 12 open handles at once, PARTY_PATH_MAX = 200
+    byte paths — both fixed sizes already chosen by whoever wrote the
+    builtin bodies, left as-is; revisit only if real scripts hit
+    either ceiling.
+
+================================================================
+PHASE 4 — Arrays                                      [DONE this session]
+================================================================
+Goal: give scripts a collection type, mainly as a prerequisite for
+Phase 5 (HTTP response headers) and Phase 6 (a listing of accepted
+connections/requests), per the note this file already had.
+
+Scope decisions locked in before coding (spec-first, per this file's
+own rule, in PARTY_SPEC.md section 10):
+  - Went with **function-shaped builtins** (arr_new/arr_len/arr_get/
+    arr_set/arr_free), NOT `[...]` literal syntax or `a[i]` indexing.
+    The design-questions list this file originally posed included
+    the syntax question ("`vars a = []`? `a[0]`?") but didn't mandate
+    an answer; bracket syntax needs a new lexer token pair
+    (TOK_LBRACKET/RBRACKET), a new expression production, AND a new
+    assignment-target grammar alongside the existing ident-only
+    `.pes_assign` (`a[i] = x` doesn't fit that shape) - real parser
+    work and a bigger diff than reusing the exact mechanism Phase 3
+    already proved out for fopen/fread/etc (a plain TOK_IDENT + '('
+    intercepted by party_call_builtin before party_func_find, no
+    lexer/parser changes at all). Picked the smaller footprint, same
+    kind of call this file's Phase 2 section made (bare `{identifier}`
+    over full `{<expr>}`). Bracket syntax is now the first item in
+    PARTY_SPEC.md's deferred list, layerable on top of this session's
+    work without touching the storage below it.
+  - **Fixed size, not growable**: `arr_new(n)` fixes the length for
+    the array's lifetime; no append/push/resize. This was the OTHER
+    design question phases.txt posed ("fixed-size vs growable") -
+    growable would need either a realloc-shaped primitive (nothing
+    like that exists anywhere else in this codebase - every table
+    here is a fixed-capacity pool) or a linked/chunked structure,
+    both real design work on their own; deferred explicitly.
+  - **Reference semantics**: a `PV_ARRAY` value's [+8] field is a
+    handle (an index into a fixed slot table), the exact same
+    handle-into-a-table shape file handles already use. Copying the
+    32-byte value (assignment, passing as an arg, returning it) only
+    copies the handle, so aliases share the underlying storage -
+    documented explicitly in the spec with an `alias`/`nums` example
+    since this is a real semantic choice (the alternative, deep-copy
+    on every assignment, would need party_val_copy to special-case
+    PV_ARRAY instead of staying a flat 32-byte memcpy for every type -
+    didn't do that).
+  - Elements can be **any value type**, including another array
+    (nothing enforces homogeneity or forbids nesting - the element
+    slots are just ordinary 32-byte Party values, same as every other
+    slot in this interpreter). This wasn't a deliberate feature so
+    much as "didn't add code to prevent it" - display handles it via
+    plain recursion (see below), but it isn't explicitly exercised by
+    the arrays.pa example.
+
+Surface implemented, now in PARTY_SPEC.md section 10:
+    vars a = arr_new(3)     ; array of 3 elements, each starts int 0
+    arr_set(a, 0, "hi")     ; statement only, like fwrite
+    display arr_get(a, 0)   ; "hi"
+    display arr_len(a)      ; 3
+    arr_free(a)             ; releases the slot
+
+Implementation (all in party.asm):
+  - `PV_ARRAY equ 5` - new value type.
+  - `PARTY_ARR_MAX equ 4` / `PARTY_ARR_CAP equ 16` - deliberately
+    small (4 concurrently-alive arrays, 16 elements each = 2048 bytes
+    of element storage + a few dozen bytes of bookkeeping). Sized
+    this conservatively because party_ctx_table (the background-
+    process suspend/resume mechanism) copies this table into EVERY
+    parked ctx, and kernel.asm's own proc_bg_ctx replicates a whole
+    ctx per MAX_PROCESSES slot - and kernel.asm already had to trim
+    MAX_PROCESSES from 4 to 2 "to fit the kernel's BSS under 0xA0000"
+    (kernel.asm ~18343, real-mode conventional-memory ceiling). A
+    bigger array table directly eats into that same margin. This
+    session could NOT verify the actual real-mode BSS budget (no
+    boot/link environment here, same standing caveat as every prior
+    session) - raise these constants only after checking real
+    link-time headroom in the full dev tree, not by guessing.
+  - `party_arr_alloc` / `party_arr_check` - straight copies of the
+    Phase 3 `party_fh_alloc` / `party_fh_check` pattern (find-a-free-
+    slot / validate-a-handle), operating on the new
+    `party_arr_used`/`party_arr_count`/`party_arr_data` tables instead
+    of the file-handle ones.
+  - `party_bi_arr_new/len/get/set/free` - the five builtin bodies,
+    following the exact Phase 3 shape (arg-count check, pop args in
+    reverse-push order into scratch slots, type-check each, do the
+    work, push exactly one result - PV_NONE for the two statement-
+    only ones, arr_set and arr_free, matching fwrite/fclose).
+    arr_set is the first 3-argument builtin in the language, needing
+    a new `party_scratch3` (party_scratch/scratch1/scratch2 already
+    existed; scratch3 is new this session).
+  - `party_call_builtin`: five new str_eq branches + dispatch
+    entries, same shape as the six Phase 3 branches, checked before
+    `party_func_find` so a script can't shadow these names either.
+  - `party_print_value`: new PV_ARRAY case, prints `[e0, e1, ...]` by
+    walking the slot's elements and calling party_print_value
+    recursively per element (the routine already saves/restores its
+    own registers around its body, so this is safely reentrant for a
+    nested array without any extra bookkeeping). A stale/invalid
+    handle - shouldn't happen through normal use, but display doesn't
+    itself re-validate before this point - prints nothing rather than
+    erroring, since display's contract elsewhere (PV_NONE) is "print
+    nothing" for a value that doesn't have real content to show.
+  - New data: `str_fn_arr_new/len/get/set/free` (dispatcher-compared
+    names), `party_arr_used`/`party_arr_count`/`party_arr_data`
+    (the slot table itself), seven new `msg_party_arr_*` error
+    strings, three tiny display-formatting strings
+    (`lbracket_str`/`rbracket_str`/`comma_sp_str`).
+  - `party_exec` and `party_reset_runtime` (the compiled `.run` boot
+    path) both now zero `party_arr_used` on entry, the same way they
+    already zero `party_var_used`/`party_loc_used`/
+    `party_frame_returned` - otherwise a stale slot from a PREVIOUS
+    script run in the same session (or a previous background-process
+    ctx) could look "in use" to a fresh run that never touched arrays.
+  - **party_ctx_table / PARTY_CTX_SIZE updated** for the background-
+    process save/restore mechanism (party_ctx_save/party_ctx_restore,
+    used by `run x.run -back` and the scheduler): added three new
+    entries (party_arr_used: 4 bytes, party_arr_count: 32 bytes,
+    party_arr_data: 2048 bytes) and grew the existing party_scratch
+    entry from 96 to 128 bytes to cover the new party_scratch3.
+    PARTY_CTX_SIZE is a hand-maintained constant (NOT derived from
+    the table), so it had to be bumped by hand: 20226 -> 22342 (+32
+    scratch3, +2084 array tables), and PARTY_CTX_REGS_OFFS with it
+    (always CTX_SIZE - 24). This is exactly the kind of change that's
+    easy to get quietly wrong (forget to bump the constant and a
+    background-process ctx save silently truncates, corrupting
+    whatever comes after it in the ctx blob) - flagging clearly here
+    in case a future phase adds more per-run state and needs to do
+    the same bookkeeping.
+  - No compiler changes needed (same "practical upshot" as every
+    prior phase - calling through party_call_builtin is interpreter-
+    level, and the .run compiler just re-enters the same interpreter).
+  - No new statement keyword, no lexer/TOK_ changes, no
+    TOK_COUNT_KNOWN change - ordinary identifiers followed by '(',
+    exactly like Phase 3's builtins.
+
+Verified this session:
+  - party.asm syntax-checked standalone with nasm (installed fresh
+    this session - wasn't preinstalled in this sandbox). Diffed the
+    full undefined-symbol set against an UNMODIFIED copy of the
+    upload assembled the same way: identical 42-symbol set before and
+    after, zero new undefined symbols, zero real (non-"symbol not
+    defined") errors introduced. Same verification shape Phase 3 used
+    and for the same reason - a dead-code/wiring bug (like Phase 3's
+    missing party_call_builtin call site) wouldn't show up as a nasm
+    error at all, so "diffs to nothing new" is the meaningful check,
+    not "nasm exit code."
+  - Did NOT verify the real link-time image size / BSS budget (see
+    the PARTY_ARR_MAX/CAP sizing note above) - no boot/link
+    environment in this sandbox, same standing limitation as every
+    session before this one. This is a bigger deal for this phase
+    specifically than for Phases 1-3, since this is the first phase
+    to grow party_ctx_table/PARTY_CTX_SIZE, and that growth is
+    multiplied by MAX_PROCESSES in kernel.asm's proc_bg_ctx - treat
+    this as an explicit, not-yet-checked risk, not a formality.
+
+NOT done / known gaps (pick these up in a later phase if wanted):
+  - No `[...]` / `a[i]` syntax - see the scope decision above; this
+    is the natural next follow-up and is now the first entry in
+    PARTY_SPEC.md's deferred list.
+  - No growable arrays (append/push/resize) - fixed size only.
+  - No bounds-safe "try get" - `arr_get`/`arr_set` on a bad index is
+    always a hard runtime error, there's no `arr_get_or(a, i, dflt)`
+    equivalent. Not asked for; easy to add later as another builtin
+    if wanted, same shape as the others.
+  - Not tested on real hardware/emulator this session (no boot
+    environment available), same caveat as every prior phase.
+    Smoke-test `arrays.pa` (PARTY_SPEC.md section 12) end to end:
+    arr_new/arr_set/arr_get/arr_len/display/alias-sharing/arr_free,
+    then error paths (arr_new negative or oversized n, arr_new
+    non-int arg, arr_get/arr_set out-of-bounds or non-int index,
+    arr_get/arr_set/arr_len/arr_free on a non-array or already-freed
+    handle, arr_new past PARTY_ARR_MAX concurrently-alive arrays)
+    before relying on it. Also untested: `party compile arrays.pa` +
+    `run arrays.run` (should work automatically, same "practical
+    upshot" as every phase, but "should" isn't "verified"), AND -
+    new for this phase specifically - `run arrays.run -back` (a
+    BACKGROUND run), since that's the one path that actually
+    exercises the party_ctx_table changes above; nothing in Phases
+    1-3 changed party_ctx_table so this is the first time that
+    machinery has been touched by an added-feature phase rather than
+    just carried along unchanged.
+  - PARTY_ARR_MAX=4 / PARTY_ARR_CAP=16 are small enough that a script
+    doing anything nontrivial with arrays (e.g. several arrays alive
+    at once, or one bigger than 16 elements) will hit the ceiling
+    quickly. Deliberate given the BSS-budget concern above, but
+    revisit once real link-time headroom is confirmed - don't just
+    bump the constants blind.
+
+================================================================
+PHASE 5 — In-language HTTP 1.0 client                 [NOT STARTED]
+================================================================
+Goal: `take`/`give`-equivalent callable as an expression, not just a
+shell command, so a script can use the response instead of just
+seeing it printed.
+Proposed surface:
+    vars resp = http_get("http://example.com/")
+    display resp.status      ; needs either arrays/structs (Phase 4/
+                              ; a new PV_STRUCT) or just multiple
+                              ; return-style builtins:
+    vars resp = http_get("http://example.com/")   ; returns body only
+    vars code = http_last_status()                ; separate builtin
+                                                    ; for the status
+                                                    ; code, sidesteps
+                                                    ; needing structs
+Recommend the second shape (body + separate status/headers builtins
+that read "last request" scratch state) to avoid being blocked on
+Phase 4. Implementation reuses http_build_get/http_build_post/
+tcp_do_exchange/http_find_body (http.asm) directly — same functions
+cmd_take/cmd_give already call — wire them up as builtin functions
+the same way Phase 3's fopen/fread are builtins. No new TCP/kernel
+work needed for the client side; this phase is pure plumbing from
+existing http.asm internals into the Party call-builtin dispatcher.
+
+================================================================
+PHASE 6 — Servers (listen/accept)                     [NOT STARTED — BIG]
+================================================================
+This is a kernel networking feature, not a language feature, and it's
+the largest item on this list. tcp.asm currently only knows how to be
+a client (it sends the SYN; see tcp_state comments at kernel.asm
+~18241 and tcp_send_segment/tcp_handle_segment in tcp.asm). Before any
+Party syntax makes sense, kernel-side work is needed:
+  - A listen/backlog concept: bind to a local port, wait for an
+    inbound SYN (currently netpoll's dispatch, kernel.asm ~12630,
+    only reacts to frames as part of the client exchange flow —
+    check whether it silently drops unsolicited SYNs today, since
+    that's effectively "no server support" at the packet level).
+  - Accept: turn an inbound SYN into a new session (probably needs a
+    second tcp_state-like slot, or turning the current single global
+    tcp_* state vars into a small table of sessions, since a server
+    plausibly wants >1 concurrent connection even at a toy scale).
+  - Only once that exists does a Party surface make sense, e.g.:
+        vars srv = http_serve(8080)
+        while (true) {
+            vars req = http_accept(srv)
+            http_respond(req, 200, "text/plain", "hi")
+        }
+Do NOT attempt to fake this by, e.g., having `rush` poll in a loop —
+that's a shell trick, not a server, and would be misleading to build
+and call "servers". If server support turns out to be too large for
+the kernel's current single-connection tcp_state model, say so
+explicitly in this file rather than shipping a half-working listen
+that only handles one client ever and silently wedges on the second.
+
+================================================================
+PHASE 7 — Docs & compiler sanity pass                 [NOT STARTED]
+================================================================
+- Re-read PARTY_SPEC.md end to end once Phases 2-6 (whichever
+  shipped) are in, fix any numbering/cross-reference drift like the
+  section renumbering this session needed after inserting section 8.
+- Confirm every new builtin/statement survives `party compile x.pa`
+  + `run x.run` (should be automatic per the "practical upshot" note
+  above, but actually run it once per phase instead of assuming).
+- Full real `nasm` build in the actual dev tree (with splash.asm/
+  browse.asm/mouse.asm/boot.asm present) — this sandbox couldn't do
+  that; don't skip it just because the standalone party.asm check
+  was clean.
+
+================================================================
+SESSION LOG (append, don't rewrite history)
+================================================================
+Session 1: Surveyed party.asm/kernel.asm/tcp.asm/http.asm.
+  Implemented Phase 1 (`rush`) end to end in party.asm, updated
+  PARTY_SPEC.md section 8 + deferred-features list, wrote this file.
+  party.asm syntax-checked standalone with nasm (no real errors, only
+  expected undefined-external-symbol noise for kernel.asm-defined
+  labels). Did NOT attempt Phase 2+ — next session should start there,
+  spec-first, per the notes above.
+
+Session 2: Implemented Phase 2 (string interpolation,
+  `{identifier}` only — see the Phase 2 section above for the scope
+  decision and why). Updated PARTY_SPEC.md section 1 (rule set +
+  interp.pa example) and the deferred-features list (now "Not in
+  v0.1.12"). party.asm syntax-checked standalone with nasm again —
+  same clean result as session 1 (undefined-external noise only).
+  Did NOT touch Phase 3+ — next session should start there. One open
+  question worth flagging for whoever does the `{<expr>}` follow-up:
+  decide between re-entering the parser on a re-lexed `{...}`
+  substring vs. splitting string literals into multiple tokens at lex
+  time (option (b) in the original Phase 2 notes) before writing any
+  code — this session picked identifier-only specifically to dodge
+  that decision, it's still unmade.
+
+Session 3 (this one): Finished Phase 3 (in-language file access —
+  fopen/fread/fwrite/fclose/fexists/fdelete). Found the builtin
+  bodies and dispatcher already fully written in the uploaded
+  party.asm but never wired up (party_parse_call didn't call
+  party_call_builtin) and missing every piece of backing data (handle
+  table, name strings, error messages) — see the Phase 3 section
+  above for the full list of what was added vs. what was already
+  there. Added PARTY_SPEC.md section 9 (File access) and a files.pa
+  example; renumbered the old sections 9-10 to 10-11 and bumped the
+  deferred-features header to "Not in v0.1.13", dropping the
+  now-implemented file-access line from that list. party.asm
+  syntax-checked standalone with nasm; diffed the undefined-symbol
+  set against the unmodified upload to confirm the fix resolved
+  exactly the Phase 3 symbols and introduced nothing new (see "What
+  was actually added" above for why a plain error count wasn't
+  enough here). Did NOT touch Phase 4+ — next session should start
+  there (Phase 4, arrays, is recommended before Phase 5 per the
+  existing note on HTTP response headers).
+
+Session 4 (this one): Implemented Phase 4 (arrays) end to end —
+  PV_ARRAY value type, a small fixed slot table (PARTY_ARR_MAX=4 x
+  PARTY_ARR_CAP=16, deliberately conservative — see the Phase 4
+  section above and the new key-facts bullet on party_ctx_table for
+  why), and five builtins (arr_new/arr_len/arr_get/arr_set/arr_free)
+  wired into party_call_builtin the same way Phase 3's file builtins
+  are. Locked in two scope decisions up front, spec-first as this
+  file requires: function-shaped builtins instead of `[...]`/`a[i]`
+  syntax (smaller diff, no lexer/parser changes — bracket syntax is
+  now the first deferred-list item), and fixed-size, reference-
+  semantics arrays (handle-in-a-value, same shape fopen already
+  uses) instead of growable/deep-copy. Taught party_print_value to
+  format PV_ARRAY (recursively, so nested arrays "just work"). This
+  is the first phase since the initial three sessions to touch
+  party_ctx_table/PARTY_CTX_SIZE (the background-`-back`-process
+  suspend/resume mechanism) — added the three new array regions and
+  hand-bumped PARTY_CTX_SIZE 20226 -> 22342 accordingly; flagged this
+  explicitly since it's easy to get quietly wrong and untestable
+  without a real boot environment. Updated PARTY_SPEC.md: new section
+  10 (Arrays), renumbered old 10-11 (Input, Example programs) to
+  11-12, added arrays.pa to the
+  Example programs list, bumped the deferred-features header to "Not
+  in v0.1.14" with arrays' own two follow-ups (bracket syntax,
+  growable arrays) added in place of the now-implemented plain
+  "Arrays" line. party.asm syntax-checked standalone with nasm
+  (installed nasm fresh this session, wasn't present already) and
+  diffed the undefined-symbol set against an unmodified copy of the
+  upload: identical 42-symbol set before/after, zero new symbols,
+  zero real errors — same verification shape as every prior phase.
+  Did NOT verify real link-time BSS headroom (no boot/link
+  environment here, and this phase is the first one where that
+  actually matters — see the "NOT done" list in the Phase 4 section).
+  Did NOT touch Phase 5+ — next session should start there (in-
+  language HTTP client), and can now use arrays for response headers
+  per the plumbing already sketched below, or continue with the
+  simpler body+separate-status-builtin shape and use arrays later.
