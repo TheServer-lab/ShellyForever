@@ -1,0 +1,78 @@
+; ============================================================
+; ShellyForever OS
+; forge.vub
+;
+; Vub build configuration
+; ============================================================
+
+
+; ============================================================
+; Build
+; ============================================================
+
+; Assemble bootloader, stage2, kernel,
+; and construct the 256MB disk image.
+define "build" execute = "bash build.sh"
+
+
+; ============================================================
+; Run
+; ============================================================
+
+; Run ShellyForever in QEMU with PC speaker audio.
+define "run" execute = "qemu-system-x86_64 -audiodev sdl,id=pcspk -machine pcspk-audiodev=pcspk -drive format=raw,file=shellyforever.img"
+
+
+; ============================================================
+; File Transfer
+; ============================================================
+
+; Transfer required files after building.
+define "transfer" execute = "python filetransfer.py"
+
+
+; ============================================================
+; Flash
+; ============================================================
+
+; Flash shellyforever.img to the verified SSD.
+;
+; WARNING:
+; This writes directly to a physical disk.
+define "flash" execute = "powershell -ExecutionPolicy Bypass -File flash-shelly.ps1"
+
+
+; ============================================================
+; Build + Transfer
+; ============================================================
+
+define "prepare" execute = "build transfer"
+
+
+; ============================================================
+; Build + Flash
+; ============================================================
+
+define "deploy" execute = "build transfer flash"
+
+
+; ============================================================
+; Full Development Cycle
+; ============================================================
+
+define "all" execute = "build transfer flash"
+
+
+; ============================================================
+; Clean
+; ============================================================
+
+define "clean" execute = "del /Q boot.bin stage2.bin kernel_body.bin shellyforever.img"
+
+
+; ============================================================
+; Default Target
+; ============================================================
+
+define "default" execute = "build"
+
