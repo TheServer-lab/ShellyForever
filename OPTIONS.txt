@@ -1,0 +1,5 @@
+vub build
+vub run
+vub clean
+vub transfer
+vub flash
